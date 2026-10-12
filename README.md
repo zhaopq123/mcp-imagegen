@@ -261,3 +261,10 @@ server.py                   入口：配置自检 → 组件装配 → FastMCP �
 ## 致谢
 
 上游能力由 [Agnes AI](https://api.agnes-ai.cn) 提供。本项目仅做协议适配与工程加固。
+
+
+---
+
+## 📚 完整文档
+
+更详细的说明在 [docs/wiki/](docs/wiki/Home.md)：快速开始 · 配置项详解 · 接入客户端 · 架构说明 · 常见问题
