@@ -65,12 +65,29 @@ VIDEOS_PATH = "/v1/videos"
 QUERY_PATH = "/agnesapi"
 
 # 模型注册表（E15 精神：内部别名 → 真实模型 ID，禁止自由文本 model）
-MODEL_IDS = {
+# 默认值可被配置覆盖（AGNES_IMAGE_MODEL / AGNES_VIDEO_MODEL）：
+# 上游新增或更名模型时改配置即可，无需改代码。
+DEFAULT_MODEL_IDS = {
     "agnes-image": "agnes-image-2.5-flash",
     "agnes-video": "agnes-video-2.5-flash",
 }
-IMAGE_MODEL_ID = MODEL_IDS["agnes-image"]
-VIDEO_MODEL_ID = MODEL_IDS["agnes-video"]
+MODEL_IDS = dict(DEFAULT_MODEL_IDS)
+
+
+def resolve_model_ids(cfg) -> dict[str, str]:
+    """从配置解析模型 ID 映射（空串回落默认）。
+
+    cfg 为 None 时返回内置默认（供未接配置的调用点/测试使用）。
+    """
+    ids = dict(DEFAULT_MODEL_IDS)
+    if cfg is not None:
+        image = (getattr(cfg, "agnes_image_model", "") or "").strip()
+        video = (getattr(cfg, "agnes_video_model", "") or "").strip()
+        if image:
+            ids["agnes-image"] = image
+        if video:
+            ids["agnes-video"] = video
+    return ids
 
 # 视频提交固定参数（方案 V2 2.1：mode="text"、size="720P"）
 VIDEO_MODE_TEXT = "text"
@@ -248,6 +265,10 @@ class AgnesClient:
         self._client_factory = client_factory or httpx.AsyncClient
         self._sleep = sleep
         self._drain_poll_sec = drain_poll_sec
+        # 模型 ID 映射：由配置解析（空串回落内置默认），实例级持有
+        self._model_ids = resolve_model_ids(cfg)
+        self._image_model_id = self._model_ids["agnes-image"]
+        self._video_model_id = self._model_ids["agnes-video"]
         self._current = _ClientHandle(self._new_client())
 
     # ------------------------------------------------------------------
@@ -309,7 +330,7 @@ class AgnesClient:
         请求体 {model, prompt, size}（E25）+ 可选 ratio（D2/官方 F3：
         仅与档位式 size 配合——冲突已由 pipeline 拦截，None 不注入）。
         """
-        model_id = self._model_id(model, expected=IMAGE_MODEL_ID)
+        model_id = self._model_id(model, expected=self._image_model_id)
         payload = {"model": model_id, "prompt": prompt, "size": size}
         if ratio is not None:
             payload["ratio"] = ratio
@@ -339,7 +360,7 @@ class AgnesClient:
         可选 seed（D3/官方 F5：integer 直传，None 不注入——官方未标注
         值域，不臆测上限）。
         """
-        model_id = self._model_id(model, expected=VIDEO_MODEL_ID)
+        model_id = self._model_id(model, expected=self._video_model_id)
         payload = {
             "model": model_id,
             "prompt": prompt,
@@ -369,7 +390,7 @@ class AgnesClient:
         deadline: budget.Deadline,
     ) -> ApiCallResult:
         """视频单查（T3）：GET /agnesapi?video_id=…&model_name=… → {status, url?}。"""
-        model_id = self._model_id(model, expected=VIDEO_MODEL_ID)
+        model_id = self._model_id(model, expected=self._video_model_id)
         params = {"video_id": video_id, "model_name": model_id}
         return await self._call(
             model_id,
@@ -385,12 +406,11 @@ class AgnesClient:
     # ------------------------------------------------------------------
     # 内部：模型注册表校验（E15：别名查表，禁止自由文本 model）
     # ------------------------------------------------------------------
-    @staticmethod
-    def _model_id(model: str, *, expected: str) -> str:
-        model_id = MODEL_IDS.get(model)
+    def _model_id(self, model: str, *, expected: str) -> str:
+        model_id = self._model_ids.get(model)
         if model_id is None:
             raise ValueError(
-                f"未知模型: {model!r}（应为 {sorted(MODEL_IDS)} 之一）"
+                f"未知模型: {model!r}（应为 {sorted(self._model_ids)} 之一）"
             )
         if model_id != expected:
             raise ValueError(

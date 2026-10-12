@@ -2,7 +2,7 @@
 
 单 Provider 单生图模型 → 路由链①–⑤全删，退化为：
 
-    显式 model="agnes-image" → 探针标记直达（E2：绕过熔断表——用户
+    显式 model="agnes-image"（内部别名）→ 探针标记直达（E2：绕过熔断表——用户
         自救通道，其成功/失败结果仍写熔断）；
     auto → 熔断门：
         OPEN（硬/软）→ 快失败决策（E24：pipeline 转为 rate_limit
@@ -10,8 +10,8 @@
         CLOSED / HALF_OPEN → 直达 agnes-image（半开首个请求获探针
             资格 E8，未发出时归还）。
 
-别名常量（E15 精神延续）：agnes-image → agnes-image-2.5-flash，
-禁止自由文本 model。
+模型别名（E15 精神延续）：对外只暴露内部别名 agnes-image，
+真实上游模型 ID 由配置提供，禁止自由文本 model。
 
 reason_tag 有限枚举（进日志"路由决策来源"字段）：
     explicit / auto / circuit_open
@@ -26,10 +26,11 @@ from typing import Optional, Protocol
 MODEL_IMAGE = "agnes-image"
 MODELS = (MODEL_IMAGE,)
 
-# 别名 → 真实模型 id（禁止自由文本）
-MODEL_ALIASES: dict[str, str] = {
-    "agnes-image": "agnes-image-2.5-flash",
-}
+# 内部别名 → 真实模型 id 的解析**不在本模块**：真实模型 ID 由配置
+# （AGNES_IMAGE_MODEL / AGNES_VIDEO_MODEL）驱动，见 infra/agnes.resolve_model_ids()。
+# 本模块只负责「别名」层面的路由决策，不感知上游模型名。
+# 保留此常量仅为向后兼容（无调用点）。
+MODEL_ALIASES: dict[str, str] = {}
 
 # reason 枚举（有限集，严禁扩展语义）
 REASON_EXPLICIT = "explicit"          # 显式指定（绕过熔断表，E2）

@@ -110,6 +110,10 @@ _ENV_SPEC: dict[str, tuple[type, object]] = {
     "HTTPXMAXKEEPALIVECONNECTIONS": (int, 4),
     # ---- V2 增量（增量设计方案 V2 三节；T1）----
     "AGNES_BASE_URL": (str, "https://api.agnes-ai.cn"),
+    # 上游模型 ID（可自定，不写死）：上游新增/更名模型时改这两项即可，
+    # 无需改代码。留空则回落到内置默认（见 infra/agnes.py DEFAULT_MODEL_IDS）。
+    "AGNES_IMAGE_MODEL": (str, ""),
+    "AGNES_VIDEO_MODEL": (str, ""),
     "VIDEO_DIR": (str, "/var/lib/mcp-imagegen/videos"),
     "TIMEOUT_AGNES_IMAGE_SEC": (float, 60.0),  # D5：30→60（4K 档实测 9s+，留裕量）
     "VIDEO_SUBMIT_TIMEOUT_SEC": (float, 30.0),
@@ -145,6 +149,8 @@ class Config:
     httpx_max_keepalive_connections: int
     # ---- V2（T1 增量；硅基五变量已随 Provider 删除）----
     agnes_base_url: str
+    agnes_image_model: str  # 空串 = 用内置默认
+    agnes_video_model: str  # 空串 = 用内置默认
     agnes_token: str
     video_dir: str
     timeout_agnes_image_sec: float
@@ -304,6 +310,8 @@ def _field_name(env_name: str) -> str:
         "HTTPXMAXKEEPALIVECONNECTIONS": "httpx_max_keepalive_connections",
         # ---- V2 增量（T1）----
         "AGNES_BASE_URL": "agnes_base_url",
+        "AGNES_IMAGE_MODEL": "agnes_image_model",
+        "AGNES_VIDEO_MODEL": "agnes_video_model",
         "VIDEO_DIR": "video_dir",
         "TIMEOUT_AGNES_IMAGE_SEC": "timeout_agnes_image_sec",
         "VIDEO_SUBMIT_TIMEOUT_SEC": "video_submit_timeout_sec",

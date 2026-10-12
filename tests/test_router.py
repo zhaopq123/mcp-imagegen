@@ -28,8 +28,14 @@ def test_models_is_single_image_model():
     assert router.MODELS == ("agnes-image",)
 
 
-def test_alias_maps_to_real_model_id():
-    assert router.MODEL_ALIASES == {"agnes-image": "agnes-image-2.5-flash"}
+def test_router_does_not_hardcode_upstream_model():
+    """路由层不感知上游真实模型名（由配置驱动，见 infra/agnes.resolve_model_ids）。"""
+    assert router.MODEL_ALIASES == {}
+    # 真实模型 ID 不得出现在本模块（防回退为硬编码）
+    src = (router.__file__ or "")
+    import pathlib
+    text = pathlib.Path(src).read_text(encoding="utf-8")
+    assert "agnes-image-2.5-flash" not in text
 
 
 def test_reason_enum_is_closed_set():
