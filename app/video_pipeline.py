@@ -1,4 +1,18 @@
-"""视频流水线（V2 增量设计方案 2.2；T7a 提交+轮询 / T7b query 入口）。
+"""视频流水线（V3 异步化版：设计方案 2.2 T7a 提交 / T7b query 入口）。
+
+V3 核心改造（多队列 + 并发 + 异步，本轮主题）——
+    V2 的真实痛点：视频 run 在**并发槽内**轮询到 deadline（R14），
+    槽池只有 3 个且生图共用——3 个视频请求就能把服务堵死 200s，期间
+    所有生图请求全部 busy（这是本轮要根治的头号性能问题）。
+    V3 把"等待"从"占槽"里摘出来：
+
+        提交（占槽，IO ~秒级）→ 注册后台作业 → **立即释放槽**
+        → 请求侧在自身剩余预算内 await 作业 future（不占槽）
+        → deadline 到仍未完成 → E17 契约返 task_id（客户端续查）
+
+    R14（轮询期持续占槽）由此作废：等待不是 IO，不该占额度。
+    对外契约零变化（A2′ 冻结描述逐字成立）：请求仍在预算内同步等待。
+
 
 串联（run = generate_video 工具后端）：
     参数校验（prompt 必填、seconds 整数 4–12、aspect_ratio 官方六档
@@ -40,8 +54,21 @@ E19 语义）——本轮与 CircuitBreaker 零交互。
 护栏（6.1）：asyncio.timeout(TOTALBUDGETSEC + SLACK) 整体兜底；护栏
 先响（理论不可达）时若已提交转 E17 语义、未提交转超时错误。
 
-日志（R13）：run 与 query 每请求恰好一行访问日志；result 枚举本轮
-新增 "running"（E17 非错误收尾）；stages = validate/queue/submit/poll。
+后台 worker（V3 新增）：
+    提交后由 asyncio.create_task 挂到事件循环（R2：禁线程，仍是协程），
+    受 VIDEO_JOB_CONCURRENCY 闸门限并发轮询，总等待上限
+    VIDEO_JOB_MAX_WAIT_SEC（默认 1800s，远超单请求 deadline —— 请求走了
+    作业还在跑，客户端凭 task_id 续查）；completed 且 persist=true →
+    **后台自动下载落盘**（VIDEO_DIR）→ 写终态 + future 通知。
+    停机时 cancel_background() 只停本端跟踪（上游任务照常跑，E17 哲学）。
+
+query 入口（T7b）：
+    task_id 非空 → 查作业表（未命中/TTL 过期/容量逐出 → task_not_found，
+    E18/R16）→ **有活跃后台 worker 时返回本端实况（零上游 IO，E20 不占
+    槽；V3 快路径）**，否则退回 V2 行为实时打一次上游（兼容路径）。
+
+日志（R13）：run 与 query 每请求恰好一行访问日志；result 枚举含
+"running"（E17 非错误收尾）；stages = validate/queue/submit/wait。
 """
 from __future__ import annotations
 
@@ -71,6 +98,9 @@ SECONDS_MAX = 12
 # 16:9(1280x704) / 9:16(720x1280) / 1:1(720x720) / 4:3(960x720) /
 # 3:4(720x960) / 21:9(1680x720)
 ASPECT_RATIOS = ("16:9", "9:16", "1:1", "4:3", "3:4", "21:9")
+
+# V3：视频泳道名（多队列调度；与生图 image 泳道隔离，互不饿死）
+LANE_VIDEO = "video"
 
 SleepFn = Callable[[float], Awaitable[None]]
 
@@ -153,6 +183,13 @@ class VideoPipeline:
         # T7c：persist 服务（与生图共用同一实例/下载池；None = 组件未注入，
         # persist=True 视同 skipped，独立组件测试用）
         self._persist = persist
+        # ---- V3：后台作业（视频异步化）----
+        self._job_gate = asyncio.Semaphore(
+            max(1, int(getattr(cfg, "video_job_concurrency", 8))))
+        self._job_max_wait = float(
+            getattr(cfg, "video_job_max_wait_sec", 1800.0))
+        self._job_max = max(1, int(getattr(cfg, "video_job_max", 24)))
+        self._bg: dict[str, asyncio.Task] = {}  # task_id → 后台 worker
 
     # ------------------------------------------------------------------
     # 入口一：generate_video
@@ -249,17 +286,23 @@ class VideoPipeline:
                 param, detail = bad
                 return self._finish_error(rec, timer, errors_mod.invalid_params(param, detail))
 
-            # ---- 2. 并发槽（E4 排队计入 deadline；R14 轮询期占槽；R15 finally 释放）----
+            # ---- 2. video 泳道槽：只覆盖"提交"这段 IO（V3 关键改动）----
+            submitted: "tuple[str, str | None]" = ("exhausted", None)
             try:
-                async with self._pool.slot(deadline, req_id):
+                async with self._acquire_slot(deadline, req_id):
                     timer.mark("queue")
-                    return await self._generate(
-                        req_id=req_id, rec=rec, timer=timer, deadline=deadline,
-                        state=state, prompt=prompt, seconds=seconds,
-                        aspect_ratio=aspect_ratio, persist_flag=persist_flag,
-                        seed=seed,
-                        http_headers=http_headers,
+                    submitted = await self._submit(
+                        rec=rec, timer=timer, deadline=deadline,
+                        prompt=prompt, seconds=seconds,
+                        aspect_ratio=aspect_ratio, seed=seed,
                     )
+            except budget_mod.LaneFullError as exc:
+                # V3：泳道排队超限 → busy 快失败（不消耗等待预算）
+                timer.mark("queue")
+                rec.timeout_hit = logline_mod.TIMEOUT_QUEUE_WAIT
+                return self._finish_error(
+                    rec, timer,
+                    errors_mod.queue_full_error(exc.lane, exc.depth, exc.max_queued))
             except budget_mod.SlotBusyError as exc:
                 timer.mark("queue")
                 rec.timeout_hit = logline_mod.TIMEOUT_QUEUE_WAIT
@@ -270,6 +313,35 @@ class VideoPipeline:
                 rec.timeout_hit = logline_mod.TIMEOUT_DEADLINE
                 return self._finish_error(
                     rec, timer, errors_mod.deadline_exhausted(deadline.elapsed()))
+
+            # 提交阶段出口：错误契约行 / 预算耗尽快出（未发 IO）
+            kind, payload = submitted
+            if kind == "error":
+                return payload or contract_mod.format_error(
+                    errors_mod.deadline_exhausted(deadline.elapsed()))
+            if kind == "exhausted" or not payload:
+                timer.mark("submit")
+                rec.timeout_hit = logline_mod.TIMEOUT_DEADLINE
+                return self._finish_error(
+                    rec, timer, errors_mod.deadline_exhausted(deadline.elapsed()))
+
+            video_id = payload
+            state.task_id = video_id  # 护栏兜底路径可转 E17
+            rec.task_id = video_id    # logline 15 字段（T7c）
+            timer.mark("submit")
+
+            # ---- 3. 注册后台作业（future）+ 启动 worker（槽内已完成提交）----
+            job = self._register_job(
+                video_id=video_id, prompt=prompt, rec=rec, seconds=seconds,
+                aspect_ratio=aspect_ratio, seed=seed)
+            self._spawn_worker(
+                job, seconds=seconds, aspect_ratio=aspect_ratio,
+                persist_flag=persist_flag, seed=seed, http_headers=http_headers)
+
+            # ---- 4. 槽外等待：剩余预算内 await（不占任何并发额度，V3）----
+            return await self._await_job(
+                rec=rec, timer=timer, deadline=deadline, job=job,
+                seed=seed, seconds=seconds, aspect_ratio=aspect_ratio)
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # noqa: BLE001 —— 兜底：内部异常也走契约行
@@ -279,101 +351,332 @@ class VideoPipeline:
             if self._tracker is not None:
                 self._tracker.exit()
 
-    # ------------------------------------------------------------------
-    # run 内部：提交 + 轮询（槽内）
-    # ------------------------------------------------------------------
-    async def _generate(
-        self, *, req_id: str, rec: logline_mod.LogRecord, timer: _StageTimer,
-        deadline: budget_mod.Deadline, state: _RunState, prompt: str,
-        seconds: int, aspect_ratio: str, persist_flag: bool,
-        seed: Optional[int] = None,
-        http_headers: Optional[Mapping[str, str]] = None,
-    ) -> str:
-        rec.model = VIDEO_MODEL
 
-        # ---- 3. 提交（read ≤ 提交档 30s；seed 可选直传，D3/官方 F5）----
+    # ------------------------------------------------------------------
+    # V3：提交（槽内）/ 作业登记 / 槽外等待 / 后台 worker
+    # ------------------------------------------------------------------
+    async def _submit(
+        self, *, rec: logline_mod.LogRecord, timer: _StageTimer,
+        deadline: budget_mod.Deadline, prompt: str, seconds: int,
+        aspect_ratio: str, seed: Optional[int] = None,
+    ) -> "tuple[str, str | None]":
+        """提交到上游（槽内执行）。
+
+        返回二元组（kind, payload）——不用裸 str 做出口判定：video_id 与
+        错误契约行同为 str，混在一个返回值里无法区分（V3 首轮真实 bug）：
+            ("ok",        video_id)
+            ("error",     契约错误行)
+            ("exhausted", None)      # 预算耗尽，未发起 IO
+        """
+        rec.model = VIDEO_MODEL
         try:
             api = await self._api.submit_video(
                 model=VIDEO_MODEL, prompt=prompt, seconds=seconds,
                 aspect_ratio=aspect_ratio, deadline=deadline, seed=seed,
             )
         except budget_mod.DeadlineExceededError:
-            timer.mark("submit")
-            rec.timeout_hit = logline_mod.TIMEOUT_DEADLINE
-            return self._finish_error(
-                rec, timer, errors_mod.deadline_exhausted(deadline.elapsed()))
-        timer.mark("submit")
-
+            return ("exhausted", None)
         if not api.ok or not api.video_id:
-            return self._finish_error(rec, timer, self._classify(api))
+            return ("error", self._finish_error(rec, timer, self._classify(api)))
+        return ("ok", api.video_id)
 
-        video_id = api.video_id
-        state.task_id = video_id  # 护栏兜底路径可转 E17
-        rec.task_id = video_id    # logline 15 字段（T7c）
+    def _register_job(
+        self, *, video_id: str, prompt: str, rec: logline_mod.LogRecord,
+        seconds: Optional[int] = None, aspect_ratio: Optional[str] = None,
+        seed: Optional[int] = None,
+    ) -> tasks_mod.JobEntry:
+        """登记作业（含 future 通知）。
+
+        JobTable → register_job；老 TaskTable 退化包装（保持既有单测可
+        注入旧表，V3 不强依赖新表类型）。
+        """
+        register = getattr(self._table, "register_job", None)
+        if callable(register):
+            return register(
+                task_id=video_id, model=VIDEO_MODEL, prompt_hash=rec.prompt_hash,
+                seconds=seconds, aspect_ratio=aspect_ratio, seed=seed)
         self._table.register(
             task_id=video_id, model=VIDEO_MODEL, prompt_hash=rec.prompt_hash)
+        # 退化路径同样必须建 future——否则等待方会"等了个空气"直接转
+        # E17（V3 首轮真实 bug：老表注入场景视频必然返 running）
+        loop = asyncio.get_event_loop()
+        return tasks_mod.JobEntry(
+            task_id=video_id, model=VIDEO_MODEL, prompt_hash=rec.prompt_hash,
+            seconds=seconds, aspect_ratio=aspect_ratio, seed=seed,
+            future=loop.create_future())
 
-        # ---- 4. 轮询循环 ----
-        return await self._poll(
-            req_id=req_id, rec=rec, timer=timer, deadline=deadline,
-            state=state, video_id=video_id, seconds=seconds,
-            aspect_ratio=aspect_ratio, persist_flag=persist_flag,
-            seed=seed,
-            http_headers=http_headers,
-        )
-
-    async def _poll(
-        self, *, req_id: str, rec: logline_mod.LogRecord, timer: _StageTimer,
-        deadline: budget_mod.Deadline, state: _RunState, video_id: str,
-        seconds: int, aspect_ratio: str, persist_flag: bool,
-        seed: Optional[int] = None,
-        http_headers: Optional[Mapping[str, str]] = None,
+    async def _await_job(
+        self, *, rec: logline_mod.LogRecord, timer: _StageTimer,
+        deadline: budget_mod.Deadline, job: tasks_mod.JobEntry,
+        seed: Optional[int], seconds: int, aspect_ratio: str,
     ) -> str:
-        interval = self._cfg.video_poll_interval_sec
-        while True:
-            # 先等间隔再查（设计 2.2；事件循环 sleep 驱动，R2）
-            await self._sleep(interval)
-            try:
-                api = await self._api.query_video(
-                    video_id=video_id, model=VIDEO_MODEL, deadline=deadline)
-            except budget_mod.DeadlineExceededError:
-                # 单查入口检查：预算耗尽 → E17 非错误（零 IO 快出）
-                timer.mark("poll")
-                return self._finish_deferred(
-                    rec, timer, video_id, deadline.elapsed())
-            timer.mark("poll")
-            rec.poll_count = (rec.poll_count or 0) + 1  # 完成一次上游轮询（T7c）
+        """在剩余预算内等待后台作业终态（**不占并发槽**，V3）。"""
+        waited = 0.0
+        if job.future is not None:
+            # 分片等待：asyncio.wait_for 走的是**事件循环真实时钟**，而
+            # deadline 走的是可注入时钟（生产=真实单调钟，测试=FakeClock）。
+            # 一次性 wait_for(remaining) 在注入时钟场景永远不会超时 →
+            # 请求被后台作业拖到作业预算耗尽才返回（V3 首轮真实 bug）。
+            # 故切成小片循环：每片结束回到 deadline 检查（两种时钟都认）。
+            slice_sec = 0.02
+            while not job.future.done():
+                remaining = deadline.remaining()
+                if remaining <= 0:
+                    waited = deadline.elapsed()   # 预算耗尽 → E17
+                    break
+                try:
+                    await asyncio.wait_for(
+                        asyncio.shield(job.future),
+                        timeout=min(remaining, slice_sec),
+                    )
+                except asyncio.TimeoutError:
+                    continue
+                except asyncio.CancelledError:
+                    raise
+        timer.mark("wait")
+        rec.poll_count = job.poll_count or None
 
-            if not api.ok:
-                # 查询失败 → 错误分类返回（detail 附 task_id 便于对账/续查）
-                info = self._classify(api)
-                info = replace(info, reason=f"{info.reason} | task_id={video_id}")
-                return self._finish_error(rec, timer, info)
+        if job.status == tasks_mod.STATUS_COMPLETED and job.final_url:
+            rec.persist = job.persist_status or "skipped"
+            meta = contract_mod.VideoMeta(
+                model=VIDEO_MODEL, seconds=seconds, aspect_ratio=aspect_ratio,
+                elapsed_sec=job.elapsed_sec, seed=seed,
+                persist_status=job.persist_status,
+            )
+            rec.result = "ok"
+            rec.total = timer.total_str()
+            rec.emit()
+            return contract_mod.format_video_success(job.final_url, meta)
 
-            # 命中后顺手 update——表内 status 永远是最近一次上游实况
-            self._table.update(
-                task_id=video_id, status=api.video_status, url=api.video_url)
-
-            if api.video_status == "failed":
-                # E19：唯一视频模型无切换，按原因映射返回
+        if job.status == tasks_mod.STATUS_FAILED:
+            reason = f"task_id={job.task_id}"
+            if job.error_reason:
+                reason = f"{reason} | {job.error_reason}"
+            category = job.error_category or errors_mod.UPSTREAM_ERROR
+            if category == errors_mod.UPSTREAM_ERROR:
                 return self._finish_error(
-                    rec, timer, errors_mod.video_failed_error(f"task_id={video_id}"))
-            if api.video_status == "completed":
-                if api.video_url:
-                    return await self._finish_success(
-                        req_id=req_id, rec=rec, timer=timer, deadline=deadline,
-                        video_id=video_id, seconds=seconds,
-                        aspect_ratio=aspect_ratio, persist_flag=persist_flag,
-                        seed=seed, url=api.video_url,
-                        http_headers=http_headers)
-                # completed 无 URL：上游契约破损 → 按未定义状态分类
-                return self._finish_error(rec, timer, errors_mod.classify_http_status(
-                    200, f"completed 无 url（task_id={video_id}）"))
-            # 非终态（running / 未枚举状态）→ 预算检查后续轮
-            if deadline.expired():
-                # E17：deadline 到仍 running → 非错误返回
-                return self._finish_deferred(
-                    rec, timer, video_id, deadline.elapsed())
+                    rec, timer, errors_mod.video_failed_error(reason))
+            # 后台已归类（429/400/…）→ 原样转发，不压成 upstream_error
+            return self._finish_error(
+                rec, timer, errors_mod.passthrough_error(category, reason))
+
+        # 预算耗尽 / 后台中止 → E17 非错误（上游照常跑）
+        # 契约上的"已等待"必须是**请求侧**等待秒数：后台作业有独立预算
+        # （默认 1800s）且共享同一时钟，直接取 deadline.elapsed() 会报出
+        # 后台预算而非请求预算（V3 首轮真实 bug）→ 钳到总预算。
+        waited_sec = min(waited or deadline.elapsed(), self._cfg.total_budget_sec)
+        return self._finish_deferred(rec, timer, job.task_id, waited_sec)
+
+    def _spawn_worker(
+        self, job: tasks_mod.JobEntry, *, seconds: int, aspect_ratio: str,
+        persist_flag: bool, seed: Optional[int],
+        http_headers: Optional[Mapping[str, str]] = None,
+    ) -> None:
+        """启动后台轮询 worker（每 task_id 至多一个；幂等）。
+
+        在跟踪数达 VIDEO_JOB_MAX 时逐出**最早**的作业（abort，等待方转
+        E17）：后台作业是内存跟踪，无上限增长会把手机内存吃干。
+        """
+        existing = self._bg.get(job.task_id)
+        if existing is not None and not existing.done():
+            return
+        if len(self._bg) >= self._job_max:
+            oldest_id = next(iter(self._bg))   # dict 保插入序
+            oldest = self._bg.pop(oldest_id, None)
+            if oldest is not None and not oldest.done():
+                oldest.cancel()
+            entry = self._table.get(oldest_id)
+            if isinstance(entry, tasks_mod.JobEntry):
+                self._mark_abort(entry, reason="后台作业数超上限，逐出最早者")
+            logger.warning(
+                "[video] 后台作业数达上限 %d，逐出最早作业 %s（上游不受影响）",
+                self._job_max, oldest_id)
+        task = asyncio.create_task(
+            self._job_worker(
+                job, seconds=seconds, aspect_ratio=aspect_ratio,
+                persist_flag=persist_flag, seed=seed, http_headers=http_headers),
+            name=f"video-job-{job.task_id[:8]}",
+        )
+        self._bg[job.task_id] = task
+        task.add_done_callback(
+            lambda _t, tid=job.task_id: self._bg.pop(tid, None))
+
+    async def _job_worker(
+        self, job: tasks_mod.JobEntry, *, seconds: int, aspect_ratio: str,
+        persist_flag: bool, seed: Optional[int],
+        http_headers: Optional[Mapping[str, str]] = None,
+    ) -> None:
+        """后台轮询到终态（脱离请求 deadline），终态通知等待方。
+
+        - 轮询闸门 VIDEO_JOB_CONCURRENCY 限并发；总上限 VIDEO_JOB_MAX_WAIT_SEC；
+        - completed 且 persist=true → 后台自动下载落盘（persist 层永不报错）；
+        - 任何退出路径都保证 future 被 set（防等待方永久挂起）。
+        """
+        deadline = budget_mod.Deadline(self._job_max_wait, clock=self._clock)
+        interval = self._cfg.video_poll_interval_sec
+        try:
+            async with self._job_gate:
+                while True:
+                    await self._sleep(interval)
+                    job.poll_count += 1
+                    try:
+                        api = await self._api.query_video(
+                            video_id=job.task_id, model=VIDEO_MODEL,
+                            deadline=deadline)
+                    except budget_mod.DeadlineExceededError:
+                        self._mark_abort(
+                            job, reason="后台轮询预算耗尽",
+                            elapsed=deadline.elapsed())
+                        return
+                    if not api.ok:
+                        info = self._classify(api)
+                        self._mark_fail(
+                            job,
+                            reason=f"{info.reason} | task_id={job.task_id}",
+                            elapsed=deadline.elapsed(), category=info.category)
+                        return
+                    self._table.update(
+                        task_id=job.task_id, status=api.video_status,
+                        url=api.video_url)
+                    if api.video_status == tasks_mod.STATUS_FAILED:
+                        self._mark_fail(
+                            job, reason=f"task_id={job.task_id}",
+                            elapsed=deadline.elapsed())
+                        return
+                    if api.video_status == tasks_mod.STATUS_COMPLETED:
+                        url = api.video_url
+                        if not url:
+                            self._mark_fail(
+                                job,
+                                reason=f"completed 无 url（task_id={job.task_id}）",
+                                elapsed=deadline.elapsed(),
+                                category=errors_mod.UPSTREAM_ERROR)
+                            return
+                        final_url, persist_status = url, None
+                        if persist_flag and self._persist is not None:
+                            # 后台落盘：用作业自己的下载预算（不受请求 deadline 约束）
+                            final_url, persist_status = await self._persist.persist_video(
+                                url,
+                                deadline=budget_mod.Deadline(
+                                    self._cfg.persist_timeout_video_sec,
+                                    clock=self._clock),
+                                req_id=job.task_id[:12],
+                                headers=http_headers)
+                        self._mark_complete(
+                            job, url=url, elapsed=deadline.elapsed(),
+                            persist_status=persist_status, final_url=final_url)
+                        return
+                    if deadline.expired():
+                        self._mark_abort(
+                            job, reason="后台轮询总等待超限",
+                            elapsed=deadline.elapsed())
+                        return
+        except asyncio.CancelledError:
+            self._mark_abort(job, reason="服务停机，后台跟踪已取消")
+            raise
+        except Exception as exc:  # noqa: BLE001 —— 后台作业绝不外抛
+            logger.exception("[video] 后台作业异常 task_id=%s", job.task_id)
+            self._mark_fail(
+                job, reason=f"后台异常 {type(exc).__name__}: {exc}",
+                elapsed=deadline.elapsed())
+        finally:
+            if job.future is not None and not job.future.done():
+                self._mark_abort(
+                    job, reason="后台作业提前退出",
+                    elapsed=deadline.elapsed())
+
+    def _acquire_slot(self, deadline: budget_mod.Deadline, req_id: str):
+        """取并发槽：优先 video 泳道（V3 多队列），老 SlotPool 回退原路径。"""
+        lane_of = getattr(self._pool, "lane", None)
+        if callable(lane_of):
+            return lane_of(LANE_VIDEO).slot(deadline, req_id)
+        return self._pool.slot(deadline, req_id)
+
+    def list_jobs(self, limit: int = 20) -> list[dict]:
+        """在跟踪的视频作业快照（最近提交在前；供 list_video_tasks 工具）。"""
+        entries = [
+            e for e in getattr(self._table, "_entries", {}).values()
+            if isinstance(e, tasks_mod.JobEntry)
+        ]
+        entries.sort(key=lambda e: e.submitted_at, reverse=True)
+        return [
+            {
+                "task_id": e.task_id,
+                "status": e.status,
+                "elapsed": round(e.elapsed_sec, 1),
+                "url": e.final_url or e.url,
+                "persist": e.persist_status,
+            }
+            for e in entries[:max(1, limit)]
+        ]
+
+    # ------------------------------------------------------------------
+    # 终态写入（JobTable 直用；老 TaskTable 退化到 update + future 通知）
+    # ------------------------------------------------------------------
+    def _notify_done(self, job: tasks_mod.JobEntry, result: str) -> None:
+        if job.future is not None and not job.future.done():
+            job.future.set_result(result)
+
+    def _mark_complete(
+        self, job: tasks_mod.JobEntry, *, url: Optional[str], elapsed: float,
+        persist_status: Optional[str], final_url: Optional[str],
+    ) -> None:
+        table = self._table
+        if hasattr(table, "complete"):
+            table.complete(
+                job.task_id, url=url, elapsed_sec=elapsed,
+                persist_status=persist_status, final_url=final_url)
+            return
+        table.update(job.task_id, status=tasks_mod.STATUS_COMPLETED,
+                     url=final_url or url)
+        # 退化路径：表里是 TaskEntry、手上持有的是 JobEntry 副本，
+        # status 必须同步写到副本——否则等待方读到的永远是 running
+        job.status = tasks_mod.STATUS_COMPLETED
+        job.url = final_url or url
+        job.final_url = final_url or url
+        job.persist_status = persist_status
+        job.elapsed_sec = elapsed
+        self._notify_done(job, tasks_mod.JOB_RESULT_OK)
+
+    def _mark_fail(
+        self, job: tasks_mod.JobEntry, *, reason: str, elapsed: float,
+        category: Optional[str] = None,
+    ) -> None:
+        """标记失败（category 为后台已归类的类别，供请求侧原样转发）。"""
+        job.error_category = category or errors_mod.UPSTREAM_ERROR
+        table = self._table
+        if hasattr(table, "fail"):
+            table.fail(job.task_id, reason=reason, elapsed_sec=elapsed)
+            return
+        table.update(job.task_id, status=tasks_mod.STATUS_FAILED)
+        job.status = tasks_mod.STATUS_FAILED
+        job.error_reason = reason
+        job.elapsed_sec = elapsed
+        self._notify_done(job, tasks_mod.JOB_RESULT_FAILED)
+
+    def _mark_abort(
+        self, job: tasks_mod.JobEntry, *, reason: str, elapsed: float = 0.0,
+    ) -> None:
+        """未达终态即停止跟踪（上游不受影响，等待方转 E17 deferred）。"""
+        table = self._table
+        if hasattr(table, "abort"):
+            table.abort(job.task_id, reason=reason, elapsed_sec=elapsed)
+            return
+        job.error_reason = reason
+        job.elapsed_sec = elapsed
+        self._notify_done(job, tasks_mod.JOB_RESULT_TIMEOUT)
+
+    def cancel_background(self) -> int:
+        """停机：取消全部后台 worker（返回取消数；上游任务不受影响）。"""
+        count = 0
+        for task_id, task in list(self._bg.items()):
+            if not task.done():
+                task.cancel()
+                count += 1
+            self._bg.pop(task_id, None)
+        if count:
+            logger.info("[video] 停机：取消 %d 个后台作业（上游任务照常跑）", count)
+        return count
 
     # ------------------------------------------------------------------
     # query 内部
@@ -399,7 +702,52 @@ class VideoPipeline:
                 return self._finish_error(
                     rec, timer, errors_mod.task_not_found_error(task_id))
 
-            # ---- 3. 实时打上游（read ≤10s；不占并发槽 E20）----
+            # ---- 3. V3 快路径：终态**或**有活跃后台 worker → 实况已在本地，
+            #      直接返回（零上游 IO，E20 不占槽）。
+            #      注意：作业完成后 worker 会退出并从 _bg 摘除——此时若只看
+            #      worker 活跃度就会退化成打上游（V3 首轮真实缺陷），故终态
+            #      必须无条件走本地。----
+            worker = self._bg.get(task_id)
+            worker_active = worker is not None and not worker.done()
+            job = entry if isinstance(entry, tasks_mod.JobEntry) else None
+            if job is not None and (
+                worker_active
+                or entry.status in (
+                    tasks_mod.STATUS_COMPLETED, tasks_mod.STATUS_FAILED)
+            ):
+                rec.poll_count = (job.poll_count or None) if job else None
+                if entry.status == tasks_mod.STATUS_COMPLETED:
+                    url = (job.final_url if job else None) or entry.url
+                    if not url:
+                        return self._finish_error(rec, timer, errors_mod.classify_http_status(
+                            200, f"completed 无 url（task_id={task_id}）"))
+                    rec.result = "ok"
+                    rec.persist = (job.persist_status if job else None) or "skipped"
+                    rec.total = timer.total_str()
+                    rec.emit()
+                    if job is not None and job.seconds is not None:
+                        meta = contract_mod.VideoMeta(
+                            model=VIDEO_MODEL, seconds=job.seconds,
+                            aspect_ratio=job.aspect_ratio or "16:9",
+                            elapsed_sec=job.elapsed_sec, seed=job.seed,
+                            persist_status=job.persist_status)
+                        return contract_mod.format_video_success(url, meta)
+                    return url
+                if entry.status == tasks_mod.STATUS_FAILED:
+                    reason = (job.error_reason if job else None) or f"task_id={task_id}"
+                    category = (job.error_category if job else None) or errors_mod.UPSTREAM_ERROR
+                    if category == errors_mod.UPSTREAM_ERROR:
+                        return self._finish_error(
+                            rec, timer, errors_mod.video_failed_error(reason))
+                    return self._finish_error(
+                        rec, timer, errors_mod.passthrough_error(category, reason))
+                rec.result = "running"
+                rec.total = timer.total_str()
+                rec.emit()
+                return contract_mod.format_video_status(task_id, entry.status)
+
+            # ---- 4. 兼容路径（无后台 worker：老 TaskTable / 独立组件场景）：
+            #      实时打上游（read ≤10s；不占并发槽 E20）----
             try:
                 api = await self._api.query_video(
                     video_id=task_id, model=VIDEO_MODEL, deadline=deadline)
@@ -459,33 +807,6 @@ class VideoPipeline:
         rec.total = timer.total_str()
         rec.emit()
         return contract_mod.format_video_deferred(task_id, waited_sec)
-
-    async def _finish_success(
-        self, *, req_id: str, rec: logline_mod.LogRecord, timer: _StageTimer,
-        deadline: budget_mod.Deadline, video_id: str, seconds: int,
-        aspect_ratio: str, persist_flag: bool, url: str,
-        seed: Optional[int] = None,
-        http_headers: Optional[Mapping[str, str]] = None,
-    ) -> str:
-        final_url, persist_status = url, None
-        if persist_flag and self._persist is not None:
-            # T7c：persist=true → 下载落盘 VIDEO_DIR（read = min(120s, 剩余)，
-            # 计入 deadline，仍在并发槽内）；C6/R5——PersistService 永不报错，
-            # 失败/预算不足降级返 (原上游 URL, persist_failed)，非错误；
-            # headers 透传用于 /files URL 绝对化（Q3：Host/转发头推断）。
-            final_url, persist_status = await self._persist.persist_video(
-                url, deadline=deadline, req_id=req_id,
-                headers=http_headers)
-        rec.persist = persist_status or "skipped"
-        meta = contract_mod.VideoMeta(
-            model=VIDEO_MODEL, seconds=seconds, aspect_ratio=aspect_ratio,
-            elapsed_sec=deadline.elapsed(), seed=seed,
-            persist_status=persist_status,
-        )
-        rec.result = "ok"
-        rec.total = timer.total_str()
-        rec.emit()
-        return contract_mod.format_video_success(final_url, meta)
 
     # ------------------------------------------------------------------
     # 其他辅助

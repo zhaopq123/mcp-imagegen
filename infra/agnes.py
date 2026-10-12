@@ -54,7 +54,7 @@ from typing import Awaitable, Callable, Optional, Tuple
 
 import httpx
 
-from . import budget
+from . import budget, ratelimit
 from engine import errors as errors_mod  # D6：错误体双格式 message 提取（纯函数）
 
 logger = logging.getLogger("mcp_imagegen.agnes")
@@ -259,12 +259,15 @@ class AgnesClient:
         client_factory: Optional[Callable[..., httpx.AsyncClient]] = None,
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
         drain_poll_sec: float = DRAIN_POLL_SEC,
+        limiter: Optional[ratelimit.RateLimiter] = None,
     ) -> None:
         self._cfg = cfg
         self._transport = transport
         self._client_factory = client_factory or httpx.AsyncClient
         self._sleep = sleep
         self._drain_poll_sec = drain_poll_sec
+        # V3：上游限速（None = 不限；生产由 server 装配，测试可注入假身）
+        self._limiter = limiter
         # 模型 ID 映射：由配置解析（空串回落内置默认），实例级持有
         self._model_ids = resolve_model_ids(cfg)
         self._image_model_id = self._model_ids["agnes-image"]
@@ -433,6 +436,17 @@ class AgnesClient:
         deadline: budget.Deadline,
         parse: Callable[[httpx.Response, str], ApiCallResult],
     ) -> ApiCallResult:
+        # V3：先过限速闸门（等待计入 deadline）。撞 429 被硬熔断 10 分钟的
+        # 代价比"自己排队几秒"高得多（2026-10-13 压测实证）。
+        if self._limiter is not None:
+            try:
+                await self._limiter.acquire(
+                    wait_cap_sec=max(deadline.remaining(), 0.0))
+            except asyncio.TimeoutError:
+                return ApiCallResult(
+                    ok=False, model_id=model_id,
+                    error_detail="upstream rate limit wait exceeded deadline",
+                )
         handle = self._current
         handle.in_flight += 1
         try:
@@ -507,6 +521,11 @@ class AgnesClient:
                 continue
             if status == 200:
                 return parse(resp, model_id)
+            # V3：上游明确过载（429 限流 / 503 队列满）→ 冻结限速窗口，
+            # 让后续请求排队而不是继续硬闯（否则整段窗口内全军覆没）
+            if status == 429 or 500 <= status <= 599:
+                if self._limiter is not None:
+                    self._limiter.penalize(_parse_retry_after(resp))
             # 4xx / 429 / 重试耗尽的 5xx：零重试或不再重试，直接返回
             return ApiCallResult(
                 ok=False,

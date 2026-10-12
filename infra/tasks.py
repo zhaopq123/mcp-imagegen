@@ -27,6 +27,12 @@ STATUS_RUNNING = "running"
 STATUS_COMPLETED = "completed"
 STATUS_FAILED = "failed"
 
+# V3：后台作业终态（视频异步化后，作业生命周期可跨请求——
+# 请求 deadline 到了作业仍在跑，由后台 worker 继续轮询到终态）
+JOB_RESULT_OK = "ok"
+JOB_RESULT_FAILED = "failed"
+JOB_RESULT_TIMEOUT = "timeout"
+
 # 周期清理间隔（方案 2.3：与心跳同为事件循环 sleep 驱动；TTL 7200s
 # 量级下 60s 足够稀疏，且 get 命中路径已做单条惰性清除兜底）
 CLEANUP_INTERVAL_SEC = 60.0
@@ -42,6 +48,27 @@ class TaskEntry:
     status: str = STATUS_RUNNING
     url: Optional[str] = None
     submitted_at: float = 0.0
+
+
+@dataclass
+class JobEntry(TaskEntry):
+    """视频后台作业条目（V3）：TaskEntry + 完成通知 + 结果载荷。
+
+    future 语义：由后台 worker 在到达终态（completed/failed/超时）时
+    set_result；请求侧在自身 deadline 内 await 它（不占并发槽）。
+    future 只 set 一次（worker 内做 done() 判断，防重复 set 抛错）。
+    """
+
+    future: Optional[asyncio.Future] = None
+    final_url: Optional[str] = None     # persist 后的自托管 URL（未 persist 即上游 URL）
+    persist_status: Optional[str] = None
+    error_reason: Optional[str] = None  # failed 的原因（契约行 detail）
+    error_category: Optional[str] = None  # V3：后台已归类的类别（防请求侧二次分类）
+    elapsed_sec: float = 0.0
+    poll_count: int = 0
+    seconds: Optional[int] = None
+    aspect_ratio: Optional[str] = None
+    seed: Optional[int] = None
 
 
 class TaskTable:
@@ -152,3 +179,97 @@ class TaskTable:
             "上游任务不受影响，本端表现为 task_not_found，R16）",
             self._max, overflow,
         )
+
+
+# ---------------------------------------------------------------------------
+# V3：视频后台作业表（JobTable）
+# ---------------------------------------------------------------------------
+class JobTable(TaskTable):
+    """视频异步作业表：TaskTable + 完成通知（future）+ 结果载荷。
+
+    与 TaskTable 的关系（避免死代码与双头实现）：
+    - 继承复用 TTL / 容量逐出 / 周期清理（同一契约 R16：过期即
+      task_not_found）；
+    - 仅新增"作业"语义：future 通知 + persist 结果 + 后台轮询计数；
+    - register_job 兼容父类 register 的签名（旧的 query 路径仍可 update/get）。
+
+    并发模型同父类：单事件循环内串行访问，无锁（R2）。
+    """
+
+    def register_job(
+        self, task_id: str, *, model: str, prompt_hash: str,
+        seconds: Optional[int] = None, aspect_ratio: Optional[str] = None,
+        seed: Optional[int] = None,
+    ) -> JobEntry:
+        """登记作业并建完成通知 future；超限逐出同父类契约。"""
+        entry = JobEntry(
+            task_id=task_id,
+            model=model,
+            prompt_hash=prompt_hash,
+            status=STATUS_RUNNING,
+            submitted_at=self._clock(),
+            seconds=seconds,
+            aspect_ratio=aspect_ratio,
+            seed=seed,
+        )
+        loop = asyncio.get_event_loop()
+        entry.future = loop.create_future()
+        self._entries[task_id] = entry
+        self._evict_over_capacity()
+        return entry
+
+    def get_job(self, task_id: str) -> Optional[JobEntry]:
+        """取作业（TTL 过期 → None，同 R16 契约）。"""
+        entry = self.get(task_id)
+        if isinstance(entry, JobEntry):
+            return entry
+        return None
+
+    def complete(
+        self, task_id: str, *, url: Optional[str], elapsed_sec: float,
+        persist_status: Optional[str] = None, final_url: Optional[str] = None,
+    ) -> Optional[JobEntry]:
+        """作业成功终态：写表 + 通知等待方（future 只 set 一次）。"""
+        entry = self.update(
+            task_id, status=STATUS_COMPLETED, url=url)
+        if not isinstance(entry, JobEntry):
+            return None
+        entry.final_url = final_url or url
+        entry.persist_status = persist_status
+        entry.elapsed_sec = elapsed_sec
+        self._notify(entry, JOB_RESULT_OK)
+        return entry
+
+    def fail(
+        self, task_id: str, *, reason: str, elapsed_sec: float,
+    ) -> Optional[JobEntry]:
+        """作业失败终态：写表 + 通知等待方。"""
+        entry = self.update(task_id, status=STATUS_FAILED)
+        if not isinstance(entry, JobEntry):
+            return None
+        entry.error_reason = reason
+        entry.elapsed_sec = elapsed_sec
+        self._notify(entry, JOB_RESULT_FAILED)
+        return entry
+
+    def abort(self, task_id: str, *, reason: str, elapsed_sec: float = 0.0) -> None:
+        """作业未达终态即终止（后台轮询超时 / 停机取消）→ 通知等待方。
+
+        注意：不写 STATUS_FAILED——上游任务可能仍在跑，本端只是停止跟踪
+        （E17 哲学：上游不受本端影响）。等待方收到 JOB_RESULT_TIMEOUT，
+        请求侧据此返回 deferred（task_id + status=running）。
+        """
+        entry = self._entries.get(task_id)
+        if not isinstance(entry, JobEntry):
+            return
+        entry.elapsed_sec = elapsed_sec
+        entry.error_reason = reason
+        self._notify(entry, JOB_RESULT_TIMEOUT)
+
+    # ------------------------------------------------------------------
+    # 内部
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _notify(entry: JobEntry, result: str) -> None:
+        if entry.future is not None and not entry.future.done():
+            entry.future.set_result(result)

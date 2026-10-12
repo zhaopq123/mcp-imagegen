@@ -54,6 +54,9 @@ WATCHDOG_SEC = 30.0               # systemd WatchdogSec（6.1；须 > 2×心跳�
 DAILY_REBUILD_HOUR = 4             # 每日客户端重建调度时刻（6.2：每日 04:00 本地时间）
 REQUEST_GUARD_SLACK_SEC = 1.0     # 整体 asyncio.timeout 护栏 = TOTALBUDGETSEC + 本松弛量（6.1 自救兜底）
 DISK_WATERMARK_RATIO = 0.90       # 磁盘水位阈值（6.2 超线只 WARN + meta 提示；规格书未定数值，工程默认 90%）
+# V3：batch 合法区间上限（与 app/pipeline.BATCH_MAX 同源；config 不反向依赖 app，
+# 故在此单一出处定义，pipeline 从 config 导入以杜绝双头常量）
+BATCH_MAX = 4
 
 
 class ConfigError(Exception):
@@ -122,6 +125,24 @@ _ENV_SPEC: dict[str, tuple[type, object]] = {
     "PERSIST_TIMEOUT_VIDEO_SEC": (float, 120.0),
     "TASK_TTL_SEC": (float, 7200.0),
     "TASK_MAX": (int, 100),
+    # ---- V3 增量：多队列 / 并发 / 视频后台异步（IMAGE=生图泳道，
+    #      VIDEO=视频泳道；两泳道独立额度，互不饿死）----
+    "IMAGE_MAX_CONCURRENCY": (int, 3),      # 生图泳道并发槽
+    "VIDEO_MAX_CONCURRENCY": (int, 3),      # 视频泳道并发槽（提交+单查 IO 期间占用）
+    "IMAGE_QUEUE_WAIT_SEC": (float, 30.0),  # 生图排队等待上限（计入 deadline）
+    "VIDEO_QUEUE_WAIT_SEC": (float, 30.0),  # 视频排队等待上限（计入 deadline）
+    "IMAGE_QUEUE_MAX": (int, 64),           # 生图泳道排队深度上限（超限 → busy）
+    "VIDEO_QUEUE_MAX": (int, 16),           # 视频泳道排队深度上限
+    "IMAGE_BATCH_CONCURRENCY": (int, 4),    # 单次请求内 batch 拆分的并发度（1–4）
+    # 视频后台作业（脱离请求 deadline，由后台 worker 轮询到终态）
+    "VIDEO_JOB_MAX_WAIT_SEC": (float, 1800.0),  # 后台轮询总上限（> deadline，跨请求续命）
+    "VIDEO_JOB_MAX": (int, 24),                 # 同时跟踪的后台作业数上限
+    "VIDEO_JOB_CONCURRENCY": (int, 8),          # 后台同时轮询的作业数上限
+    # ---- V3：上游速率限制（压测实证：放开并发会撞 429 → 硬熔断 10min，
+    #      不如自己排队慢慢发）----
+    "UPSTREAM_RPS": (float, 1.0),               # 上游请求匀速上限（令牌/秒）
+    "UPSTREAM_BURST": (int, 2),                 # 允许的短突发（桶容量）
+    "UPSTREAM_COOLDOWN_SEC": (float, 15.0),     # 收到 429/503 后的冻结时长
 }
 
 # 必填密钥（缺失/为空 → 启动 fail-fast）
@@ -160,6 +181,21 @@ class Config:
     persist_timeout_video_sec: float
     task_ttl_sec: float
     task_max: int
+    # ---- V3（多队列 / 并发 / 视频后台异步）----
+    image_max_concurrency: int
+    video_max_concurrency: int
+    image_queue_wait_sec: float
+    video_queue_wait_sec: float
+    image_queue_max: int
+    video_queue_max: int
+    image_batch_concurrency: int
+    video_job_max_wait_sec: float
+    video_job_max: int
+    video_job_concurrency: int
+    # ---- V3：上游速率限制 ----
+    upstream_rps: float
+    upstream_burst: int
+    upstream_cooldown_sec: float
 
     # ------------------------------------------------------------------
     # 启动自检：嵌套不等式（红线 B6）
@@ -235,6 +271,51 @@ class Config:
         if self.task_max < 1:
             problems.append(f"TASK_MAX={self.task_max} 必须 ≥ 1")
 
+        # ---- V3 增量自检（多队列 / 并发 / 后台作业）----
+        if self.image_max_concurrency < 1:
+            problems.append(
+                f"IMAGE_MAX_CONCURRENCY={self.image_max_concurrency} 必须 ≥ 1")
+        if self.video_max_concurrency < 1:
+            problems.append(
+                f"VIDEO_MAX_CONCURRENCY={self.video_max_concurrency} 必须 ≥ 1")
+        if self.image_queue_wait_sec <= 0:
+            problems.append(
+                f"IMAGE_QUEUE_WAIT_SEC={self.image_queue_wait_sec}s 必须 > 0")
+        if self.video_queue_wait_sec <= 0:
+            problems.append(
+                f"VIDEO_QUEUE_WAIT_SEC={self.video_queue_wait_sec}s 必须 > 0")
+        if self.image_queue_wait_sec > self.total_budget_sec:
+            problems.append(
+                f"IMAGE_QUEUE_WAIT_SEC={self.image_queue_wait_sec}s > "
+                f"TOTALBUDGETSEC={self.total_budget_sec}s（排队计入预算）")
+        if self.video_queue_wait_sec > self.total_budget_sec:
+            problems.append(
+                f"VIDEO_QUEUE_WAIT_SEC={self.video_queue_wait_sec}s > "
+                f"TOTALBUDGETSEC={self.total_budget_sec}s（排队计入预算）")
+        if self.image_queue_max < 1:
+            problems.append(f"IMAGE_QUEUE_MAX={self.image_queue_max} 必须 ≥ 1")
+        if self.video_queue_max < 1:
+            problems.append(f"VIDEO_QUEUE_MAX={self.video_queue_max} 必须 ≥ 1")
+        if not 1 <= self.image_batch_concurrency <= BATCH_MAX:
+            problems.append(
+                f"IMAGE_BATCH_CONCURRENCY={self.image_batch_concurrency} 必须落在 "
+                f"1–{BATCH_MAX}（与 batch_size 合法区间一致）")
+        if self.video_job_max_wait_sec <= 0:
+            problems.append(
+                f"VIDEO_JOB_MAX_WAIT_SEC={self.video_job_max_wait_sec}s 必须 > 0")
+        if self.video_job_max < 1:
+            problems.append(f"VIDEO_JOB_MAX={self.video_job_max} 必须 ≥ 1")
+        if self.video_job_concurrency < 1:
+            problems.append(
+                f"VIDEO_JOB_CONCURRENCY={self.video_job_concurrency} 必须 ≥ 1")
+        if self.upstream_rps <= 0:
+            problems.append(f"UPSTREAM_RPS={self.upstream_rps} 必须 > 0")
+        if self.upstream_burst < 1:
+            problems.append(f"UPSTREAM_BURST={self.upstream_burst} 必须 ≥ 1")
+        if self.upstream_cooldown_sec < 0:
+            problems.append(
+                f"UPSTREAM_COOLDOWN_SEC={self.upstream_cooldown_sec} 必须 ≥ 0")
+
         if problems:
             raise ConfigError(
                 "嵌套不等式自检失败（read ≤ 分档 ≤ 200 < 210 建议 < 220）：\n  - "
@@ -253,6 +334,17 @@ class Config:
             f"单查 {self.video_query_timeout_sec:g}s ≤ 单查 ≤ 提交 ≤ deadline "
             f"({self.total_budget_sec:g}s) ✓ | 轮询 {self.video_poll_interval_sec:g}s | "
             f"任务表 TTL {self.task_ttl_sec:g}s / 容量 {self.task_max} ✓",
+            "[config] V3 多队列自检: "
+            f"生图泳道 并发{self.image_max_concurrency}/等待{self.image_queue_wait_sec:g}s/"
+            f"队列深{self.image_queue_max} | "
+            f"视频泳道 并发{self.video_max_concurrency}/等待{self.video_queue_wait_sec:g}s/"
+            f"队列深{self.video_queue_max} | "
+            f"batch 并发 {self.image_batch_concurrency} ✓ | "
+            f"视频后台作业 上限{self.video_job_max}/轮询并发{self.video_job_concurrency}/"
+            f"总等待{self.video_job_max_wait_sec:g}s ✓",
+            "[config] V3 上游限速自检: "
+            f"{self.upstream_rps:g} req/s（突发 {self.upstream_burst}）| "
+            f"过载冻结 {self.upstream_cooldown_sec:g}s ✓",
         ]
 
 
@@ -320,5 +412,20 @@ def _field_name(env_name: str) -> str:
         "PERSIST_TIMEOUT_VIDEO_SEC": "persist_timeout_video_sec",
         "TASK_TTL_SEC": "task_ttl_sec",
         "TASK_MAX": "task_max",
+        # ---- V3（多队列 / 并发 / 视频后台异步）----
+        "IMAGE_MAX_CONCURRENCY": "image_max_concurrency",
+        "VIDEO_MAX_CONCURRENCY": "video_max_concurrency",
+        "IMAGE_QUEUE_WAIT_SEC": "image_queue_wait_sec",
+        "VIDEO_QUEUE_WAIT_SEC": "video_queue_wait_sec",
+        "IMAGE_QUEUE_MAX": "image_queue_max",
+        "VIDEO_QUEUE_MAX": "video_queue_max",
+        "IMAGE_BATCH_CONCURRENCY": "image_batch_concurrency",
+        "VIDEO_JOB_MAX_WAIT_SEC": "video_job_max_wait_sec",
+        "VIDEO_JOB_MAX": "video_job_max",
+        "VIDEO_JOB_CONCURRENCY": "video_job_concurrency",
+        # ---- V3：上游速率限制 ----
+        "UPSTREAM_RPS": "upstream_rps",
+        "UPSTREAM_BURST": "upstream_burst",
+        "UPSTREAM_COOLDOWN_SEC": "upstream_cooldown_sec",
     }
     return special[env_name]

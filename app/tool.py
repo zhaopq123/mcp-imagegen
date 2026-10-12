@@ -63,6 +63,8 @@ if TYPE_CHECKING:  # 仅类型标注；运行时避免 tool ↔ pipeline 循环�
 TOOL_NAME = "generate_image"
 TOOL_NAME_VIDEO = "generate_video"
 TOOL_NAME_QUERY = "query_video"
+# V3：异步作业总览（不触碰上面三个冻结工具的 schema/description）
+TOOL_NAME_LIST = "list_video_tasks"
 
 # A1″：description 逐字符冻结（A1′ 原文 + D2 size/ratio 语义句；
 # tests/test_tool.py 全等断言拦截一切改动）
@@ -104,6 +106,15 @@ TOOL_PARAMS_VIDEO: tuple[str, ...] = (
     "prompt", "seconds", "aspect_ratio", "seed", "persist",
 )
 TOOL_PARAMS_QUERY: tuple[str, ...] = ("task_id",)
+TOOL_PARAMS_LIST: tuple[str, ...] = ("limit",)
+
+# V3：list_video_tasks 描述（自建，非规格书冻结文本）
+TOOL_DESCRIPTION_LIST = (
+    "List the video generation tasks currently tracked in memory "
+    "(newest first). Use it after submitting several videos "
+    "asynchronously to see their task_id, status and result URL at "
+    "once, instead of polling query_video one by one."
+)
 
 
 def register_tool(
@@ -180,6 +191,19 @@ def register_tool(
     ) -> str:
         """见模块级 TOOL_DESCRIPTION_QUERY（此处 docstring 不进 schema）。"""
         return await video_pipeline.query(task_id=task_id)
+
+    @mcp.tool(name=TOOL_NAME_LIST, description=TOOL_DESCRIPTION_LIST)
+    async def list_video_tasks(
+        limit: Annotated[
+            int, Field(description="最多返回条数；默认 20")
+        ] = 20,
+    ) -> str:
+        """见模块级 TOOL_DESCRIPTION_LIST（此处 docstring 不进 schema）。"""
+        import json
+
+        jobs = video_pipeline.list_jobs(limit=limit)
+        return json.dumps(
+            {"count": len(jobs), "tasks": jobs}, ensure_ascii=False)
 
     # 注册后的函数对象已替换为 Tool，无需保留引用
     return None

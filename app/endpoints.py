@@ -16,7 +16,7 @@ import hmac
 import logging
 import re
 from pathlib import Path
-from typing import Iterable
+from typing import Callable, Iterable
 
 from starlette.requests import Request
 from starlette.responses import FileResponse, JSONResponse, PlainTextResponse, Response
@@ -39,6 +39,27 @@ _NOT_FOUND = PlainTextResponse("not found", status_code=404)
 def healthz_endpoint(request: Request) -> Response:
     """GET /healthz → 200（循环活着即可达；不参与僵死判据）。"""
     return JSONResponse({"status": "ok"})
+
+
+def make_healthz_endpoint(components=None) -> Callable[[Request], Response]:
+    """V3：带队列实况的 /healthz（巡检/压测看积压）。
+
+    components 为 None 时退化为纯探活（兼容既有调用与单测）。
+    """
+
+    def _endpoint(request: Request) -> Response:
+        payload: dict = {"status": "ok"}
+        if components is not None:
+            pool = getattr(components, "pool", None)
+            if pool is not None and hasattr(pool, "stats"):
+                payload["queues"] = pool.stats()
+            table = getattr(getattr(components, "video_pipeline", None),
+                            "_table", None)
+            if table is not None:
+                payload["video_jobs"] = len(table)
+        return JSONResponse(payload)
+
+    return _endpoint
 
 
 def make_files_endpoint(image_dir: str, video_dir: "str | None" = None):

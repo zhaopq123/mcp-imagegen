@@ -35,7 +35,7 @@ import uuid
 from typing import Callable, Mapping, Optional
 
 from app import contract as contract_mod
-from config import DISK_WATERMARK_RATIO, REQUEST_GUARD_SLACK_SEC, Config
+from config import BATCH_MAX, DISK_WATERMARK_RATIO, REQUEST_GUARD_SLACK_SEC, Config
 from engine import errors as errors_mod
 from engine import normalizer as normalizer_mod
 from engine import router as router_mod
@@ -48,7 +48,12 @@ from ops import shutdown as shutdown_mod
 
 logger = logging.getLogger("mcp_imagegen.pipeline")
 
-BATCH_MAX = 4  # batch 合法区间 1–4（规格书二；schema 不硬约束，此处校验）
+# batch 合法区间 1–4（规格书二；schema 不硬约束，此处校验）
+# V3：常量单一出处迁至 config.BATCH_MAX（自检要用），此处保留同名导出。
+BATCH_MAX = BATCH_MAX
+
+# V3：泳道名（多队列调度；生图走 image 泳道）
+LANE_IMAGE = "image"
 
 
 def validate_params(
@@ -128,6 +133,11 @@ class GeneratePipeline:
         self._persist = persist
         self._tracker = tracker
         self._clock = clock or time.monotonic  # deadline 时钟（测试注入 FakeClock）
+        # V3：batch 拆分的并发度（1–BATCH_MAX；受 IMAGE_BATCH_CONCURRENCY 配置）
+        self._batch_concurrency = max(
+            1, min(int(getattr(cfg, "image_batch_concurrency", BATCH_MAX)), BATCH_MAX))
+        # V3：泳道选择（MultiQueuePool 有 lane()；老 SlotPool 走 slot()，duck typing 兼容）
+        self._lane_name = LANE_IMAGE
 
     # ------------------------------------------------------------------
     # 入口
@@ -198,9 +208,9 @@ class GeneratePipeline:
                 rec.emit()
                 return contract_mod.format_error(info)
 
-            # ---- 2. 并发槽（E4：排队等待计入 deadline）----
+            # ---- 2. 并发槽（E4：排队等待计入 deadline；V3 走 image 泳道）----
             try:
-                async with self._pool.slot(deadline, req_id):
+                async with self._acquire_slot(deadline, req_id):
                     timer.mark("queue")
                     return await self._generate(
                         req_id=req_id, rec=rec, timer=timer, deadline=deadline,
@@ -208,6 +218,15 @@ class GeneratePipeline:
                         persist_flag=persist_flag, ratio=ratio,
                         http_headers=http_headers,
                     )
+            except budget_mod.LaneFullError as exc:
+                # V3：泳道排队超限 → busy（快失败，不消耗等待预算）
+                timer.mark("queue")
+                info = errors_mod.queue_full_error(exc.lane, exc.depth, exc.max_queued)
+                rec.timeout_hit = logline_mod.TIMEOUT_QUEUE_WAIT
+                rec.result = f"error:{info.category}"
+                rec.total = timer.total_str()
+                rec.emit()
+                return contract_mod.format_error(info)
             except budget_mod.SlotBusyError as exc:
                 timer.mark("queue")
                 info = errors_mod.busy_error(exc.waited_sec)
@@ -264,48 +283,69 @@ class GeneratePipeline:
         rec.model = model
         normalized_size = normalizer_mod.normalize_size(size)
 
-        # ---- 4. 拆分串行（agnes-image 无原生 batch；单次 1 张）----
+        # ---- 4. 拆分并发（V3：agnes-image 无原生 batch；单次 1 张，
+        #      拆成的 n 次调用**并发**发出，并发度 = min(batch, 配置值)）----
         urls: list[str] = []
         last_error: Optional[errors_mod.ErrorInfo] = None
         tier = self._cfg.timeout_agnes_image_sec
         call_count = 0
         probe_sent = False  # 探针是否已实际发出（发出即消费，E8）
 
-        for _ in range(batch_size):
-            # R20：每次调用前 deadline 剩余 ≥ 单次档才发起；不足即止
-            if deadline.remaining() < tier:
-                logger.info(
-                    "[pipeline] req_id=%s 预算剩余 %.1fs < 单次档 %.1fs，"
-                    "拆分串行即止（%d/%d 已发）",
-                    req_id, deadline.remaining(), tier, call_count, batch_size,
-                )
-                break
-            probe_sent = True  # 即将发出（含调用中预算耗尽的情形）
-            try:
-                api = await self._api.generate_image(
-                    model=model, prompt=prompt, size=normalized_size,
-                    deadline=deadline, ratio=ratio,
-                )
-            except budget_mod.DeadlineExceededError:
-                # 调用中预算耗尽（退避后 check 抛出）→ 即止，非错误（E9）
-                break
-            call_count += 1
-            timer.mark("api")
+        # 并发闸门：限制单次请求内的并发上游调用数（防 batch=4 × 高并发
+        # 请求数把上游/连接池打爆）
+        gate = asyncio.Semaphore(min(batch_size, self._batch_concurrency))
+        slots: list[Optional[tuple[str, object]]] = [None] * batch_size
+        marker = {"probe": False}  # 闭包内写标志（并发共享）
 
-            if api.ok and api.urls:
-                self._circuit.record_success(model)
-                urls.extend(api.urls)
-                last_error = None
+        async def _one(index: int) -> None:
+            """batch 的第 index 次调用（并发执行，结果按索引保序回收）。"""
+            async with gate:
+                # R20：每次调用前 deadline 剩余 ≥ 单次档才发起；不足即止
+                if deadline.remaining() < tier:
+                    logger.info(
+                        "[pipeline] req_id=%s 预算剩余 %.1fs < 单次档 %.1fs，"
+                        "拆分第 %d 次即止（并发拆分）",
+                        req_id, deadline.remaining(), tier, index + 1,
+                    )
+                    return
+                marker["probe"] = True  # 即将发出（含调用中预算耗尽的情形）
+                try:
+                    api = await self._api.generate_image(
+                        model=model, prompt=prompt, size=normalized_size,
+                        deadline=deadline, ratio=ratio,
+                    )
+                except budget_mod.DeadlineExceededError:
+                    # 调用中预算耗尽（退避后 check 抛出）→ 即止，非错误（E9）
+                    return
+                if api.ok and api.urls:
+                    self._circuit.record_success(model)
+                    slots[index] = ("ok", list(api.urls))
+                    return
+                # ---- 单次失败：分类 → 写熔断 → 不中断其余并发（E9 同纪律）----
+                info = self._classify(api)
+                self._record_failure(model, info)
+                logger.warning(
+                    "[pipeline] req_id=%s 拆分第 %d 次调用失败: %s（不中断其余）",
+                    req_id, index + 1, info.reason,
+                )
+                slots[index] = ("err", info)
+
+        await asyncio.gather(*(_one(i) for i in range(batch_size)))
+        timer.mark("api")
+
+        # 保序汇总（并发不改变交付顺序：请求 batch=3 时 URL 顺序即发起序）
+        for item in slots:
+            if item is None:
                 continue
-
-            # ---- 单次失败：分类 → 写熔断 → 不中断后续（预算耗尽除外）----
-            info = self._classify(api)
-            last_error = info
-            self._record_failure(model, info)
-            logger.warning(
-                "[pipeline] req_id=%s 拆分第 %d 次调用失败: %s（不中断后续）",
-                req_id, call_count, info.reason,
-            )
+            kind, payload = item
+            if kind == "ok":
+                call_count += 1
+                urls.extend(payload)  # type: ignore[arg-type]
+                last_error = None
+            else:
+                call_count += 1
+                last_error = payload  # type: ignore[assignment]
+        probe_sent = marker["probe"]
 
         # ---- 5. 收尾分流（R17：M=0 走错误路径，不产生部分成功）----
         if not urls:
@@ -390,6 +430,18 @@ class GeneratePipeline:
     # ------------------------------------------------------------------
     # 辅助
     # ------------------------------------------------------------------
+    def _acquire_slot(self, deadline: "budget_mod.Deadline", req_id: str):
+        """取并发槽：优先走多队列泳道（V3），老 SlotPool 走原路径。
+
+        duck typing 而非 isinstance：避免 pipeline 反向依赖具体池类型，
+        单测注入 SlotPool（tests/test_pipeline.py 既有用法）与生产注入
+        MultiQueuePool 都能跑。
+        """
+        lane_of = getattr(self._pool, "lane", None)
+        if callable(lane_of):
+            return lane_of(self._lane_name).slot(deadline, req_id)
+        return self._pool.slot(deadline, req_id)
+
     def _classify(self, api: agnes_mod.ApiCallResult) -> errors_mod.ErrorInfo:
         if api.status_code is None:  # 网络/超时异常（重试 1 次后仍失败）
             return errors_mod.network_error(api.error_detail)
