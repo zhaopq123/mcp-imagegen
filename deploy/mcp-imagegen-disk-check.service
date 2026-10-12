@@ -1,0 +1,31 @@
+# mcp-imagegen-disk-check.service —— 每日磁盘水位检查（S4.1；红线 C10：只告警、不删图）
+#
+# 由 mcp-imagegen-disk-check.timer 每日触发。复用应用代码取数，不引入新魔法数值（红线 B）：
+#   - 水位阈值：config.DISK_WATERMARK_RATIO（0.90，单一出处）
+#   - 使用率：  infra.persist.PersistService.disk_usage_ratio()（IMAGE_DIR 所在文件系统）
+# 输出契约（已本地三场景验证）：
+#   - 水位正常   → stdout（journal info）："…… 水位正常"
+#   - 超线/不可得 → stderr（journal err；journalctl -p warning 可筛出）+ "[disk-check]" 标记
+#   - 退出码恒 0：纯观察者，不删任何文件、不把 timer 打红；处置动作一律留给人工
+# 前置条件：/etc/mcp-imagegen/env 已就绪（与主服务同一份，取 IMAGE_DIR；load_config 需密钥项）
+
+[Unit]
+Description=MCP imagegen 每日磁盘水位检查（只记 WARN 日志，不删图）
+After=local-fs.target
+
+[Service]
+Type=oneshot
+User=mcp-imagegen
+Group=mcp-imagegen
+WorkingDirectory=/opt/mcp-imagegen
+EnvironmentFile=/etc/mcp-imagegen/env
+# 说明：全角"％"与 f-string 均为刻意的——避开 systemd 单元文件对 ASCII '%'/'$' 的 specifier 转义；
+# 单引号包裹、内部仅双引号，systemd 引号规则下原样传给 python -c。
+ExecStart=/opt/mcp-imagegen/venv/bin/python -c 'import sys; from config import DISK_WATERMARK_RATIO, load_config; from infra.persist import PersistService; cfg = load_config(); r = PersistService(cfg).disk_usage_ratio(); warn = r is None or r >= DISK_WATERMARK_RATIO; msg = f"[disk-check] IMAGE_DIR={cfg.image_dir} 磁盘使用率 {r*100:.1f}％（水位线 {DISK_WATERMARK_RATIO*100:.0f}％）" if r is not None else f"[disk-check] IMAGE_DIR={cfg.image_dir} 磁盘使用率不可得（目录不存在或不可读）"; tail = " —— 已超水位线：请人工评估清理（策略：只告警，不自动删图）" if r is not None and r >= DISK_WATERMARK_RATIO else (" —— 无法获取使用率，请检查部署与权限" if r is None else " —— 水位正常"); print(msg + tail, file=sys.stderr if warn else sys.stdout)'
+SyslogIdentifier=mcp-imagegen-disk-check
+
+# 纯只读检查：加固同主服务
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=full

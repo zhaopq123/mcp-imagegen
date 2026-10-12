@@ -1,0 +1,41 @@
+# Caddyfile —— mcp-imagegen 可选前置反代（S4.2，规格书二/五：读超时 >= 210s）
+#
+# 路由（与后端 app/endpoints.py 对齐，路径原样透传、不重写）：
+#   /mcp*     → MCP Streamable HTTP 端点（Bearer 鉴权在后端 BearerGate 完成）
+#   /files/*  → 图片静态服务（保留后端文件名白名单 + 防穿越校验，不在 Caddy 侧直读磁盘）
+#   /healthz* → 探活（人工巡检用，不参与 watchdog 判据）
+#
+# 超时链（嵌套，不得打破）：请求总预算 200 < Agent 客户端建议 210 <= Caddy 读后端 220 = systemd TimeoutStopSec 220
+#   - “读超时 >= 210s” 落实为 transport http 的 response_header_timeout = 220s（等待后端响应头上限）；
+#   - Caddy 自身 server 超时保持默认（read_body 无限制、write 无超时），长请求与 SSE 流安全；
+#   - /mcp 的 flush_interval -1：关闭响应缓冲、即时透传，SSE 事件流不被攒包。
+#
+# 安装：install -m 644 Caddyfile /etc/caddy/Caddyfile && systemctl reload caddy
+# 站点地址默认 “:80”（明文 HTTP，本机/内网即装即用）；换成真实域名（如 img.example.com）
+# 后 Caddy 自动签发 HTTPS 并 301 跳转。后端 /files 完整 URL 依赖 X-Forwarded-Proto /
+# X-Forwarded-Host（Caddy 反代默认注入），届时自动推断为 https://<域名>/files/...
+# 注意：后端端口取自 /etc/mcp-imagegen/env 的 PORT（默认 8000），改端口需同步修改下方 127.0.0.1:8000
+
+:80 {
+	# ---- /mcp：MCP Streamable HTTP（POST 工具调用最长 ~200s；GET 为 SSE 长流）----
+	reverse_proxy /mcp* 127.0.0.1:8000 {
+		flush_interval -1
+		transport http {
+			response_header_timeout 220s
+		}
+	}
+
+	# ---- /files/：图片静态服务（代理到后端，保留白名单与防穿越校验）----
+	reverse_proxy /files/* 127.0.0.1:8000 {
+		transport http {
+			response_header_timeout 220s
+		}
+	}
+
+	# ---- /healthz：探活（应快速失败，不必等满 220s）----
+	reverse_proxy /healthz* 127.0.0.1:8000 {
+		transport http {
+			response_header_timeout 30s
+		}
+	}
+}

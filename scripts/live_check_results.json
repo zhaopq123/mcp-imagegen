@@ -1,0 +1,675 @@
+[
+ {
+  "runs": [
+   {
+    "run_id": "5252e1071599",
+    "started_at": "2026-10-10T14:26:40+0800",
+    "base_url": "https://api.agnes-ai.cn",
+    "phases_requested": [
+     "raw_img_default",
+     "raw_img_bad"
+    ],
+    "raw_img_default": {
+     "status": 200,
+     "elapsed_sec": 7.409,
+     "retry_after": null,
+     "top_keys": [
+      "created",
+      "data",
+      "task_id"
+     ],
+     "item_count": 1,
+     "item_keys": [
+      "b64_json",
+      "revised_prompt",
+      "url"
+     ],
+     "url": "https://cos-platform-outputs.agnes-ai.cn/images/t2i/task_Dljq0nmawkgeTsEqDz1wk0i6blE25GBP/output_cd752dc5400843a3bbf8d913846d6f20.png"
+    },
+    "raw_img_bad": {
+     "status": 400,
+     "elapsed_sec": 6.242,
+     "retry_after": null,
+     "top_keys": [
+      "error"
+     ],
+     "error": {
+      "code": "invalid_request",
+      "message": "size 的值 \"banana\" 无效，必须是 1K、2K、3K、4K 或 WIDTHxHEIGHT (request id: 20261010062647789930552kw0VVxrg)",
+      "type": "invalid_request"
+     }
+    },
+    "finished_at": "2026-10-10T14:26:53+0800"
+   },
+   {
+    "run_id": "2b7dc9a15e84",
+    "started_at": "2026-10-10T14:27:13+0800",
+    "base_url": "https://api.agnes-ai.cn",
+    "phases_requested": [
+     "raw_img_2k",
+     "svc_image",
+     "svc_image_bad"
+    ],
+    "raw_img_2k": {
+     "status": 200,
+     "elapsed_sec": 13.388,
+     "retry_after": null,
+     "top_keys": [
+      "created",
+      "data",
+      "task_id"
+     ],
+     "item_count": 1,
+     "item_keys": [
+      "b64_json",
+      "revised_prompt",
+      "url"
+     ],
+     "url": "https://cos-platform-outputs.agnes-ai.cn/images/t2i/task_UrSysoR1tZb7qGlXrUcdtFOtqxMoGqIa/output_09003a990d3043639931199b25db9cb6.png"
+    },
+    "svc_image": {
+     "elapsed_sec": 10.111,
+     "reply": "https://cos-platform-outputs.agnes-ai.cn/images/t2i/task_6wtCyYgQaZsig6zxQm2ajgSHlynmpzIB/output_cbee680caaeb4cb09e29e157623092a4.png\n[meta] model=agnes-image size=1024x1024 url_expires=1h",
+     "timeout_tier": 30.0
+    },
+    "svc_image_bad": {
+     "phase_error": "RemoteProtocolError: peer closed connection without sending complete message body (incomplete chunked read)"
+    },
+    "finished_at": "2026-10-10T14:27:38+0800"
+   },
+   {
+    "run_id": "d1e46475fc8e",
+    "started_at": "2026-10-10T14:29:03+0800",
+    "base_url": "https://api.agnes-ai.cn",
+    "phases_requested": [
+     "svc_image_bad"
+    ],
+    "svc_image_bad": {
+     "elapsed_sec": 0.193,
+     "reply": "[error] category=rate_limit retry=yes reason=上游限流(429) | 您已达到免费用户的 API 速率限制。升级 Token Plan 即可解锁更高限额，继续不间断使用 API。 (request id: 202610100629047470942024dGlbi0Q) suggestion=稍后重试"
+    },
+    "finished_at": "2026-10-10T14:29:04+0800"
+   },
+   {
+    "run_id": "9bbc3bd64102",
+    "started_at": "2026-10-10T14:29:09+0800",
+    "base_url": "https://api.agnes-ai.cn",
+    "phases_requested": [
+     "svc_persist"
+    ],
+    "svc_persist": {
+     "elapsed_sec": 8.374,
+     "reply": "http://127.0.0.1:39987/files/a816da9f1ab0-01-89ff700c.png\n[meta] model=agnes-image size=1024x1024 persisted",
+     "files_get_status": 200,
+     "files_get_bytes": 1290765,
+     "files_content_type": "image/png",
+     "disk_files": [
+      "a816da9f1ab0-01-89ff700c.png"
+     ],
+     "bytes_match_disk": true
+    },
+    "finished_at": "2026-10-10T14:29:18+0800"
+   },
+   {
+    "run_id": "2a6fbe2f28f6",
+    "started_at": "2026-10-10T14:30:12+0800",
+    "base_url": "https://api.agnes-ai.cn",
+    "phases_requested": [
+     "svc_video"
+    ],
+    "svc_video": {
+     "run_elapsed_sec": 1.47,
+     "run_reply": "[error] category=upstream_error retry=yes reason=上游服务错误(503) | {\"code\":\"video_queue_full\",\"message\":\"视频队列已满，请稍后重试 (request id: 20261010063014250450789sDrZOMzP)\",\"data\":null} suggestion=稍后重试"
+    },
+    "finished_at": "2026-10-10T14:30:14+0800"
+   },
+   {
+    "run_id": "f6a711df6bb6",
+    "started_at": "2026-10-10T14:31:19+0800",
+    "base_url": "https://api.agnes-ai.cn",
+    "phases_requested": [
+     "svc_video"
+    ],
+    "svc_video": {
+     "submit_attempts": [
+      {
+       "attempt": 1,
+       "elapsed_sec": 1.24,
+       "result": "queue_full_or_error",
+       "reply_head": "[error] category=upstream_error retry=yes reason=上游服务错误(503) | {\"code\":\"video_queue_full\",\"message\":\"视频队列已满，请稍后重试 (request id: 20261010063121228280385Z70VuXQD)\",\"data\":null} sugges"
+      },
+      {
+       "attempt": 2,
+       "elapsed_sec": 0.081,
+       "result": "queue_full_or_error",
+       "reply_head": "[error] category=rate_limit retry=yes reason=上游限流(429) | 您已达到免费用户的 API 速率限制。升级 Token Plan 即可解锁更高限额，继续不间断使用 API。 (request id: 20261010063141405948743CauJAUBG) suggestion=稍后重试"
+      },
+      {
+       "attempt": 3,
+       "elapsed_sec": 0.153,
+       "result": "queue_full_or_error",
+       "reply_head": "[error] category=rate_limit retry=yes reason=上游限流(429) | 您已达到免费用户的 API 速率限制。升级 Token Plan 即可解锁更高限额，继续不间断使用 API。 (request id: 20261010063201557963870KfSQS3hE) suggestion=稍后重试"
+      },
+      {
+       "attempt": 4,
+       "elapsed_sec": 1.04,
+       "result": "queue_full_or_error",
+       "reply_head": "[error] category=upstream_error retry=yes reason=上游服务错误(503) | {\"code\":\"video_queue_full\",\"message\":\"视频队列已满，请稍后重试 (request id: 20261010063222528350158GYaAr3hS)\",\"data\":null} sugges"
+      },
+      {
+       "attempt": 5,
+       "elapsed_sec": 0.181,
+       "result": "queue_full_or_error",
+       "reply_head": "[error] category=rate_limit retry=yes reason=上游限流(429) | 您已达到免费用户的 API 速率限制。升级 Token Plan 即可解锁更高限额，继续不间断使用 API。 (request id: 20261010063242778384557Z2QQ9kQz) suggestion=稍后重试"
+      },
+      {
+       "attempt": 6,
+       "elapsed_sec": 0.155,
+       "result": "queue_full_or_error",
+       "reply_head": "[error] category=rate_limit retry=yes reason=上游限流(429) | 您已达到免费用户的 API 速率限制。升级 Token Plan 即可解锁更高限额，继续不间断使用 API。 (request id: 20261010063302938712661a0l0lp0p) suggestion=稍后重试"
+      }
+     ],
+     "submit_attempts_total_sec": 102.852,
+     "run_reply": "[error] category=rate_limit retry=yes reason=上游限流(429) | 您已达到免费用户的 API 速率限制。升级 Token Plan 即可解锁更高限额，继续不间断使用 API。 (request id: 20261010063302938712661a0l0lp0p) suggestion=稍后重试"
+    },
+    "finished_at": "2026-10-10T14:33:03+0800"
+   },
+   {
+    "run_id": "adbbd679ea09",
+    "started_at": "2026-10-10T14:35:10+0800",
+    "base_url": "https://api.agnes-ai.cn",
+    "phases_requested": [
+     "raw_429"
+    ],
+    "raw_429": {
+     "burst": 10,
+     "results": [
+      {
+       "i": 0,
+       "status": 200,
+       "elapsed_sec": 14.436,
+       "retry_after": null,
+       "ratelimit_headers": {}
+      },
+      {
+       "i": 1,
+       "status": 200,
+       "elapsed_sec": 7.936,
+       "retry_after": null,
+       "ratelimit_headers": {}
+      },
+      {
+       "i": 2,
+       "status": 200,
+       "elapsed_sec": 10.635,
+       "retry_after": null,
+       "ratelimit_headers": {}
+      },
+      {
+       "i": 3,
+       "status": 200,
+       "elapsed_sec": 7.754,
+       "retry_after": null,
+       "ratelimit_headers": {}
+      },
+      {
+       "i": 4,
+       "status": 200,
+       "elapsed_sec": 11.339,
+       "retry_after": null,
+       "ratelimit_headers": {}
+      },
+      {
+       "i": 5,
+       "status": 200,
+       "elapsed_sec": 14.654,
+       "retry_after": null,
+       "ratelimit_headers": {}
+      },
+      {
+       "i": 6,
+       "status": 200,
+       "elapsed_sec": 9.684,
+       "retry_after": null,
+       "ratelimit_headers": {}
+      },
+      {
+       "i": 7,
+       "status": 200,
+       "elapsed_sec": 10.156,
+       "retry_after": null,
+       "ratelimit_headers": {}
+      },
+      {
+       "i": 8,
+       "status": 200,
+       "elapsed_sec": 8.474,
+       "retry_after": null,
+       "ratelimit_headers": {}
+      },
+      {
+       "i": 9,
+       "status": 200,
+       "elapsed_sec": 14.129,
+       "retry_after": null,
+       "ratelimit_headers": {}
+      }
+     ],
+     "saw_429": false
+    },
+    "finished_at": "2026-10-10T14:36:59+0800"
+   },
+   {
+    "run_id": "08ea902e6735",
+    "started_at": "2026-10-10T14:38:07+0800",
+    "base_url": "https://api.agnes-ai.cn",
+    "phases_requested": [
+     "raw_429"
+    ],
+    "raw_429": {
+     "burst": 12,
+     "mode": "concurrent",
+     "results": [
+      {
+       "i": 0,
+       "status": 200,
+       "elapsed_sec": 8.851,
+       "retry_after": null,
+       "ratelimit_headers": {}
+      },
+      {
+       "i": 1,
+       "status": 503,
+       "elapsed_sec": 0.338,
+       "retry_after": null,
+       "ratelimit_headers": {}
+      },
+      {
+       "i": 2,
+       "status": 200,
+       "elapsed_sec": 12.903,
+       "retry_after": null,
+       "ratelimit_headers": {}
+      },
+      {
+       "i": 3,
+       "status": 503,
+       "elapsed_sec": 0.311,
+       "retry_after": null,
+       "ratelimit_headers": {}
+      },
+      {
+       "i": 4,
+       "status": 200,
+       "elapsed_sec": 8.171,
+       "retry_after": null,
+       "ratelimit_headers": {}
+      },
+      {
+       "i": 5,
+       "status": 200,
+       "elapsed_sec": 10.803,
+       "retry_after": null,
+       "ratelimit_headers": {}
+      },
+      {
+       "i": 6,
+       "status": 200,
+       "elapsed_sec": 8.884,
+       "retry_after": null,
+       "ratelimit_headers": {}
+      },
+      {
+       "i": 7,
+       "status": 503,
+       "elapsed_sec": 0.354,
+       "retry_after": null,
+       "ratelimit_headers": {}
+      },
+      {
+       "i": 8,
+       "status": 200,
+       "elapsed_sec": 8.364,
+       "retry_after": null,
+       "ratelimit_headers": {}
+      },
+      {
+       "i": 9,
+       "status": 429,
+       "elapsed_sec": 0.26,
+       "retry_after": null,
+       "ratelimit_headers": {},
+       "error_body": {
+        "error": {
+         "message": "您已达到免费用户的 API 速率限制。升级 Token Plan 即可解锁更高限额，继续不间断使用 API。 (request id: 20261010063808411865480N0Y7Mszq)",
+         "type": "AgnesAI_error",
+         "param": "",
+         "code": "rate_limit_exceeded"
+        }
+       }
+      },
+      {
+       "i": 10,
+       "status": 503,
+       "elapsed_sec": 0.505,
+       "retry_after": null,
+       "ratelimit_headers": {}
+      },
+      {
+       "i": 11,
+       "status": 503,
+       "elapsed_sec": 0.33,
+       "retry_after": null,
+       "ratelimit_headers": {}
+      }
+     ],
+     "saw_429": true
+    },
+    "finished_at": "2026-10-10T14:38:21+0800"
+   },
+   {
+    "run_id": "e64527183509",
+    "started_at": "2026-10-10T14:40:28+0800",
+    "base_url": "https://api.agnes-ai.cn",
+    "phases_requested": [
+     "raw_429"
+    ],
+    "raw_429": {
+     "burst": 12,
+     "mode": "concurrent",
+     "results": [
+      {
+       "i": 0,
+       "status": 200,
+       "elapsed_sec": 9.358,
+       "retry_after": null,
+       "ratelimit_headers": {}
+      },
+      {
+       "i": 1,
+       "status": 200,
+       "elapsed_sec": 7.764,
+       "retry_after": null,
+       "ratelimit_headers": {}
+      },
+      {
+       "i": 2,
+       "status": 200,
+       "elapsed_sec": 8.396,
+       "retry_after": null,
+       "ratelimit_headers": {}
+      },
+      {
+       "i": 3,
+       "status": 200,
+       "elapsed_sec": 8.346,
+       "retry_after": null,
+       "ratelimit_headers": {}
+      },
+      {
+       "i": 4,
+       "status": 200,
+       "elapsed_sec": 7.951,
+       "retry_after": null,
+       "ratelimit_headers": {}
+      },
+      {
+       "i": 5,
+       "status": 200,
+       "elapsed_sec": 8.422,
+       "retry_after": null,
+       "ratelimit_headers": {}
+      },
+      {
+       "i": 6,
+       "status": 200,
+       "elapsed_sec": 15.167,
+       "retry_after": null,
+       "ratelimit_headers": {}
+      },
+      {
+       "i": 7,
+       "status": 200,
+       "elapsed_sec": 7.944,
+       "retry_after": null,
+       "ratelimit_headers": {}
+      },
+      {
+       "i": 8,
+       "status": 200,
+       "elapsed_sec": 10.225,
+       "retry_after": null,
+       "ratelimit_headers": {}
+      },
+      {
+       "i": 9,
+       "status": 200,
+       "elapsed_sec": 14.073,
+       "retry_after": null,
+       "ratelimit_headers": {}
+      },
+      {
+       "i": 10,
+       "status": 429,
+       "elapsed_sec": 0.193,
+       "retry_after": null,
+       "ratelimit_headers": {},
+       "error_body": {
+        "error": {
+         "message": "您已达到免费用户的 API 速率限制。升级 Token Plan 即可解锁更高限额，继续不间断使用 API。 (request id: 202610100640288856099272fgcYmbO)",
+         "type": "AgnesAI_error",
+         "param": "",
+         "code": "rate_limit_exceeded"
+        }
+       }
+      },
+      {
+       "i": 11,
+       "status": 429,
+       "elapsed_sec": 0.376,
+       "retry_after": null,
+       "ratelimit_headers": {},
+       "error_body": {
+        "error": {
+         "message": "您已达到免费用户的 API 速率限制。升级 Token Plan 即可解锁更高限额，继续不间断使用 API。 (request id: 2026101006402956229621GFcAtIjL)",
+         "type": "AgnesAI_error",
+         "param": "",
+         "code": "rate_limit_exceeded"
+        }
+       }
+      }
+     ],
+     "saw_429": true
+    },
+    "finished_at": "2026-10-10T14:40:43+0800"
+   },
+   {
+    "run_id": "a0f9b77b49e9",
+    "started_at": "2026-10-10T14:41:39+0800",
+    "base_url": "https://api.agnes-ai.cn",
+    "phases_requested": [
+     "svc_video"
+    ],
+    "svc_video": {
+     "submit_attempts": [
+      {
+       "attempt": 1,
+       "elapsed_sec": 0.825,
+       "result": "queue_full_or_error",
+       "reply_head": "[error] category=upstream_error retry=yes reason=上游服务错误(503) | {\"code\":\"video_queue_full\",\"message\":\"视频队列已满，请稍后重试 (request id: 2026101006414118270942OYXGdZmk)\",\"data\":null} suggest"
+      },
+      {
+       "attempt": 2,
+       "elapsed_sec": 0.19,
+       "result": "queue_full_or_error",
+       "reply_head": "[error] category=rate_limit retry=yes reason=上游限流(429) | 您已达到免费用户的 API 速率限制。升级 Token Plan 即可解锁更高限额，继续不间断使用 API。 (request id: 20261010064201301024937dQ6IkVY2) suggestion=稍后重试"
+      },
+      {
+       "attempt": 3,
+       "elapsed_sec": 0.119,
+       "result": "queue_full_or_error",
+       "reply_head": "[error] category=rate_limit retry=yes reason=上游限流(429) | 您已达到免费用户的 API 速率限制。升级 Token Plan 即可解锁更高限额，继续不间断使用 API。 (request id: 20261010064221428406553oeWQESug) suggestion=稍后重试"
+      },
+      {
+       "attempt": 4,
+       "elapsed_sec": 1.385,
+       "result": "queue_full_or_error",
+       "reply_head": "[error] category=upstream_error retry=yes reason=上游服务错误(503) | {\"code\":\"video_queue_full\",\"message\":\"视频队列已满，请稍后重试 (request id: 20261010064242723906374h9c2DJAm)\",\"data\":null} sugges"
+      },
+      {
+       "attempt": 5,
+       "elapsed_sec": 0.095,
+       "result": "queue_full_or_error",
+       "reply_head": "[error] category=rate_limit retry=yes reason=上游限流(429) | 您已达到免费用户的 API 速率限制。升级 Token Plan 即可解锁更高限额，继续不间断使用 API。 (request id: 20261010064302908258087kUDj61FN) suggestion=稍后重试"
+      },
+      {
+       "attempt": 6,
+       "elapsed_sec": 0.079,
+       "result": "queue_full_or_error",
+       "reply_head": "[error] category=rate_limit retry=yes reason=上游限流(429) | 您已达到免费用户的 API 速率限制。升级 Token Plan 即可解锁更高限额，继续不间断使用 API。 (request id: 20261010064322992249759rkTaOsHj) suggestion=稍后重试"
+      }
+     ],
+     "submit_attempts_total_sec": 102.697,
+     "run_reply": "[error] category=rate_limit retry=yes reason=上游限流(429) | 您已达到免费用户的 API 速率限制。升级 Token Plan 即可解锁更高限额，继续不间断使用 API。 (request id: 20261010064322992249759rkTaOsHj) suggestion=稍后重试"
+    },
+    "finished_at": "2026-10-10T14:43:23+0800"
+   },
+   {
+    "run_id": "3c80daa91135",
+    "started_at": "2026-10-10T14:44:27+0800",
+    "base_url": "https://api.agnes-ai.cn",
+    "phases_requested": [
+     "svc_image_bad"
+    ],
+    "svc_image_bad": {
+     "elapsed_sec": 0.191,
+     "reply": "[error] category=content_policy retry=no reason=内容审核未通过(400) | size \"99999x99999\" 超过最大 4096x4096 (request id: 20261010064428861363121lZp3l2J) suggestion=修改 prompt 后重试"
+    },
+    "finished_at": "2026-10-10T14:44:28+0800"
+   },
+   {
+    "run_id": "24d5dce37bc8",
+    "started_at": "2026-10-10T14:44:54+0800",
+    "base_url": "https://api.agnes-ai.cn",
+    "phases_requested": [
+     "svc_video"
+    ],
+    "svc_video": {
+     "submit_attempts": [
+      {
+       "attempt": 1,
+       "elapsed_sec": 6.95,
+       "result": "queue_full_or_error",
+       "reply_head": "[error] category=upstream_error retry=yes reason=上游服务错误(503) | {\"code\":\"video_queue_full\",\"message\":\"视频队列已满，请稍后重试 (request id: 20261010064502413447427V7ib3wYc)\",\"data\":null} sugges"
+      },
+      {
+       "attempt": 2,
+       "elapsed_sec": 0.149,
+       "result": "queue_full_or_error",
+       "reply_head": "[error] category=rate_limit retry=yes reason=上游限流(429) | 您已达到免费用户的 API 速率限制。升级 Token Plan 即可解锁更高限额，继续不间断使用 API。 (request id: 20261010064522691239678bezpeTbC) suggestion=稍后重试"
+      },
+      {
+       "attempt": 3,
+       "elapsed_sec": 0.112,
+       "result": "queue_full_or_error",
+       "reply_head": "[error] category=rate_limit retry=yes reason=上游限流(429) | 您已达到免费用户的 API 速率限制。升级 Token Plan 即可解锁更高限额，继续不间断使用 API。 (request id: 20261010064542800112621UjMMEn3a) suggestion=稍后重试"
+      },
+      {
+       "attempt": 4,
+       "elapsed_sec": 13.102,
+       "result": "queue_full_or_error",
+       "reply_head": "[error] category=upstream_error retry=yes reason=上游服务错误(503) | {\"code\":\"video_queue_full\",\"message\":\"视频队列已满，请稍后重试 (request id: 20261010064609896096400aKCyJYYy)\",\"data\":null} sugges"
+      },
+      {
+       "attempt": 5,
+       "elapsed_sec": 0.118,
+       "result": "queue_full_or_error",
+       "reply_head": "[error] category=rate_limit retry=yes reason=上游限流(429) | 您已达到免费用户的 API 速率限制。升级 Token Plan 即可解锁更高限额，继续不间断使用 API。 (request id: 2026101006463617457104bUdqUfAn) suggestion=稍后重试"
+      },
+      {
+       "attempt": 6,
+       "elapsed_sec": 0.17,
+       "result": "queue_full_or_error",
+       "reply_head": "[error] category=rate_limit retry=yes reason=上游限流(429) | 您已达到免费用户的 API 速率限制。升级 Token Plan 即可解锁更高限额，继续不间断使用 API。 (request id: 202610100646561884647628l449vrK) suggestion=稍后重试"
+      }
+     ],
+     "submit_attempts_total_sec": 120.607,
+     "run_reply": "[error] category=rate_limit retry=yes reason=上游限流(429) | 您已达到免费用户的 API 速率限制。升级 Token Plan 即可解锁更高限额，继续不间断使用 API。 (request id: 202610100646561884647628l449vrK) suggestion=稍后重试"
+    },
+    "finished_at": "2026-10-10T14:46:56+0800"
+   },
+   {
+    "run_id": "940f34fed195",
+    "started_at": "2026-10-10T15:41:54+0800",
+    "base_url": "https://api.agnes-ai.cn",
+    "phases_requested": [
+     "svc_video"
+    ],
+    "svc_video": {
+     "submit_attempts": [
+      {
+       "attempt": 1,
+       "elapsed_sec": 0.709,
+       "result": "queue_full_or_error",
+       "reply_head": "[error] category=upstream_error retry=yes reason=上游服务错误(503) | 视频队列已满，请稍后重试 (request id: 20261010074155623729343p4H316lc) suggestion=稍后重试"
+      },
+      {
+       "attempt": 2,
+       "elapsed_sec": 0.149,
+       "result": "queue_full_or_error",
+       "reply_head": "[error] category=rate_limit retry=yes reason=上游限流(429) | 您已达到免费用户的 API 速率限制。升级 Token Plan 即可解锁更高限额，继续不间断使用 API。 (request id: 20261010074215885599096y30WWD3e) suggestion=稍后重试"
+      },
+      {
+       "attempt": 3,
+       "elapsed_sec": 0.188,
+       "result": "queue_full_or_error",
+       "reply_head": "[error] category=rate_limit retry=yes reason=上游限流(429) | 您已达到免费用户的 API 速率限制。升级 Token Plan 即可解锁更高限额，继续不间断使用 API。 (request id: 2026101007423674548614PqgGm8Zs) suggestion=稍后重试"
+      },
+      {
+       "attempt": 4,
+       "elapsed_sec": 1.077,
+       "result": "queue_full_or_error",
+       "reply_head": "[error] category=upstream_error retry=yes reason=上游服务错误(503) | 视频队列已满，请稍后重试 (request id: 2026101007425731036193hd8cHHQv) suggestion=稍后重试"
+      },
+      {
+       "attempt": 5,
+       "elapsed_sec": 0.081,
+       "result": "queue_full_or_error",
+       "reply_head": "[error] category=rate_limit retry=yes reason=上游限流(429) | 您已达到免费用户的 API 速率限制。升级 Token Plan 即可解锁更高限额，继续不间断使用 API。 (request id: 20261010074317236130028PIFJKx8q) suggestion=稍后重试"
+      },
+      {
+       "attempt": 6,
+       "elapsed_sec": 0.147,
+       "result": "queue_full_or_error",
+       "reply_head": "[error] category=rate_limit retry=yes reason=上游限流(429) | 您已达到免费用户的 API 速率限制。升级 Token Plan 即可解锁更高限额，继续不间断使用 API。 (request id: 20261010074337378705789nEYe0k43) suggestion=稍后重试"
+      }
+     ],
+     "submit_attempts_total_sec": 102.354,
+     "run_reply": "[error] category=rate_limit retry=yes reason=上游限流(429) | 您已达到免费用户的 API 速率限制。升级 Token Plan 即可解锁更高限额，继续不间断使用 API。 (request id: 20261010074337378705789nEYe0k43) suggestion=稍后重试"
+    },
+    "finished_at": "2026-10-10T15:43:37+0800"
+   }
+  ]
+ },
+ {
+  "phase": "v2_accept",
+  "time": "2026-10-10 15:43:26",
+  "cases": {
+   "A_ratio_image": {
+    "ok": true,
+    "elapsed_sec": 11.7,
+    "out_head": "https://cos-platform-outputs.agnes-ai.cn/images/t2i/task_7MdtcWoXOD3H2ZqSQ7aaiUARA7rIOaQ6/output_cc55c4db987f4f4999d9942bae4df1ef.png\n[meta] model=agnes-image size=2K ratio=16:9 url_expires=1h"
+   },
+   "B_seed_219_video": {
+    "ok": false,
+    "outcome": "other",
+    "elapsed_sec": 0.1,
+    "out_head": "[error] category=rate_limit retry=yes reason=上游限流(429) | 您已达到免费用户的 API 速率限制。升级 Token Plan 即可解锁更高限额，继续不间断使用 API。 (request id: 20261010074338443110573YsXUZxPR) suggestion=稍后重试"
+   },
+   "C_bad_aspect": {
+    "ok": true,
+    "out_head": "[error] category=invalid_params retry=fixthenretry reason=参数校验失败: aspect_ratio | 限 16:9/9:16/1:1/4:3/3:4/21:9 六档，收到 '5:4' suggestion=修正参数后重试"
+   }
+  }
+ }
+]

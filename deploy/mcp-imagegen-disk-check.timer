@@ -1,0 +1,20 @@
+# mcp-imagegen-disk-check.timer —— 每日磁盘水位检查调度（S4.1）
+#
+# 安装：
+#   install -m 644 mcp-imagegen-disk-check.service mcp-imagegen-disk-check.timer /etc/systemd/system/
+#   systemctl daemon-reload && systemctl enable --now mcp-imagegen-disk-check.timer
+# 验证：systemctl list-timers mcp-imagegen-disk-check.timer
+#       journalctl -u mcp-imagegen-disk-check.service -p warning   # 只看超线告警
+
+[Unit]
+Description=每日触发 mcp-imagegen 磁盘水位检查（04:30）
+
+[Timer]
+# 每日 04:30（本地时间）：错开应用内 04:00 每日客户端重建，避免日志与负载叠峰
+OnCalendar=*-*-* 04:30:00
+# 关机/停机错过则下次启动补跑一次（水位是低频巡检项，不丢检查）
+Persistent=true
+AccuracySec=1min
+
+[Install]
+WantedBy=timers.target
