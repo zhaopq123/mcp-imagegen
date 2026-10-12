@@ -1,0 +1,13 @@
+# MCP 图片生成 Server · 运行依赖
+# - fastmcp：MCP 工具端点（streamable-http）与工具 schema
+# - httpx：Agnes API 客户端 + persist 下载
+# - sd_notify 为 vendored 实现（ops/liveness.py SdNotifier），不依赖 sdnotify 包
+#
+# 实测钉死（2026-10-10 部署验证）：
+#   fastmcp 4.1.0 + httpx 0.28.1 → 424/424 单测通过
+#   注意：原规格示例的 fastmcp==2.14.3 在当前 PyPI 依赖树装不上
+#   （其 import 的 IdentityAssertionParams 在 mcp 1.x 中不存在，
+#     声明 mcp<2.0 与实际不符）。4.1.0 为实测可用版本。
+fastmcp==4.1.0
+httpx==0.28.1
+uvicorn

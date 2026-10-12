@@ -1,0 +1,54 @@
+# mcp-imagegen.service —— 主服务 systemd 单元（S4.1，规格书 6.1/6.2）
+#
+# 安装（runbook 详版见 install.md）：
+#   useradd --system --home-dir /opt/mcp-imagegen --shell /usr/sbin/nologin mcp-imagegen
+#   install -d -o mcp-imagegen -g mcp-imagegen /var/lib/mcp-imagegen/images
+#   install -m 600 -o root -g root <填好密钥的 env 文件> /etc/mcp-imagegen/env
+#   install -m 644 mcp-imagegen.service /etc/systemd/system/
+#   systemctl daemon-reload && systemctl enable --now mcp-imagegen
+# 验证：systemctl status mcp-imagegen / journalctl -u mcp-imagegen -f
+#       curl -s http://127.0.0.1:8000/healthz
+
+[Unit]
+Description=MCP 图片生成 Server（uvicorn + FastMCP；Type=notify + watchdog 自愈）
+After=network.target
+# 启动风暴保护：60s 窗口内连崩 5 次即停止拉起（systemd>=230 起本两项属 [Unit] 段）
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Service]
+Type=notify
+# watchdog：事件循环僵死（心跳停发）30s 即判死重启；
+# 应用心跳间隔 15s（config.HEARTBEAT_INTERVAL_SEC）< WatchdogSec 的一半，留足裕量
+WatchdogSec=30
+# 崩溃自愈：无限次拉起、间隔 5s；连崩风暴由上方 StartLimit 两项制动
+Restart=always
+RestartSec=5
+# 优雅停机窗口 = uvicorn timeout_graceful_shutdown = config.SYSTEMD_TIMEOUT_STOP_SEC = 220s
+# （超时链：总预算 200 < Agent 建议 210 < 220）；到点未退由 systemd SIGKILL 兜底
+TimeoutStopSec=220
+# 内存硬顶：超限按 OOM 杀掉，交由 Restart=always 拉起
+MemoryMax=512M
+
+# 专用低权限用户运行
+User=mcp-imagegen
+Group=mcp-imagegen
+WorkingDirectory=/opt/mcp-imagegen
+# 密钥与运行参数（含 SILICONFLOWTOKEN / MCPACCESS_TOKEN）：
+#   文件须为 root:root 600 —— systemd(PID 1) 读取后注入进程环境，服务用户无需可读
+EnvironmentFile=/etc/mcp-imagegen/env
+# 启动前配置自检（server.py --check，退出码 2 = 嵌套不等式/密钥违例 → 阻止启动，B6 fail-fast）
+ExecStartPre=/opt/mcp-imagegen/venv/bin/python server.py --check
+ExecStart=/opt/mcp-imagegen/venv/bin/python server.py
+
+# 日志统一走 journald（journalctl -u mcp-imagegen -f）
+SyslogIdentifier=mcp-imagegen
+
+# 轻量加固：应用仅写 IMAGE_DIR（默认 /var/lib/mcp-imagegen/images），与以下选项兼容
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=full
+
+[Install]
+WantedBy=multi-user.target
