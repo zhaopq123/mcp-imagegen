@@ -34,8 +34,11 @@ SPEC_TOOL_DESCRIPTION = (
     "Supports batch generation (split into sequential calls server-side). "
     "size accepts a tier (1K/2K/3K/4K) or a WxH value like 1024x768; "
     "ratio (e.g. 16:9) may only be set alongside a tiered size, never "
-    "with WxH. NOTE: upstream image URLs are short-lived; set "
-    "persist=true to get a durable self-hosted URL."
+    "with WxH. image: optional reference image(s) for image-to-image "
+    "editing or multi-image composition — accept a public URL, a data "
+    "URI/base64, or this server's own artifact name or /files/<name> "
+    "URL. NOTE: upstream image URLs are short-lived; set persist=true "
+    "to get a durable self-hosted URL."
 )
 
 # 规格书 2.2 原文快照（A2′；V2 六节明文沿用零改动；en-dash = U+2013）
@@ -44,8 +47,14 @@ SPEC_TOOL_DESCRIPTION_VIDEO = (
     "agnes-video-2.5-flash. Waits synchronously within the time budget; "
     "if the task is still running at deadline, returns a task_id which "
     "can be polled via the query_video tool. Returns video URL on "
-    "success. NOTE: set persist=true for a durable URL (upstream URLs "
-    "are short-lived)."
+    "success. first_frame/last_frame: optional keyframe images (use "
+    "first_frame to animate this image as the real first frame); "
+    "reference_images: optional style/content references (re-composes). "
+    "Each accepts a public URL, data URI/base64, or this server's own "
+    "artifact name or /files/<name> URL. When the upstream queue is "
+    "full the server queues the submission and returns a task_id with "
+    "status=queued. NOTE: set persist=true for a durable URL (upstream "
+    "URLs are short-lived)."
 )
 
 # 规格书 2.3 原文快照（A3′；该段单下划线未经吞蚀，逐字符照录）
@@ -154,15 +163,16 @@ def test_tool_names_unchanged():
 
 
 def test_tool_params_exact():
-    """D2/D3：生图参数面 = prompt/size/ratio/batch_size/persist；
-    视频参数面 = prompt/seconds/aspect_ratio/seed/persist。"""
+    """V4：工具参数面包含生图参考图、视频首尾帧与参考图。"""
     assert tool.TOOL_PARAMS == (
-        "prompt", "size", "ratio", "batch_size", "persist",
+        "prompt", "size", "ratio", "batch_size", "persist", "image",
     )
     assert tool.TOOL_PARAMS_VIDEO == (
         "prompt", "seconds", "aspect_ratio", "seed", "persist",
+        "first_frame", "last_frame", "reference_images",
     )
     assert tool.TOOL_PARAMS_QUERY == ("task_id",)
+    assert tool.TOOL_PARAMS_LIST == ("limit",)
 
 
 # ---------------------------------------------------------------------------
@@ -293,7 +303,11 @@ def test_generate_video_params_passthrough():
     assert call["persist_flag"] is False   # schema 默认值 → persist_flag
     assert set(call.keys()) == {
         "prompt", "seconds", "aspect_ratio", "seed", "persist_flag",
-        "http_headers"}
+        "first_frame", "last_frame", "reference_images", "http_headers",
+    }
+    assert call["first_frame"] is None
+    assert call["last_frame"] is None
+    assert call["reference_images"] is None
     assert call["http_headers"] is None     # 测试无 HTTP 上下文 → None
 
 

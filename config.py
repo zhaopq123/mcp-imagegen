@@ -54,6 +54,9 @@ WATCHDOG_SEC = 30.0               # systemd WatchdogSec（6.1；须 > 2×心跳�
 DAILY_REBUILD_HOUR = 4             # 每日客户端重建调度时刻（6.2：每日 04:00 本地时间）
 REQUEST_GUARD_SLACK_SEC = 1.0     # 整体 asyncio.timeout 护栏 = TOTALBUDGETSEC + 本松弛量（6.1 自救兜底）
 DISK_WATERMARK_RATIO = 0.90       # 磁盘水位阈值（6.2 超线只 WARN + meta 提示；规格书未定数值，工程默认 90%）
+# V3：batch 合法区间上限（与 app/pipeline.BATCH_MAX 同源；config 不反向依赖 app，
+# 故在此单一出处定义，pipeline 从 config 导入以杜绝双头常量）
+BATCH_MAX = 4
 
 
 class ConfigError(Exception):
@@ -122,6 +125,38 @@ _ENV_SPEC: dict[str, tuple[type, object]] = {
     "PERSIST_TIMEOUT_VIDEO_SEC": (float, 120.0),
     "TASK_TTL_SEC": (float, 7200.0),
     "TASK_MAX": (int, 100),
+    # ---- V3 增量：多队列 / 并发 / 视频后台异步（IMAGE=生图泳道，
+    #      VIDEO=视频泳道；两泳道独立额度，互不饿死）----
+    "IMAGE_MAX_CONCURRENCY": (int, 3),      # 生图泳道并发槽
+    "VIDEO_MAX_CONCURRENCY": (int, 3),      # 视频泳道并发槽（提交+单查 IO 期间占用）
+    "IMAGE_QUEUE_WAIT_SEC": (float, 30.0),  # 生图排队等待上限（计入 deadline）
+    "VIDEO_QUEUE_WAIT_SEC": (float, 30.0),  # 视频排队等待上限（计入 deadline）
+    "IMAGE_QUEUE_MAX": (int, 64),           # 生图泳道排队深度上限（超限 → busy）
+    "VIDEO_QUEUE_MAX": (int, 16),           # 视频泳道排队深度上限
+    "IMAGE_BATCH_CONCURRENCY": (int, 4),    # 单次请求内 batch 拆分的并发度（1–4）
+    # 视频后台作业（脱离请求 deadline，由后台 worker 轮询到终态）
+    "VIDEO_JOB_MAX_WAIT_SEC": (float, 1800.0),  # 后台轮询总上限（> deadline，跨请求续命）
+    "VIDEO_JOB_MAX": (int, 24),                 # 同时跟踪的后台作业数上限
+    "VIDEO_JOB_CONCURRENCY": (int, 8),          # 后台同时轮询的作业数上限
+    # ---- V3：上游速率限制（压测实证：放开并发会撞 429 → 硬熔断 10min，
+    #      不如自己排队慢慢发）----
+    "UPSTREAM_RPS": (float, 1.0),               # 上游请求匀速上限（令牌/秒）
+    "UPSTREAM_BURST": (int, 2),                 # 允许的短突发（桶容量）
+    "UPSTREAM_COOLDOWN_SEC": (float, 15.0),     # 收到 429/503 后的冻结时长
+    # ---- V4：参考图（图生图 / 图生视频）----
+    # 参考图统一转 data URI 内联发给上游（实测可用）。上限取官方参考媒体
+    # 限制的保守侧：图片单张 <15MB；本服务再收紧到 10MB，避免 base64
+    # 膨胀 33% 后撞上游 50MB 总限，也避免手机内存被单请求吃干。
+    "REFERENCE_MAX_MB": (float, 10.0),          # 单张参考图大小上限（MB）
+    "IMAGE_REFERENCE_MAX": (int, 4),            # 生图参考图数量上限
+    "VIDEO_REFERENCE_MAX": (int, 5),            # 视频参考图上限（Flash 官方=5）
+    "UPLOAD_MAX_MB": (float, 15.0),             # /upload 单文件上限（官方单张 15MB）
+    # ---- V4：视频提交排队（上游队列满=常态，免费额度 RPM=1）----
+    # 撞 503 video_queue_full 不再立刻失败，改为服务端代为排队重试：
+    # 把「用户/Agent 反复手动重试」变成「提交一次，好了来拿」。
+    "VIDEO_SUBMIT_QUEUE_WAIT_SEC": (float, 600.0),  # 代排队总时长上限
+    "VIDEO_SUBMIT_RETRY_MIN_SEC": (float, 20.0),    # 排队重试最小间隔
+    "VIDEO_SUBMIT_RETRY_MAX_SEC": (float, 90.0),    # 排队重试最大间隔（指数退避封顶）
 }
 
 # 必填密钥（缺失/为空 → 启动 fail-fast）
@@ -160,6 +195,41 @@ class Config:
     persist_timeout_video_sec: float
     task_ttl_sec: float
     task_max: int
+    # ---- V3（多队列 / 并发 / 视频后台异步）----
+    image_max_concurrency: int
+    video_max_concurrency: int
+    image_queue_wait_sec: float
+    video_queue_wait_sec: float
+    image_queue_max: int
+    video_queue_max: int
+    image_batch_concurrency: int
+    video_job_max_wait_sec: float
+    video_job_max: int
+    video_job_concurrency: int
+    # ---- V3：上游速率限制 ----
+    upstream_rps: float
+    upstream_burst: int
+    upstream_cooldown_sec: float
+    # ---- V4：参考图（图生图 / 图生视频）----
+    reference_max_mb: float
+    image_reference_max: int
+    video_reference_max: int
+    upload_max_mb: float
+    # ---- V4：视频提交排队 ----
+    video_submit_queue_wait_sec: float
+    video_submit_retry_min_sec: float
+    video_submit_retry_max_sec: float
+
+    # ------------------------------------------------------------------
+    # V4 派生：参考图上限（字节）
+    # ------------------------------------------------------------------
+    @property
+    def reference_max_bytes(self) -> int:
+        return int(self.reference_max_mb * 1024 * 1024)
+
+    @property
+    def upload_max_bytes(self) -> int:
+        return int(self.upload_max_mb * 1024 * 1024)
 
     # ------------------------------------------------------------------
     # 启动自检：嵌套不等式（红线 B6）
@@ -235,6 +305,86 @@ class Config:
         if self.task_max < 1:
             problems.append(f"TASK_MAX={self.task_max} 必须 ≥ 1")
 
+        # ---- V3 增量自检（多队列 / 并发 / 后台作业）----
+        if self.image_max_concurrency < 1:
+            problems.append(
+                f"IMAGE_MAX_CONCURRENCY={self.image_max_concurrency} 必须 ≥ 1")
+        if self.video_max_concurrency < 1:
+            problems.append(
+                f"VIDEO_MAX_CONCURRENCY={self.video_max_concurrency} 必须 ≥ 1")
+        if self.image_queue_wait_sec <= 0:
+            problems.append(
+                f"IMAGE_QUEUE_WAIT_SEC={self.image_queue_wait_sec}s 必须 > 0")
+        if self.video_queue_wait_sec <= 0:
+            problems.append(
+                f"VIDEO_QUEUE_WAIT_SEC={self.video_queue_wait_sec}s 必须 > 0")
+        if self.image_queue_wait_sec > self.total_budget_sec:
+            problems.append(
+                f"IMAGE_QUEUE_WAIT_SEC={self.image_queue_wait_sec}s > "
+                f"TOTALBUDGETSEC={self.total_budget_sec}s（排队计入预算）")
+        if self.video_queue_wait_sec > self.total_budget_sec:
+            problems.append(
+                f"VIDEO_QUEUE_WAIT_SEC={self.video_queue_wait_sec}s > "
+                f"TOTALBUDGETSEC={self.total_budget_sec}s（排队计入预算）")
+        if self.image_queue_max < 1:
+            problems.append(f"IMAGE_QUEUE_MAX={self.image_queue_max} 必须 ≥ 1")
+        if self.video_queue_max < 1:
+            problems.append(f"VIDEO_QUEUE_MAX={self.video_queue_max} 必须 ≥ 1")
+        if not 1 <= self.image_batch_concurrency <= BATCH_MAX:
+            problems.append(
+                f"IMAGE_BATCH_CONCURRENCY={self.image_batch_concurrency} 必须落在 "
+                f"1–{BATCH_MAX}（与 batch_size 合法区间一致）")
+        if self.video_job_max_wait_sec <= 0:
+            problems.append(
+                f"VIDEO_JOB_MAX_WAIT_SEC={self.video_job_max_wait_sec}s 必须 > 0")
+        if self.video_job_max < 1:
+            problems.append(f"VIDEO_JOB_MAX={self.video_job_max} 必须 ≥ 1")
+        if self.video_job_concurrency < 1:
+            problems.append(
+                f"VIDEO_JOB_CONCURRENCY={self.video_job_concurrency} 必须 ≥ 1")
+        if self.upstream_rps <= 0:
+            problems.append(f"UPSTREAM_RPS={self.upstream_rps} 必须 > 0")
+        if self.upstream_burst < 1:
+            problems.append(f"UPSTREAM_BURST={self.upstream_burst} 必须 ≥ 1")
+        if self.upstream_cooldown_sec < 0:
+            problems.append(
+                f"UPSTREAM_COOLDOWN_SEC={self.upstream_cooldown_sec} 必须 ≥ 0")
+
+        # ---- V4 增量自检（参考图 / 视频提交排队）----
+        if self.reference_max_mb <= 0:
+            problems.append(
+                f"REFERENCE_MAX_MB={self.reference_max_mb} 必须 > 0")
+        if self.upload_max_mb <= 0:
+            problems.append(f"UPLOAD_MAX_MB={self.upload_max_mb} 必须 > 0")
+        # /upload 上限必须 ≥ 参考图上限：否则「上传成功却当不了参考图」，
+        # 用户拿到一张用不了的图，属于自相矛盾的配置
+        if self.upload_max_mb < self.reference_max_mb:
+            problems.append(
+                f"UPLOAD_MAX_MB={self.upload_max_mb} 必须 ≥ "
+                f"REFERENCE_MAX_MB={self.reference_max_mb}"
+                "（否则上传成功的图无法用作参考图）")
+        if self.image_reference_max < 1:
+            problems.append(
+                f"IMAGE_REFERENCE_MAX={self.image_reference_max} 必须 ≥ 1")
+        if not 1 <= self.video_reference_max <= 5:
+            # Flash 上游硬限 5 张（官方文档：images length must not exceed 5）
+            problems.append(
+                f"VIDEO_REFERENCE_MAX={self.video_reference_max} 必须落在 1–5"
+                "（agnes-video-2.5-flash 上游硬限 5 张）")
+        if self.video_submit_queue_wait_sec < 0:
+            problems.append(
+                f"VIDEO_SUBMIT_QUEUE_WAIT_SEC={self.video_submit_queue_wait_sec}"
+                " 必须 ≥ 0（0 = 关闭代排队，退回立即失败）")
+        if self.video_submit_retry_min_sec <= 0:
+            problems.append(
+                f"VIDEO_SUBMIT_RETRY_MIN_SEC={self.video_submit_retry_min_sec}"
+                " 必须 > 0")
+        if self.video_submit_retry_max_sec < self.video_submit_retry_min_sec:
+            problems.append(
+                f"VIDEO_SUBMIT_RETRY_MAX_SEC={self.video_submit_retry_max_sec} "
+                f"必须 ≥ VIDEO_SUBMIT_RETRY_MIN_SEC="
+                f"{self.video_submit_retry_min_sec}")
+
         if problems:
             raise ConfigError(
                 "嵌套不等式自检失败（read ≤ 分档 ≤ 200 < 210 建议 < 220）：\n  - "
@@ -253,6 +403,26 @@ class Config:
             f"单查 {self.video_query_timeout_sec:g}s ≤ 单查 ≤ 提交 ≤ deadline "
             f"({self.total_budget_sec:g}s) ✓ | 轮询 {self.video_poll_interval_sec:g}s | "
             f"任务表 TTL {self.task_ttl_sec:g}s / 容量 {self.task_max} ✓",
+            "[config] V3 多队列自检: "
+            f"生图泳道 并发{self.image_max_concurrency}/等待{self.image_queue_wait_sec:g}s/"
+            f"队列深{self.image_queue_max} | "
+            f"视频泳道 并发{self.video_max_concurrency}/等待{self.video_queue_wait_sec:g}s/"
+            f"队列深{self.video_queue_max} | "
+            f"batch 并发 {self.image_batch_concurrency} ✓ | "
+            f"视频后台作业 上限{self.video_job_max}/轮询并发{self.video_job_concurrency}/"
+            f"总等待{self.video_job_max_wait_sec:g}s ✓",
+            "[config] V3 上游限速自检: "
+            f"{self.upstream_rps:g} req/s（突发 {self.upstream_burst}）| "
+            f"过载冻结 {self.upstream_cooldown_sec:g}s ✓",
+            "[config] V4 参考图自检: "
+            f"单张上限 {self.reference_max_mb:g}MB | 生图上限 "
+            f"{self.image_reference_max} 张 | 视频上限 "
+            f"{self.video_reference_max} 张（上游硬限 5）| 上传上限 "
+            f"{self.upload_max_mb:g}MB ✓",
+            "[config] V4 视频提交排队自检: "
+            f"代排队上限 {self.video_submit_queue_wait_sec:g}s | 重试退避 "
+            f"{self.video_submit_retry_min_sec:g}–"
+            f"{self.video_submit_retry_max_sec:g}s ✓",
         ]
 
 
@@ -320,5 +490,29 @@ def _field_name(env_name: str) -> str:
         "PERSIST_TIMEOUT_VIDEO_SEC": "persist_timeout_video_sec",
         "TASK_TTL_SEC": "task_ttl_sec",
         "TASK_MAX": "task_max",
+        # ---- V3（多队列 / 并发 / 视频后台异步）----
+        "IMAGE_MAX_CONCURRENCY": "image_max_concurrency",
+        "VIDEO_MAX_CONCURRENCY": "video_max_concurrency",
+        "IMAGE_QUEUE_WAIT_SEC": "image_queue_wait_sec",
+        "VIDEO_QUEUE_WAIT_SEC": "video_queue_wait_sec",
+        "IMAGE_QUEUE_MAX": "image_queue_max",
+        "VIDEO_QUEUE_MAX": "video_queue_max",
+        "IMAGE_BATCH_CONCURRENCY": "image_batch_concurrency",
+        "VIDEO_JOB_MAX_WAIT_SEC": "video_job_max_wait_sec",
+        "VIDEO_JOB_MAX": "video_job_max",
+        "VIDEO_JOB_CONCURRENCY": "video_job_concurrency",
+        # ---- V3：上游速率限制 ----
+        "UPSTREAM_RPS": "upstream_rps",
+        "UPSTREAM_BURST": "upstream_burst",
+        "UPSTREAM_COOLDOWN_SEC": "upstream_cooldown_sec",
+        # ---- V4：参考图（图生图 / 图生视频）----
+        "REFERENCE_MAX_MB": "reference_max_mb",
+        "IMAGE_REFERENCE_MAX": "image_reference_max",
+        "VIDEO_REFERENCE_MAX": "video_reference_max",
+        "UPLOAD_MAX_MB": "upload_max_mb",
+        # ---- V4：视频提交排队 ----
+        "VIDEO_SUBMIT_QUEUE_WAIT_SEC": "video_submit_queue_wait_sec",
+        "VIDEO_SUBMIT_RETRY_MIN_SEC": "video_submit_retry_min_sec",
+        "VIDEO_SUBMIT_RETRY_MAX_SEC": "video_submit_retry_max_sec",
     }
     return special[env_name]

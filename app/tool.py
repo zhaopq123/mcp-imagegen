@@ -63,28 +63,40 @@ if TYPE_CHECKING:  # 仅类型标注；运行时避免 tool ↔ pipeline 循环�
 TOOL_NAME = "generate_image"
 TOOL_NAME_VIDEO = "generate_video"
 TOOL_NAME_QUERY = "query_video"
+# V3：异步作业总览（不触碰上面三个冻结工具的 schema/description）
+TOOL_NAME_LIST = "list_video_tasks"
 
-# A1″：description 逐字符冻结（A1′ 原文 + D2 size/ratio 语义句；
-# tests/test_tool.py 全等断言拦截一切改动）
+# A1‴（V4 重冻结）：在 A1″ 原文基础上追加参考图（图生图/多图合成）语义句。
+# 冻结纪律不变——tests/test_tool.py 全等断言拦截一切未授权改动；
+# 本次解冻是**产品决策**（用户 2026-10-13 明示「全做」），依据见
+# docs/V4_产品分析与改造说明.md §3.1。
 TOOL_DESCRIPTION = (
     "Generate images from a text prompt using agnes-image-2.5-flash. "
     "Supports batch generation (split into sequential calls server-side). "
     "size accepts a tier (1K/2K/3K/4K) or a WxH value like 1024x768; "
     "ratio (e.g. 16:9) may only be set alongside a tiered size, never "
-    "with WxH. NOTE: upstream image URLs are short-lived; set "
-    "persist=true to get a durable self-hosted URL."
+    "with WxH. image: optional reference image(s) for image-to-image "
+    "editing or multi-image composition — accept a public URL, a data "
+    "URI/base64, or this server's own artifact name or /files/<name> "
+    "URL. NOTE: upstream image URLs are short-lived; set persist=true "
+    "to get a durable self-hosted URL."
 )
 
-# A2′：generate_video description 逐字符冻结（规格书 2.2 原文；V2 六节
-# A1′ 明文"沿用规格书原文零改动"——下划线按渲染层吞蚀复原，见模块
-# docstring；en-dash 为 U+2013）
+# A2‴（V4 重冻结）：在规格书 2.2 原文基础上追加首尾帧/参考图语义句
+# （en-dash U+2013 保留；产品决策依据同上）。
 TOOL_DESCRIPTION_VIDEO = (
     "Generate a short video (4\u201312 seconds) from a text prompt using "
     "agnes-video-2.5-flash. Waits synchronously within the time budget; "
     "if the task is still running at deadline, returns a task_id which "
     "can be polled via the query_video tool. Returns video URL on "
-    "success. NOTE: set persist=true for a durable URL (upstream URLs "
-    "are short-lived)."
+    "success. first_frame/last_frame: optional keyframe images (use "
+    "first_frame to animate this image as the real first frame); "
+    "reference_images: optional style/content references (re-composes). "
+    "Each accepts a public URL, data URI/base64, or this server's own "
+    "artifact name or /files/<name> URL. When the upstream queue is "
+    "full the server queues the submission and returns a task_id with "
+    "status=queued. NOTE: set persist=true for a durable URL (upstream "
+    "URLs are short-lived)."
 )
 
 # A3′：query_video description 逐字符冻结（规格书 2.3 原文；该段仅含
@@ -96,14 +108,24 @@ TOOL_DESCRIPTION_QUERY = (
     "submission."
 )
 
-# A2：参数名（名称有序；D2/D3 增量；pipeline 侧二次校验范围）
+# A2：参数名（名称有序；D2/D3 增量；V4 增参考图/首尾帧；pipeline 侧二次校验范围）
 TOOL_PARAMS: tuple[str, ...] = (
-    "prompt", "size", "ratio", "batch_size", "persist",
+    "prompt", "size", "ratio", "batch_size", "persist", "image",
 )
 TOOL_PARAMS_VIDEO: tuple[str, ...] = (
     "prompt", "seconds", "aspect_ratio", "seed", "persist",
+    "first_frame", "last_frame", "reference_images",
 )
 TOOL_PARAMS_QUERY: tuple[str, ...] = ("task_id",)
+TOOL_PARAMS_LIST: tuple[str, ...] = ("limit",)
+
+# V3：list_video_tasks 描述（自建，非规格书冻结文本）
+TOOL_DESCRIPTION_LIST = (
+    "List the video generation tasks currently tracked in memory "
+    "(newest first). Use it after submitting several videos "
+    "asynchronously to see their task_id, status and result URL at "
+    "once, instead of polling query_video one by one."
+)
 
 
 def register_tool(
@@ -113,7 +135,7 @@ def register_tool(
 ) -> None:
     """向 FastMCP 注册三工具（描述/schema 见模块 docstring）。"""
 
-    @mcp.tool(name=TOOL_NAME, description=TOOL_DESCRIPTION)
+    @mcp.tool(name=TOOL_NAME, description=TOOL_DESCRIPTION, output_schema=None)
     async def generate_image(
         prompt: Annotated[str, Field(description="提示词，中英文皆可")],
         size: Annotated[
@@ -133,6 +155,13 @@ def register_tool(
         persist: Annotated[
             bool, Field(description="true=转存返自托管持久 URL（/files）")
         ] = False,
+        image: Annotated[
+            Optional[list[str]], Field(
+                description="参考图（图生图/多图合成），V4；数组每项一个："
+                "公网 URL、data URI/base64，或本服务产物名/ "
+                "/files/<name> URL（可直接拿上一张生成结果当参考图）；"
+                "不传=纯文生图")
+        ] = None,
     ) -> str:
         """见模块级 TOOL_DESCRIPTION（此处 docstring 不进 schema）。"""
         return await pipeline.run(
@@ -141,10 +170,11 @@ def register_tool(
             ratio=ratio,
             batch_size=batch_size,
             persist_flag=persist,
+            images=image,
             http_headers=_current_http_headers(),
         )
 
-    @mcp.tool(name=TOOL_NAME_VIDEO, description=TOOL_DESCRIPTION_VIDEO)
+    @mcp.tool(name=TOOL_NAME_VIDEO, description=TOOL_DESCRIPTION_VIDEO, output_schema=None)
     async def generate_video(
         prompt: Annotated[str, Field(description="视频内容描述，中英文皆可")],
         seconds: Annotated[
@@ -163,6 +193,23 @@ def register_tool(
         persist: Annotated[
             bool, Field(description="true=转存返自托管持久 URL（/files）")
         ] = False,
+        first_frame: Annotated[
+            Optional[str], Field(
+                description="首帧图（keyframe 模式），V4；「让这张图作为"
+                "成片真实首帧动起来」首选。形态同参考图：公网 URL / "
+                "data URI / 本服务产物名")
+        ] = None,
+        last_frame: Annotated[
+            Optional[str], Field(
+                description="尾帧图（keyframe 模式），V4；与 first_frame "
+                "至少给一个；可做首尾帧过渡")
+        ] = None,
+        reference_images: Annotated[
+            Optional[list[str]], Field(
+                description="参考图（reference 模式，V4；上限 5 张）；"
+                "仅作风格/内容参考，会重新构图——要构图可控请用 "
+                "first_frame；与 first_frame/last_frame 互斥")
+        ] = None,
     ) -> str:
         """见模块级 TOOL_DESCRIPTION_VIDEO（此处 docstring 不进 schema）。"""
         return await video_pipeline.run(
@@ -171,18 +218,117 @@ def register_tool(
             aspect_ratio=aspect_ratio,
             seed=seed,
             persist_flag=persist,
+            first_frame=first_frame,
+            last_frame=last_frame,
+            reference_images=reference_images,
             http_headers=_current_http_headers(),
         )
 
-    @mcp.tool(name=TOOL_NAME_QUERY, description=TOOL_DESCRIPTION_QUERY)
+    @mcp.tool(name=TOOL_NAME_QUERY, description=TOOL_DESCRIPTION_QUERY, output_schema=None)
     async def query_video(
         task_id: Annotated[str, Field(description="generate_video 返回的任务号")],
     ) -> str:
         """见模块级 TOOL_DESCRIPTION_QUERY（此处 docstring 不进 schema）。"""
         return await video_pipeline.query(task_id=task_id)
 
+    @mcp.tool(name=TOOL_NAME_LIST, description=TOOL_DESCRIPTION_LIST, output_schema=None)
+    async def list_video_tasks(
+        limit: Annotated[
+            int, Field(description="最多返回条数；默认 20")
+        ] = 20,
+    ) -> str:
+        """见模块级 TOOL_DESCRIPTION_LIST（此处 docstring 不进 schema）。"""
+        import json
+
+        jobs = video_pipeline.list_jobs(limit=limit)
+        return json.dumps(
+            {"count": len(jobs), "tasks": jobs}, ensure_ascii=False)
+
     # 注册后的函数对象已替换为 Tool，无需保留引用
+    # 收尾：压平 anyOf（严格模型拒载第二道毒，见 _flatten_null_union 注释）
+    _flatten_tool_schemas(mcp)
     return None
+
+
+# ────────────────────────────────────────────────────────────────
+# 严格模型兼容：schema 归一化
+#
+# ⚠️ 根因（2026-10-13 实测，与 social-insight / websearch /
+#    shared-memory 同一个坑）：严格模型（Step-5-Preview /
+#    GLM-5.3-Flash / Deepseek-V4.1-Flash）逐字校验 tools/list 里
+#    每个工具的 schema，两样东西让它**拒掉整个请求**
+#    （11129 "The tool definition does not meet the model requirements"）：
+#      1. outputSchema —— fastmcp 自动生成，已在各 @mcp.tool 上
+#         显式 output_schema=None 关掉
+#      2. anyOf       —— ``Optional[X] = None`` 参数会展开成
+#         ``anyOf: [{...}, {"type": "null"}]``（generate_image /
+#         generate_video 的 ratio/seed/first_frame/... 全中）
+#
+#    第 2 项取决于参数写法，漏一个就是一颗雷，所以注册完成后
+#    统一压平：``anyOf: [T, null]`` → ``T``（参数本就可选，
+#    default/description 原样保留，语义不变）。
+# ────────────────────────────────────────────────────────────────
+def _flatten_null_union(node: object) -> object:
+    """递归压平 ``anyOf: [T, {"type": "null"}]`` → ``T``。"""
+    if isinstance(node, dict):
+        any_of = node.get("anyOf")
+        if isinstance(any_of, list):
+            non_null = [
+                s
+                for s in any_of
+                if not (isinstance(s, dict) and s.get("type") == "null")
+            ]
+            if len(non_null) == 1:
+                merged: dict = dict(non_null[0])
+                for k, v in node.items():
+                    if k != "anyOf":
+                        merged[k] = _flatten_null_union(v)
+                return merged
+        return {k: _flatten_null_union(v) for k, v in node.items()}
+    if isinstance(node, list):
+        return [_flatten_null_union(item) for item in node]
+    return node
+
+
+def _flatten_tool_schemas(mcp: FastMCP) -> int:
+    """压平全部已注册工具 inputSchema 里的 anyOf，返回处理的工具数。"""
+    import json as _json
+
+    probes = (
+        lambda m: getattr(getattr(m, "_local_provider", None), "_components", None),
+        lambda m: getattr(getattr(m, "_provider", None), "_components", None),
+        lambda m: getattr(getattr(m, "_tool_manager", None), "_tools", None),
+    )
+    tools: list = []
+    for probe in probes:
+        try:
+            store = probe(mcp)
+        except Exception:  # noqa: BLE001 —— 探测失败就试下一种布局
+            continue
+        if isinstance(store, dict):
+            tools = [
+                v
+                for v in store.values()
+                if hasattr(v, "parameters") and hasattr(v, "output_schema")
+            ]
+            if tools:
+                break
+    n = 0
+    for tool in tools:
+        params = getattr(tool, "parameters", None)
+        if isinstance(params, dict) and "anyOf" in _json.dumps(params, ensure_ascii=False):
+            tool.parameters = _flatten_null_union(params)
+            n += 1
+    if not tools:
+        # 静默跳过 = 把故障放回去。显式告警。
+        import sys
+
+        print(
+            "[schema] anyOf 归一化失败：未探测到已注册工具"
+            "（fastmcp 版本布局可能已变），严格模型可能拒载",
+            file=sys.stderr,
+        )
+    return n
 
 
 def _current_http_headers() -> Optional[Mapping[str, str]]:

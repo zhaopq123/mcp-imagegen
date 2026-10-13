@@ -72,10 +72,13 @@ class FakeVideoApi:
         self.query_calls: list[dict] = []
 
     async def submit_video(self, *, model, prompt, seconds, aspect_ratio,
-                           deadline, seed=None):
+                           deadline, seed=None, mode="text", first_frame=None,
+                           last_frame=None, reference_images=None):
         self.submit_calls.append({
             "model": model, "prompt": prompt, "seconds": seconds,
             "aspect_ratio": aspect_ratio, "deadline": deadline, "seed": seed,
+            "mode": mode, "first_frame": first_frame,
+            "last_frame": last_frame, "reference_images": reference_images,
         })
         return self.submit_result
 
@@ -318,17 +321,21 @@ async def test_budget_exhausted_skips_download_io(tmp_path, caplog):
         ) as ns:                               # 每跳烧 205s > 200s 总预算
             out = await run_persist(ns)
 
+    # V3：persist 移入后台作业，用作业自己的下载预算（PERSIST_TIMEOUT_VIDEO_SEC），
+    # 不再随"请求预算耗尽"而跳过——这正是异步化的收益：请求早已返回（E17
+    # deferred 或已完成），落盘照样完成。预算不足的降级路径仍由 persist 层
+    # 保证（降级原 URL + meta persist_failed），非错误。
     lines = out.split("\n")
-    assert lines[0] == UPSTREAM_MP4                    # 原上游 URL
+    assert lines[0].startswith("http://files.example:8000/files/")
     assert [ord(c) for c in lines[1][:7]] == ORD_META
-    assert "persist_failed" in lines[1]
+    assert "persisted" in lines[1]
     assert not out.startswith(ERROR_PREFIX)
-    assert ns.transport.requests == []                # R3：未发起任何下载 IO
-    assert list(ns.video_dir.iterdir()) == []
+    assert len(list(ns.video_dir.iterdir())) == 1      # 后台已落盘 1 个文件
     assert ns.sleep.calls == [ns.cfg.video_poll_interval_sec]  # 恰一次轮询间隔
     records = access_records(caplog)
     assert len(records) == 1
-    assert "persist=persist_failed" in records[0].getMessage()
+    # V3：后台完成落盘 → 访问日志如实记 persist=persisted（不再是 failed）
+    assert "persist=persisted" in records[0].getMessage()
 
 
 # ---------------------------------------------------------------------------

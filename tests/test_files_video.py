@@ -211,7 +211,10 @@ async def test_symlink_escape_rejected(tmp_path):
     video_dir.mkdir()
     outside = tmp_path / VALID_MP4            # 目录外目标（名字完全合法）
     outside.write_bytes(b"secret-outside")
-    os.symlink(outside, video_dir / VALID_MP4)
+    try:
+        os.symlink(outside, video_dir / VALID_MP4)
+    except OSError as exc:
+        pytest.skip(f"当前环境不允许创建 symlink：{exc}")
     resp = await get(make_app(image_dir, video_dir), f"/files/{VALID_MP4}")
     assert resp.status_code == 404
 

@@ -12,7 +12,8 @@
 
 | 能力 | 说明 |
 |---|---|
-| **三工具** | `generate_image`（文生图，支持批量拆分）· `generate_video`（文生视频 4–12 秒）· `query_video`（查询视频任务状态） |
+| **四工具** | `generate_image`（文生图/参考图生图，支持批量拆分）· `generate_video`（文生视频、首尾帧/参考图、服务端排队）· `query_video`（查询视频任务状态）· `list_video_tasks`（批量查看后台作业） |
+| **图像迭代闭环** | 可上传本机图片，也可把本服务的图片/视频产物作为后续参考输入；图像字节不经第三方图床 |
 | **单上游** | 仅依赖 Agnes AI（`agnes-image-2.5-flash` / `agnes-video-2.5-flash`），配置面简单 |
 | **并发与排队** | 可配并发槽（默认 3），排队超时返回 `busy` 而非无限等待 |
 | **熔断保护** | 硬熔断（429/402）与软熔断（连续失败），避免把上游配额打爆 |
@@ -144,6 +145,17 @@ MCP 端点为 **streamable-http**，需带 Bearer 鉴权。注意各客户端的
 | `ratio` | string | 上游默认 | `1:1`/`3:4`/`4:3`/`16:9`/`9:16`/`2:3`/`3:2`/`21:9`。**仅可与档位式 size 同传，与 WxH 同传即冲突** |
 | `batch_size` | int | `1` | 1–4，服务端拆分串行调用 |
 | `persist` | bool | `false` | `true` 则转存为自托管持久 URL |
+| `image` | string[] | 不传 | 可选参考图；支持公网 URL、data URI/base64、本服务产物名或 `/files/<name>`。多张图用于图生图/合成 |
+
+本机图片先用 `POST /upload` 上传，再把响应里的 `url` 作为 `image` 参数：
+
+```bash
+curl -X POST "http://<host>:8000/upload" \\
+  -H "Authorization: Bearer <MCPACCESS_TOKEN>" \\
+  --data-binary @reference.png
+```
+
+上传成功返回 `201` 和 `/files/<name>`。端点按图片文件签名识别格式；超限返回 `413`，不支持的格式返回 `415`。
 
 ### `generate_video`
 
@@ -154,14 +166,22 @@ MCP 端点为 **streamable-http**，需带 Bearer 鉴权。注意各客户端的
 | `aspect_ratio` | string | `16:9` | `16:9`/`9:16`/`1:1`/`4:3`/`3:4`/`21:9` |
 | `seed` | int | 不传 | 随机种子，直传上游 |
 | `persist` | bool | `false` | 同上 |
+| `first_frame` | string | 不传 | keyframe 模式首帧；让输入图作为成片真实首帧 |
+| `last_frame` | string | 不传 | keyframe 模式尾帧；可与首帧配合做过渡 |
+| `reference_images` | string[] | 不传 | reference 模式风格/内容参考（最多 5 张，会重新构图）；与首尾帧互斥 |
 
-在时间预算内同步等待；超预算则返回 `task_id`，用 `query_video` 续查。
+视频参考图可使用公网 URL、data URI/base64、本服务产物名或 `/files/<name>`。
+在时间预算内同步等待；超预算则返回 `task_id`，用 `query_video` 续查。上游队列满时服务端代为排队。
 
 ### `query_video`
 
 | 参数 | 类型 | 说明 |
 |---|---|---|
 | `task_id` | string | **必填**，来自 `generate_video` 的返回 |
+
+### `list_video_tasks`
+
+批量查看内存中跟踪的视频任务，按最新提交优先；返回 task_id、状态与结果 URL。
 
 ---
 
@@ -171,7 +191,8 @@ MCP 端点为 **streamable-http**，需带 Bearer 鉴权。注意各客户端的
 |---|---|
 | `/mcp` | MCP 协议端点（**需 Bearer 鉴权**）|
 | `/healthz` | 健康检查，返回 `{"status":"ok"}` |
-| `/files/{name}` | 已转存的图片 / 视频 |
+| `/files/{name}` | 已转存的图片 / 视频（公开只读，文件名白名单） |
+| `/upload` | 本机图片上传（需 Bearer；限制大小，按文件签名识别格式） |
 
 ---
 
@@ -252,44 +273,6 @@ server.py                   入口：配置自检 → 组件装配 → FastMCP �
 
 ---
 
----
-
-## 🤝 贡献与招募
-
-**欢迎一起维护这个项目！** 无论你是想修 Bug、加功能、补文档，还是只想聊聊想法，都欢迎。
-
-### 我能提供的
-
-- 清晰的分层架构与代码约定（见 [docs/wiki/架构说明](docs/wiki/架构说明.md)）
-- 424 项单测兜底，改动不容易踩坑
-- fail-fast 配置自检，改坏了启动就会告诉你
-- 完整的 [CONTRIBUTING.md](CONTRIBUTING.md) 贡献指南
-
-### 我需要的
-
-| 方向 | 说明 |
-|---|---|
-| **Bug 修复** | 从标了 `good first issue` 的开始最合适 |
-| **文档完善** | 翻译、补 FAQ、写使用案例 |
-| **功能扩展** | 新工具、新上游、部署方案改进 |
-| **测试加固** | 边界 case、异常路径覆盖 |
-
-### 参与方式
-
-**最轻**：提 [Issue](https://github.com/zhaopq123/mcp-imagegen/issues) —— 报 Bug、提想法、报文档错误
-**推荐**：Fork + PR —— 看 [CONTRIBUTING.md](CONTRIBUTING.md)，按流程提交
-**深入**：成为协作者 —— 在 [Discussions](https://github.com/zhaopq123/mcp-imagegen/discussions) 里聊聊，或直接联系维护者
-
-### 一起维护的约定
-
-- 先开 Issue 讨论，再动手，避免重复劳动
-- PR 前本地跑通：`pytest -q` + `python server.py --check`
-- 遵守代码约定：不引入线程、配置不硬编码、错误走统一契约
-- 有问题随时问，没有"笨问题"
-
----
-
-
 ## 许可
 
 [MIT](LICENSE)
@@ -299,10 +282,3 @@ server.py                   入口：配置自检 → 组件装配 → FastMCP �
 ## 致谢
 
 上游能力由 [Agnes AI](https://api.agnes-ai.cn) 提供。本项目仅做协议适配与工程加固。
-
-
----
-
-## 📚 完整文档
-
-更详细的说明在 [docs/wiki/](docs/wiki/Home.md)：快速开始 · 配置项详解 · 接入客户端 · 架构说明 · 常见问题

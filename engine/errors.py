@@ -194,6 +194,19 @@ def busy_error(waited_sec: float) -> ErrorInfo:
     return _build(BUSY, f"并发繁忙(等待 {waited_sec:.1f}s 超限)", "稍后重调")
 
 
+def queue_full_error(lane: str, depth: int, max_queued: int) -> ErrorInfo:
+    """V3：泳道排队深度超限 → busy（同类契约，retry=yes）。
+
+    与 busy_error 的区别只在 reason 文本：一个是"等太久"，一个是"队列
+    已满"——Agent 侧动作一致（稍后重调），故不新增类别。
+    """
+    return _build(
+        BUSY,
+        f"队列已满({lane} 泳道排队 {depth}/{max_queued})",
+        "稍后重调",
+    )
+
+
 def deadline_exhausted(elapsed: float = 0.0) -> ErrorInfo:
     """预算耗尽 / 余额不足快失败（规格书 3.3：快失败返超时错误，retry=yes）。"""
     detail = f"已耗时 {elapsed:.1f}s" if elapsed else "预算耗尽即止，快失败"
@@ -229,6 +242,19 @@ def circuit_open_error(retry_after_sec: float) -> ErrorInfo:
         f"熔断中（provider=Agnes），约 {retry_after_sec:.0f} 秒后重试",
         "稍后重试（Agent 侧 retry=yes）",
     )
+
+
+def passthrough_error(category: str, reason: str, suggestion: str = "稍后重试") -> ErrorInfo:
+    """V3：把后台作业已归类的错误原样带回转发行（不二次分类）。
+
+    视频异步化后，失败发生在后台 worker；若请求侧一律套
+    video_failed_error，会把 429（rate_limit）/ 400（content_policy）等
+    具体类别压成 upstream_error —— 分类信息丢失是契约退化。
+    未知类别兜底 upstream_error（矩阵查表失败不抛错）。
+    """
+    if category not in MATRIX:
+        category = UPSTREAM_ERROR
+    return _build(category, reason, suggestion)
 
 
 def video_failed_error(detail: str = "") -> ErrorInfo:

@@ -80,10 +80,13 @@ class FakeVideoApi:
         self.submit_arrived = asyncio.Event()
 
     async def submit_video(self, *, model, prompt, seconds, aspect_ratio, deadline,
-                           seed=None):
+                           seed=None, mode="text", first_frame=None,
+                           last_frame=None, reference_images=None):
         self.submit_calls.append({
             "model": model, "prompt": prompt, "seconds": seconds,
             "aspect_ratio": aspect_ratio, "deadline": deadline, "seed": seed,
+            "mode": mode, "first_frame": first_frame,
+            "last_frame": last_frame, "reference_images": reference_images,
         })
         self.submit_arrived.set()
         if isinstance(self.submit_result, Exception):
@@ -267,7 +270,9 @@ async def test_run_success_contract_table_and_log(caplog):
     assert ns.api.submit_calls[0]["seconds"] == 5
     assert ns.api.submit_calls[0]["aspect_ratio"] == "16:9"
     assert ns.sleep.calls == [iv, iv]
-    assert ns.api.in_use_at_query == [1, 1]   # R14：轮询期持续占槽
+    # V3：轮询等待移到槽外（R14 作废）——等待不是 IO，不该占并发额度；
+    # 生图泳道因此不会被视频长任务饿死（本轮性能改造的核心）
+    assert ns.api.in_use_at_query == [0, 0]
 
     assert ns.pool.in_use() == 0             # R15：完成即释放
 
@@ -327,11 +332,14 @@ async def test_run_deadline_expires_returns_running_non_error(caplog):
     entry = ns.table.get("vid-e17")        # 表内最近实况仍 running
     assert entry is not None and entry.status == "running"
 
-    # 总预算 200s / 轮询间隔 2s（D7）= 100 轮恰好耗尽（每轮先睡后查）
+    # V3：轮询交给后台作业后，作业**独立于请求**继续跑到自己的预算上限
+    # （VIDEO_JOB_MAX_WAIT_SEC=1800s），所以"请求侧恰好轮询 N 轮"的断言
+    # 不再成立——断言退化为"间隔恒定不漂移 + 至少轮询过"，轮数由作业
+    # 预算决定（这正是"请求走了作业还在跑"的语义）。
     iv = ns.cfg.video_poll_interval_sec
-    rounds = round(ns.cfg.total_budget_sec / iv)
-    assert ns.sleep.calls == [iv] * rounds
-    assert len(ns.api.query_calls) == rounds
+    assert ns.sleep.calls, "后台作业应至少轮询一次"
+    assert set(ns.sleep.calls) == {iv}      # D7：间隔恒定，不随轮次漂移
+    assert len(ns.api.query_calls) == len(ns.sleep.calls)
 
     access = access_records(caplog)
     assert len(access) == 1
@@ -421,11 +429,11 @@ async def test_queue_wait_counts_toward_deadline_e17():
     assert [ord(c) for c in out[:7]] == ORD_META
     assert "task_id=vid-q" in out
     assert "已等待 200.0s" in out
+    # V3：排队 190s 仍计入请求 deadline（E4 不变）；等待期不再占槽
+    # （R14 作废），故 in_use_at_query 恒为 0
     iv = ns.cfg.video_poll_interval_sec
-    remaining = ns.cfg.total_budget_sec - 190.0        # 拿槽后剩余预算
-    rounds = round(remaining // iv)                    # D7：10s / 2s = 5 轮
-    assert ns.sleep.calls == [iv] * rounds
-    assert ns.api.in_use_at_query == [1] * rounds      # R14：轮询期仍占槽
+    assert set(ns.sleep.calls) == {iv}
+    assert all(v == 0 for v in ns.api.in_use_at_query)  # V3：槽外等待
     assert ns.pool.in_use() == 0               # R15
 
 
@@ -490,8 +498,10 @@ def test_deadline_passed_to_submit_and_query_is_request_scoped():
     asyncio.run(run_ok(ns))
     submit_call = ns.api.submit_calls[0]
     query_call = ns.api.query_calls[0]
-    assert submit_call["deadline"] is query_call["deadline"]   # 同一对象
+    # V3：提交用请求 deadline（总预算）；轮询交给后台作业，用作业自己的
+    # 预算（VIDEO_JOB_MAX_WAIT_SEC）——这正是"请求返回了作业还在跑"的基础
     assert submit_call["deadline"].total == ns.cfg.total_budget_sec
+    assert query_call["deadline"].total == ns.cfg.video_job_max_wait_sec
 
 
 async def test_integration_real_client_submit_and_poll(scripted, cfg):

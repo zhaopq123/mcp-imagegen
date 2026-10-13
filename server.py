@@ -32,7 +32,7 @@ from app import endpoints, tool
 from app.pipeline import GeneratePipeline
 from app.video_pipeline import VideoPipeline
 from config import SYSTEMD_TIMEOUT_STOP_SEC, Config, ConfigError, load_config
-from infra import agnes, budget, circuit, persist, tasks
+from infra import agnes, budget, circuit, persist, ratelimit, tasks
 from ops import liveness, shutdown
 
 logger = logging.getLogger("mcp_imagegen.server")
@@ -64,9 +64,10 @@ def build_app(
         # ---- startup（uvicorn 绑定完成后进入）：READY=1 + 后台任务 ----
         components.notifier.notify("READY=1")
         logger.info(
-            "[startup] 就绪 port=%d image_dir=%s video_dir=%s 并发=%d 总预算=%.0fs",
-            cfg.port, cfg.image_dir, cfg.video_dir,
-            cfg.max_concurrency, cfg.total_budget_sec,
+            "[startup] 就绪 port=%d image_dir=%s video_dir=%s 总预算=%.0fs | "
+            "泳道 %s",
+            cfg.port, cfg.image_dir, cfg.video_dir, cfg.total_budget_sec,
+            components.pool.stats(),
         )
         heartbeat = asyncio.create_task(
             liveness.heartbeat_loop(components.notifier),
@@ -95,6 +96,9 @@ def build_app(
             with contextlib.suppress(asyncio.CancelledError):
                 await cleanup
             components.coordinator.begin_shutdown()  # STOPPING=1 + 日志
+            # V3：先停后台视频作业跟踪（等待方立即转 E17 deferred；
+            # 上游任务不受影响），再等请求排空
+            components.video_pipeline.cancel_background()
             await components.coordinator.wait_drained(SYSTEMD_TIMEOUT_STOP_SEC)
             await components.api_client.aclose()
             await components.persist.aclose()
@@ -102,9 +106,13 @@ def build_app(
 
     mcp = FastMCP(name="mcp-imagegen", lifespan=lifespan)
     tool.register_tool(mcp, components.pipeline, components.video_pipeline)
-    mcp.custom_route("/healthz", methods=["GET"])(endpoints.healthz_endpoint)
+    mcp.custom_route("/healthz", methods=["GET"])(
+        endpoints.make_healthz_endpoint(components))
     mcp.custom_route("/files/{name}", methods=["GET"])(
         endpoints.make_files_endpoint(cfg.image_dir, cfg.video_dir))
+    mcp.custom_route("/upload", methods=["POST"])(
+        endpoints.make_upload_endpoint(
+            cfg.image_dir, max_bytes=cfg.upload_max_bytes))
 
     inner = mcp.http_app(path="/mcp")
     return BearerApp(inner, cfg.mcp_access_token, lifespan_holder=lifespan)
@@ -160,16 +168,32 @@ class Components:
         circuit_ = circuit.CircuitBreaker(
             hard_sec=cfg.circuit_hard_sec, soft_sec=cfg.circuit_soft_sec
         )
-        pool = budget.SlotPool(cfg.max_concurrency, cfg.queue_wait_sec)
-        api_client = agnes.AgnesClient(cfg, transport=transport)
+        # V3：多队列泳道池（生图 / 视频分离，独立额度与排队深度）
+        pool = budget.MultiQueuePool(
+            {
+                "image": budget.QueueLane(
+                    "image", cfg.image_max_concurrency,
+                    cfg.image_queue_wait_sec, cfg.image_queue_max),
+                "video": budget.QueueLane(
+                    "video", cfg.video_max_concurrency,
+                    cfg.video_queue_wait_sec, cfg.video_queue_max),
+            },
+            default="image",
+        )
+        api_client = agnes.AgnesClient(
+            cfg, transport=transport,
+            limiter=ratelimit.RateLimiter(
+                rps=cfg.upstream_rps, burst=cfg.upstream_burst,
+                cooldown_sec=cfg.upstream_cooldown_sec),
+        )
         persist_ = persist.PersistService(cfg, transport=persist_transport)
         coordinator = shutdown.ShutdownCoordinator(notifier=notifier)
         pipeline = GeneratePipeline(
             cfg, pool, circuit_, api_client, persist_, tracker=coordinator,
         )
-        # T9：任务表 + 视频流水线（共用 slot pool / persist / 停机协调；
-        # query_video 不占并发槽——槽只在 run 路径获取，E20）
-        task_table = tasks.TaskTable(
+        # T9/V3：作业表（TaskTable 子类，带 future 通知）+ 视频流水线
+        # （共用泳道池 / persist / 停机协调；query_video 不占并发槽，E20）
+        task_table = tasks.JobTable(
             ttl_sec=cfg.task_ttl_sec, max_entries=cfg.task_max)
         video_pipeline = VideoPipeline(
             cfg, pool, api_client, task_table, tracker=coordinator,
