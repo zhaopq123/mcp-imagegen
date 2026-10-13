@@ -124,6 +124,7 @@ def make_upload_endpoint(image_dir: str, *, max_bytes: int):
                 return JSONResponse(
                     {"ok": False, "error": "upload_too_large", "max_bytes": max_bytes},
                     status_code=413,
+                    headers={"connection": "close"},
                 )
         except ValueError:
             return JSONResponse(
@@ -132,14 +133,33 @@ def make_upload_endpoint(image_dir: str, *, max_bytes: int):
 
         chunks: list[bytes] = []
         size = 0
+        overflow = False
+        # 溢出后不能立即 return：客户端 body 还在路上，连接提前关闭会变成
+        # RST，Agent 拿到的是不可自愈的 ConnectionReset 而非 413（生产实测
+        # 16MB 上传即触发）。正确做法是继续把流排空（设恶意保护上限），
+        # 再把 413 干净地送回去。
+        drain_cap = max_bytes * 8 + 1024 * 1024
         async for chunk in request.stream():
             size += len(chunk)
+            if overflow:
+                if size > drain_cap:
+                    # 超过排空上限（明显恶意）：只能断开，放弃送达 413
+                    return JSONResponse(
+                        {"ok": False, "error": "upload_too_large",
+                         "max_bytes": max_bytes},
+                        status_code=413,
+                        headers={"connection": "close"},
+                    )
+                continue
             if size > max_bytes:
-                return JSONResponse(
-                    {"ok": False, "error": "upload_too_large", "max_bytes": max_bytes},
-                    status_code=413,
-                )
+                overflow = True
+                continue
             chunks.append(chunk)
+        if overflow:
+            return JSONResponse(
+                {"ok": False, "error": "upload_too_large", "max_bytes": max_bytes},
+                status_code=413,
+            )
         data = b"".join(chunks)
         if not data:
             return JSONResponse({"ok": False, "error": "empty_upload"}, status_code=400)

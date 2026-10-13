@@ -102,6 +102,32 @@ async def test_bearer_gate_protects_upload_but_not_file_reads(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_streamed_oversize_upload_returns_clean_413(tmp_path):
+    """流式超限必须干净地回 413，服务端状态不受污染。
+
+    生产实测（2026-10-14）：16MB 上传直接 RST 连接（超限即 return，
+    客户端 body 还在半路）——Agent 拿到的是 ConnectionReset 而非 413，
+    不可自愈。修复后：溢出后排空剩余流（带恶意保护上限）再回 413。
+    """
+    big = b"x" * (1024 * 1024)  # 1MB/块
+    app = upload_app(tmp_path, max_bytes=1024)
+
+    async def chunks():
+        for _ in range(3):
+            yield big
+
+    async with make_client(app) as client:
+        denied = await client.post("/upload", content=chunks())
+        # 连接未坏：紧接着的正常上传必须成功
+        ok = await client.post("/upload", content=PNG)
+
+    assert denied.status_code == 413
+    assert denied.json()["error"] == "upload_too_large"
+    assert ok.status_code == 201
+    assert list(tmp_path.iterdir()) == [tmp_path / ok.json()["name"]]
+
+
+@pytest.mark.asyncio
 async def test_build_app_exposes_upload_and_enforces_auth(tmp_path):
     image_dir = tmp_path / "images"
     cfg = make_config(image_dir=image_dir, video_dir=tmp_path / "videos")
