@@ -760,6 +760,11 @@ class VideoPipeline:
                 return False
 
             if submit_deadline.expired():
+                # 记下终止类别（429→rate_limit / 队列满→upstream），
+                # 供 query 快路径把真实原因回给调用方
+                job.error_category = (errors_mod.RATE_LIMIT
+                                      if api.status_code == 429
+                                      else errors_mod.UPSTREAM_ERROR)
                 self._mark_abort(
                     job,
                     reason=(f"代排队超时（{self._queue_wait_sec:.0f}s，尝试 "
@@ -1038,6 +1043,11 @@ class VideoPipeline:
                 worker_active
                 or entry.status in (
                     tasks_mod.STATUS_COMPLETED, tasks_mod.STATUS_FAILED)
+                # V4 修订：排队中的作业（尚未拿到上游 id）绝不能掉进
+                # 兼容路径拿本端 q- 排队号打上游——上游必回 404「任务
+                # 不存在」，把可自愈的排队状态变成假故障（生产实测）。
+                or (entry.status == tasks_mod.STATUS_QUEUED
+                    and not job.upstream_id)
             ):
                 rec.poll_count = (job.poll_count or None) if job else None
                 if entry.status == tasks_mod.STATUS_COMPLETED:
@@ -1065,6 +1075,15 @@ class VideoPipeline:
                             rec, timer, errors_mod.video_failed_error(reason))
                     return self._finish_error(
                         rec, timer, errors_mod.passthrough_error(category, reason))
+                if (entry.status == tasks_mod.STATUS_QUEUED
+                        and job is not None and job.error_reason):
+                    # 代排队已终止（窗口耗尽/停机）：把终止原因如实回给
+                    # 调用方，而不是永远"仍在排队"让人干等
+                    category = (job.error_category
+                                or errors_mod.UPSTREAM_ERROR)
+                    return self._finish_error(
+                        rec, timer, errors_mod.passthrough_error(
+                            category, job.error_reason))
                 rec.result = "running"
                 rec.total = timer.total_str()
                 rec.emit()

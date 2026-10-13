@@ -58,6 +58,7 @@ class ScriptedSubmitApi:
     def __init__(self, submit_script, query_result=None):
         self.submit_script = list(submit_script)
         self.submit_calls: list[dict] = []
+        self.query_calls: list[dict] = []
         self.query_result = query_result
 
     async def submit_video(self, *, model, prompt, seconds, aspect_ratio,
@@ -73,6 +74,7 @@ class ScriptedSubmitApi:
         return item
 
     async def query_video(self, *, video_id, model, deadline):
+        self.query_calls.append({"video_id": video_id})
         if self.query_result is None:
             return agnes_mod.ApiCallResult(
                 ok=True, status_code=200, model_id=model,
@@ -200,6 +202,51 @@ async def test_auth_error_during_drain_fails_without_more_retries():
     entry = ns.table.get(task_id)
     assert entry.status == tasks_mod.STATUS_FAILED
     assert len(ns.api.submit_calls) == 2          # 503 重试一次后 401 判死
+
+# ------------------------------------------------- 排队期/终止后的查询语义
+
+async def test_query_during_queueing_never_hits_upstream():
+    """worker 还在代排队时 query → 纯本地状态行，绝不拿排队号打上游。
+
+    生产实录 bug：排队作业被拿去打上游 → 404「任务不存在」，
+    可自愈的排队状态变成假故障。
+    """
+    ns = make_ns([rate_limited(retry_after=300.0)])
+    out = await run_default(ns)
+    assert "status=queued" in out
+    task_id = out.split("task_id=")[1].split()[0].strip("；;, ")
+    # 此刻 worker 必然还在 drain 退避 sleep 中（retry_after=300s）
+    body = await ns.vp.query(task_id=task_id)
+    assert ns.api.query_calls == []               # 零上游 IO
+    assert "404" not in body
+    assert "status=queued" in body
+    # 清理：取消后台 worker 防止悬挂
+    ns.vp.cancel_background()
+
+
+async def test_query_after_drain_timeout_reports_reason_not_upstream_404():
+    """代排队窗口耗尽 → worker 退出 → query 必须回终止原因，非 404。"""
+    ns = make_ns([rate_limited(retry_after=300.0)])
+    out = await run_default(ns)
+    task_id = out.split("task_id=")[1].split()[0].strip("；;, ")
+    await wait_workers(ns)
+
+    body = await ns.vp.query(task_id=task_id)
+    assert ns.api.query_calls == []               # 从未打上游（404 不可能）
+    assert "代排队超时" in body
+    assert "rate_limit" in body                   # 终止类别如实透传（429 所致）
+
+
+async def test_query_queued_with_error_reason_is_error_not_silent_wait():
+    """终止后的作业再查 → error 契约行（retry=yes），Agent 可据此决策。"""
+    ns = make_ns([rate_limited(retry_after=300.0)])
+    out = await run_default(ns)
+    task_id = out.split("task_id=")[1].split()[0].strip("；;, ")
+    await wait_workers(ns)
+    body = await ns.vp.query(task_id=task_id)
+    assert body.startswith(ERROR_PREFIX)
+    assert "retry=yes" in body
+
 
 # --------------------------------------------------------------- 判定函数
 
