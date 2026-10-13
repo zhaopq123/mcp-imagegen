@@ -252,6 +252,44 @@ server.py                   入口：配置自检 → 组件装配 → FastMCP �
 
 ---
 
+---
+
+## 🤝 贡献与招募
+
+**欢迎一起维护这个项目！** 无论你是想修 Bug、加功能、补文档，还是只想聊聊想法，都欢迎。
+
+### 我能提供的
+
+- 清晰的分层架构与代码约定（见 [docs/wiki/架构说明](docs/wiki/架构说明.md)）
+- 424 项单测兜底，改动不容易踩坑
+- fail-fast 配置自检，改坏了启动就会告诉你
+- 完整的 [CONTRIBUTING.md](CONTRIBUTING.md) 贡献指南
+
+### 我需要的
+
+| 方向 | 说明 |
+|---|---|
+| **Bug 修复** | 从标了 `good first issue` 的开始最合适 |
+| **文档完善** | 翻译、补 FAQ、写使用案例 |
+| **功能扩展** | 新工具、新上游、部署方案改进 |
+| **测试加固** | 边界 case、异常路径覆盖 |
+
+### 参与方式
+
+**最轻**：提 [Issue](https://github.com/zhaopq123/mcp-imagegen/issues) —— 报 Bug、提想法、报文档错误
+**推荐**：Fork + PR —— 看 [CONTRIBUTING.md](CONTRIBUTING.md)，按流程提交
+**深入**：成为协作者 —— 在 [Discussions](https://github.com/zhaopq123/mcp-imagegen/discussions) 里聊聊，或直接联系维护者
+
+### 一起维护的约定
+
+- 先开 Issue 讨论，再动手，避免重复劳动
+- PR 前本地跑通：`pytest -q` + `python server.py --check`
+- 遵守代码约定：不引入线程、配置不硬编码、错误走统一契约
+- 有问题随时问，没有"笨问题"
+
+---
+
+
 ## 许可
 
 [MIT](LICENSE)
