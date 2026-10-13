@@ -120,25 +120,27 @@ def make_upload_endpoint(image_dir: str, *, max_bytes: int):
     async def upload_endpoint(request: Request) -> Response:
         content_length = request.headers.get("content-length", "")
         try:
-            if content_length and int(content_length) > max_bytes:
-                return JSONResponse(
-                    {"ok": False, "error": "upload_too_large", "max_bytes": max_bytes},
-                    status_code=413,
-                    headers={"connection": "close"},
-                )
+            declared = int(content_length) if content_length else 0
         except ValueError:
             return JSONResponse(
                 {"ok": False, "error": "invalid_content_length"}, status_code=400
             )
+        # 恶意保护上限：声明超此值不读 body 直接断（读不动也读不起）
+        drain_cap = max_bytes * 8 + 1024 * 1024
+        if declared > drain_cap:
+            return JSONResponse(
+                {"ok": False, "error": "upload_too_large", "max_bytes": max_bytes},
+                status_code=413,
+                headers={"connection": "close"},
+            )
+        # 声明超限但在排空上限内：不在这里 return——客户端（urllib 等不发
+        # Expect: 100-continue 的）body 还在半路，连接提前关闭会变成 RST，
+        # Agent 拿到的是不可自愈的 ConnectionReset 而非 413（生产实测
+        # 16MB 上传即触发）。交给下面的流式循环排空后干净回 413。
 
         chunks: list[bytes] = []
         size = 0
         overflow = False
-        # 溢出后不能立即 return：客户端 body 还在路上，连接提前关闭会变成
-        # RST，Agent 拿到的是不可自愈的 ConnectionReset 而非 413（生产实测
-        # 16MB 上传即触发）。正确做法是继续把流排空（设恶意保护上限），
-        # 再把 413 干净地送回去。
-        drain_cap = max_bytes * 8 + 1024 * 1024
         async for chunk in request.stream():
             size += len(chunk)
             if overflow:

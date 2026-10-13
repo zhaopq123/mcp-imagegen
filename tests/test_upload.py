@@ -107,7 +107,8 @@ async def test_streamed_oversize_upload_returns_clean_413(tmp_path):
 
     生产实测（2026-10-14）：16MB 上传直接 RST 连接（超限即 return，
     客户端 body 还在半路）——Agent 拿到的是 ConnectionReset 而非 413，
-    不可自愈。修复后：溢出后排空剩余流（带恶意保护上限）再回 413。
+    不可自愈。修复后：声明超限（在排空上限内）与流式超限都先把
+    body 排空再回 413；只有超过恶意保护上限才立即断开。
     """
     big = b"x" * (1024 * 1024)  # 1MB/块
     app = upload_app(tmp_path, max_bytes=1024)
@@ -117,14 +118,29 @@ async def test_streamed_oversize_upload_returns_clean_413(tmp_path):
             yield big
 
     async with make_client(app) as client:
-        denied = await client.post("/upload", content=chunks())
+        declared = await client.post("/upload", content=big * 3)  # 声明式超限
+        streamed = await client.post("/upload", content=chunks())  # 流式超限
         # 连接未坏：紧接着的正常上传必须成功
         ok = await client.post("/upload", content=PNG)
 
-    assert denied.status_code == 413
-    assert denied.json()["error"] == "upload_too_large"
+    assert declared.status_code == 413
+    assert streamed.status_code == 413
+    assert declared.json()["error"] == "upload_too_large"
     assert ok.status_code == 201
     assert list(tmp_path.iterdir()) == [tmp_path / ok.json()["name"]]
+
+
+@pytest.mark.asyncio
+async def test_absurd_content_length_is_rejected_without_reading(tmp_path):
+    """声明超排空上限（恶意灌库）→ 立即 413+close，不浪费资源读 body。"""
+    app = upload_app(tmp_path, max_bytes=1024)
+    async with make_client(app) as client:
+        absurd = await client.post(
+            "/upload", content=b"partial",
+            headers={"content-length": str(10 ** 12)})
+    assert absurd.status_code == 413
+    assert absurd.headers.get("connection") == "close"
+    assert list(tmp_path.iterdir()) == []
 
 
 @pytest.mark.asyncio
