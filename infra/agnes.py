@@ -91,6 +91,9 @@ def resolve_model_ids(cfg) -> dict[str, str]:
 
 # 视频提交固定参数（方案 V2 2.1：mode="text"、size="720P"）
 VIDEO_MODE_TEXT = "text"
+# V4：首尾帧 / 参考图两种模式（官方文档「生成模式规则」表）
+VIDEO_MODE_KEYFRAME = "keyframe"
+VIDEO_MODE_REFERENCE = "reference"
 VIDEO_SIZE_DEFAULT = "720P"
 
 # 重试纪律（C4）：仅一次重试；无 Retry-After 时退避 0.25–1s 全抖动；
@@ -327,16 +330,24 @@ class AgnesClient:
         size: str,
         deadline: budget.Deadline,
         ratio: Optional[str] = None,
+        images: Optional[Tuple[str, ...]] = None,
     ) -> ApiCallResult:
         """生图（T2）：POST /v1/images/generations。
 
         请求体 {model, prompt, size}（E25）+ 可选 ratio（D2/官方 F3：
         仅与档位式 size 配合——冲突已由 pipeline 拦截，None 不注入）。
+
+        V4：可选 images（图生图 / 多图合成）。传入即走上游图生图通道
+        （产出落 /images/i2i/，实测 200）；None / 空 → 纯文生图（原行为）。
+        值必须是**上游可接收的形态**（公网 URL 或 data URI）——
+        本地路径 / 内网 URL 的解析由 infra/refs.py 在 pipeline 层完成。
         """
         model_id = self._model_id(model, expected=self._image_model_id)
         payload = {"model": model_id, "prompt": prompt, "size": size}
         if ratio is not None:
             payload["ratio"] = ratio
+        if images:
+            payload["image"] = list(images)
         return await self._call(
             model_id,
             "POST",
@@ -357,23 +368,43 @@ class AgnesClient:
         aspect_ratio: str,
         deadline: budget.Deadline,
         seed: Optional[int] = None,
+        mode: str = VIDEO_MODE_TEXT,
+        first_frame: Optional[str] = None,
+        last_frame: Optional[str] = None,
+        reference_images: Optional[Tuple[str, ...]] = None,
     ) -> ApiCallResult:
         """视频提交（T3）：POST /v1/videos → video_id（seconds int→str，E21）。
 
         可选 seed（D3/官方 F5：integer 直传，None 不注入——官方未标注
         值域，不臆测上限）。
+
+        V4 三模式（官方「生成模式规则」表，字段不可混用）：
+            text      无媒体
+            keyframe  first_frame / last_frame 至少一个（真实首尾帧）
+            reference reference_images（Flash 上限 5 张；风格/内容参考）
+        mode 与媒体字段的合法性由 video_pipeline 层校验；本层按 mode
+        只注入对应字段（不注入无关字段——上游对不允许的字段直接 400）。
         """
         model_id = self._model_id(model, expected=self._video_model_id)
         payload = {
             "model": model_id,
             "prompt": prompt,
             "seconds": str(seconds),  # E21：int → str
-            "mode": VIDEO_MODE_TEXT,
+            "mode": mode,
             "size": VIDEO_SIZE_DEFAULT,
             "aspect_ratio": aspect_ratio,
         }
         if seed is not None:
             payload["seed"] = seed
+        # V4：按模式注入媒体字段（keyframe 与 reference 互斥，见上层校验）
+        if mode == VIDEO_MODE_KEYFRAME:
+            if first_frame:
+                payload["first_frame"] = first_frame
+            if last_frame:
+                payload["last_frame"] = last_frame
+        elif mode == VIDEO_MODE_REFERENCE:
+            if reference_images:
+                payload["images"] = list(reference_images)
         return await self._call(
             model_id,
             "POST",

@@ -119,7 +119,8 @@ class ConcurrencyRecordingApi:
         self.calls: list[int] = []
         self._seq = 0
 
-    async def generate_image(self, *, model, prompt, size, deadline, ratio=None):
+    async def generate_image(self, *, model, prompt, size, deadline, ratio=None,
+                             images=None):
         idx = self._seq
         self._seq += 1
         self.now += 1
@@ -206,7 +207,8 @@ class ScriptedVideoApi:
         self.submit_calls: list[dict] = []
 
     async def submit_video(self, *, model, prompt, seconds, aspect_ratio,
-                           deadline, seed=None):
+                           deadline, seed=None, mode="text", first_frame=None,
+                           last_frame=None, reference_images=None):
         self.submit_calls.append({"prompt": prompt, "seconds": seconds})
         return agnes_mod.ApiCallResult(
             ok=True, status_code=200, model_id="m", video_id="vid-async")

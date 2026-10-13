@@ -26,6 +26,9 @@ logger = logging.getLogger("mcp_imagegen.tasks")
 STATUS_RUNNING = "running"
 STATUS_COMPLETED = "completed"
 STATUS_FAILED = "failed"
+# V4：本端排队中（上游队列满，服务端代为排队重试提交）——尚未提交成功，
+# 与 running（上游已受理、生成中）语义严格区分，Agent 不会误判进度。
+STATUS_QUEUED = "queued"
 
 # V3：后台作业终态（视频异步化后，作业生命周期可跨请求——
 # 请求 deadline 到了作业仍在跑，由后台 worker 继续轮询到终态）
@@ -69,6 +72,18 @@ class JobEntry(TaskEntry):
     seconds: Optional[int] = None
     aspect_ratio: Optional[str] = None
     seed: Optional[int] = None
+    # ---- V4：代排队与生成模式 ----
+    # task_id 始终是**本端标识**（排队号）；upstream_id 是提交成功后拿到的
+    # 上游 video_id。二者解耦后，「排队中」也能给用户一个可续查的 task_id。
+    upstream_id: Optional[str] = None
+    mode: Optional[str] = None           # text / keyframe / reference
+    ref_count: int = 0                   # 本次使用的参考图/首尾帧张数
+    submit_attempts: int = 0             # 代排队提交尝试次数（排障用）
+    # 提交所需参数（后台 worker 排队重试时要复用，故随作业携带）
+    prompt: Optional[str] = None
+    first_frame: Optional[str] = None
+    last_frame: Optional[str] = None
+    reference_images: Optional[tuple] = None
 
 
 class TaskTable:
@@ -200,17 +215,36 @@ class JobTable(TaskTable):
         self, task_id: str, *, model: str, prompt_hash: str,
         seconds: Optional[int] = None, aspect_ratio: Optional[str] = None,
         seed: Optional[int] = None,
+        status: str = STATUS_RUNNING,
+        upstream_id: Optional[str] = None,
+        mode: Optional[str] = None,
+        ref_count: int = 0,
+        prompt: Optional[str] = None,
+        first_frame: Optional[str] = None,
+        last_frame: Optional[str] = None,
+        reference_images: Optional[tuple] = None,
     ) -> JobEntry:
-        """登记作业并建完成通知 future；超限逐出同父类契约。"""
+        """登记作业并建完成通知 future；超限逐出同父类契约。
+
+        V4：status 可为 STATUS_QUEUED（本端排队中，尚未提交成功）；
+        提交所需参数随作业携带，供后台 worker 排队重试复用。
+        """
         entry = JobEntry(
             task_id=task_id,
             model=model,
             prompt_hash=prompt_hash,
-            status=STATUS_RUNNING,
+            status=status,
             submitted_at=self._clock(),
             seconds=seconds,
             aspect_ratio=aspect_ratio,
             seed=seed,
+            upstream_id=upstream_id,
+            mode=mode,
+            ref_count=ref_count,
+            prompt=prompt,
+            first_frame=first_frame,
+            last_frame=last_frame,
+            reference_images=reference_images,
         )
         loop = asyncio.get_event_loop()
         entry.future = loop.create_future()

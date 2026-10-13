@@ -32,7 +32,7 @@ import asyncio
 import logging
 import time
 import uuid
-from typing import Callable, Mapping, Optional
+from typing import Callable, Mapping, Optional, Sequence, Tuple
 
 from app import contract as contract_mod
 from config import BATCH_MAX, DISK_WATERMARK_RATIO, REQUEST_GUARD_SLACK_SEC, Config
@@ -43,6 +43,7 @@ from infra import agnes as agnes_mod
 from infra import budget as budget_mod
 from infra import circuit as circuit_mod
 from infra import persist as persist_mod
+from infra import refs as refs_mod
 from ops import logline as logline_mod
 from ops import shutdown as shutdown_mod
 
@@ -52,12 +53,15 @@ logger = logging.getLogger("mcp_imagegen.pipeline")
 # V3：常量单一出处迁至 config.BATCH_MAX（自检要用），此处保留同名导出。
 BATCH_MAX = BATCH_MAX
 
+# V4：生图参考图数量上限（与 config 自检同源；默认 4）
+IMAGE_REFERENCE_MAX = 4
+
 # V3：泳道名（多队列调度；生图走 image 泳道）
 LANE_IMAGE = "image"
 
 
 def validate_params(
-    prompt, size, ratio, batch_size, persist,
+    prompt, size, ratio, batch_size, persist, images=None,
 ) -> "tuple[()] | tuple[str, str]":
     """语义校验（返回 () 或 (param_name, 原因)）。
 
@@ -67,6 +71,10 @@ def validate_params(
     D2（官方文档对齐）：size 双格式——档位枚举（1K/2K/3K/4K）或
     WxH（\\d{3,4}x\\d{3,4}），均直传上游；ratio 官方 8 档枚举，仅与
     档位式 size 配合（F3——WxH 已含比例信息，同传即参数冲突）。
+
+    V4：images 为参考图（图生图/多图合成）。**形态解析与大小校验在
+    infra/refs.py**（需要文件系统访问，不属于纯函数校验）；此处只做
+    数量与类型的前置校验，保证越界走 invalid_params 契约行。
     """
     if not isinstance(prompt, str) or not prompt.strip():
         return ("prompt", "不能为空")
@@ -91,6 +99,20 @@ def validate_params(
         return ("batch_size", f"超出 1–{BATCH_MAX} 区间")
     if not isinstance(persist, bool):
         return ("persist", "需为布尔值")
+    # V4：参考图（类型与数量；形态/大小校验见 infra/refs）
+    if images is not None:
+        if isinstance(images, (str, bytes)) or not isinstance(images, (list, tuple)):
+            return ("image", "需为字符串数组（每项一个参考图）")
+        if len(images) == 0:
+            return ("image", "传了空数组；不需要参考图请不要传该参数")
+        if len(images) > IMAGE_REFERENCE_MAX:
+            return (
+                "image",
+                f"数量超限：收到 {len(images)} 张，上限 {IMAGE_REFERENCE_MAX} 张",
+            )
+        for item in images:
+            if not isinstance(item, str) or not item.strip():
+                return ("image", "每项必须是非空字符串")
     return ()
 
 
@@ -150,11 +172,13 @@ class GeneratePipeline:
         batch_size: int,
         persist_flag: bool,
         ratio: Optional[str] = None,
+        images: Optional[Sequence[str]] = None,
         http_headers: Optional[Mapping[str, str]] = None,
     ) -> str:
         """单请求入口：永不抛错（CancelledError 除外），返回契约文本。
 
         D2：ratio 可选（None 不注入请求体；仅档位式 size 时合法）。
+        V4：images 可选（参考图 → 图生图 / 多图合成；None 保持纯文生图）。
         """
         req_id = uuid.uuid4().hex[:12]
         guard = self._cfg.total_budget_sec + REQUEST_GUARD_SLACK_SEC
@@ -163,13 +187,13 @@ class GeneratePipeline:
                 return await self._execute(
                     req_id=req_id, prompt=prompt, size=size,
                     batch_size=batch_size, persist_flag=persist_flag,
-                    ratio=ratio,
+                    ratio=ratio, images=images,
                     http_headers=http_headers,
                 )
         except TimeoutError:
             # 护栏触发（deadline 检查应先到；此为 6.1 防御纵深）
             rec = self._new_record(
-                req_id, prompt, size, batch_size, persist_flag, ratio)
+                req_id, prompt, size, batch_size, persist_flag, ratio, images)
             rec.timeout_hit = logline_mod.TIMEOUT_GUARD
             rec.result = "error:" + errors_mod.UPSTREAM_ERROR
             rec.total = f"{guard:.1f}s"
@@ -184,6 +208,7 @@ class GeneratePipeline:
     async def _execute(
         self, *, req_id: str, prompt: str, size: str, batch_size: int,
         persist_flag: bool, ratio: Optional[str],
+        images: Optional[Sequence[str]] = None,
         http_headers: Optional[Mapping[str, str]],
     ) -> str:
         # D2：ratio 规范化——校验层宽容首尾空白（validate_ratio），
@@ -191,14 +216,14 @@ class GeneratePipeline:
         if isinstance(ratio, str):
             ratio = ratio.strip()
         rec = self._new_record(
-            req_id, prompt, size, batch_size, persist_flag, ratio)
+            req_id, prompt, size, batch_size, persist_flag, ratio, images)
         timer = _StageTimer()
         deadline = budget_mod.Deadline(self._cfg.total_budget_sec, clock=self._clock)
         if self._tracker is not None:
             self._tracker.enter()
         try:
             # ---- 1. 参数语义校验（验收⑪⑫：越界也走 [error] invalid_params）----
-            bad = validate_params(prompt, size, ratio, batch_size, persist_flag)
+            bad = validate_params(prompt, size, ratio, batch_size, persist_flag, images)
             timer.mark("validate")
             if bad:
                 param, detail = bad
@@ -208,6 +233,28 @@ class GeneratePipeline:
                 rec.emit()
                 return contract_mod.format_error(info)
 
+            # ---- 1b. V4：参考图解析（本地路径/内网 URL → data URI）----
+            # 不静默降级：解析失败即 invalid_params（宁可说不行，不能骗）
+            resolved_images: Tuple[str, ...] = ()
+            ref_sources: Tuple[str, ...] = ()
+            if images:
+                try:
+                    resolved_images, ref_sources = refs_mod.resolve_references(
+                        images,
+                        image_dir=self._cfg.image_dir,
+                        video_dir=getattr(self._cfg, "video_dir", None),
+                        max_bytes=self._cfg.reference_max_bytes,
+                        max_count=getattr(
+                            self._cfg, "image_reference_max", IMAGE_REFERENCE_MAX),
+                    )
+                except refs_mod.ReferenceError as exc:
+                    info = errors_mod.invalid_params("image", str(exc))
+                    rec.result = f"error:{info.category}"
+                    rec.total = timer.total_str()
+                    rec.emit()
+                    return contract_mod.format_error(info)
+                timer.mark("refs")
+
             # ---- 2. 并发槽（E4：排队等待计入 deadline；V3 走 image 泳道）----
             try:
                 async with self._acquire_slot(deadline, req_id):
@@ -216,6 +263,7 @@ class GeneratePipeline:
                         req_id=req_id, rec=rec, timer=timer, deadline=deadline,
                         prompt=prompt, size=size, batch_size=batch_size,
                         persist_flag=persist_flag, ratio=ratio,
+                        images=resolved_images, ref_sources=ref_sources,
                         http_headers=http_headers,
                     )
             except budget_mod.LaneFullError as exc:
@@ -263,6 +311,8 @@ class GeneratePipeline:
         self, *, req_id: str, rec: logline_mod.LogRecord, timer: _StageTimer,
         deadline: budget_mod.Deadline, prompt: str, size: str,
         batch_size: int, persist_flag: bool, ratio: Optional[str],
+        images: Tuple[str, ...] = (),
+        ref_sources: Tuple[str, ...] = (),
         http_headers: Optional[Mapping[str, str]],
     ) -> str:
         # ---- 3. 熔断门路由（工具层无 model 参数 = 恒 auto；E24）----
@@ -313,6 +363,7 @@ class GeneratePipeline:
                     api = await self._api.generate_image(
                         model=model, prompt=prompt, size=normalized_size,
                         deadline=deadline, ratio=ratio,
+                        images=images or None,
                     )
                 except budget_mod.DeadlineExceededError:
                     # 调用中预算耗尽（退避后 check 抛出）→ 即止，非错误（E9）
@@ -364,6 +415,7 @@ class GeneratePipeline:
             req_id=req_id, rec=rec, timer=timer, urls=urls, model=model,
             size=normalized_size, batch_size=batch_size, call_count=call_count,
             persist_flag=persist_flag, deadline=deadline, ratio=ratio,
+            images=images, ref_sources=ref_sources,
             http_headers=http_headers, probe=decision.probe,
         )
 
@@ -376,6 +428,8 @@ class GeneratePipeline:
         call_count: int, persist_flag: bool, deadline: budget_mod.Deadline,
         ratio: Optional[str], http_headers: Optional[Mapping[str, str]],
         probe: bool,
+        images: Tuple[str, ...] = (),
+        ref_sources: Tuple[str, ...] = (),
     ) -> str:
         out_urls: list[str] = list(urls)
         persist_status: Optional[str] = None
@@ -420,6 +474,9 @@ class GeneratePipeline:
             requested=batch_size if len(urls) < batch_size else None,
             delivered=len(urls) if len(urls) < batch_size else None,
             persist_status=persist_status, disk_note=disk_note,
+            # V4：参考图实况（让 Agent/用户看得见「确实用上了参考图」）
+            reference_count=len(images) if images else None,
+            reference_sources=ref_sources or None,
         )
         rec.result = "ok"
         rec.split_calls = call_count  # T7c：拆分调用数（原生 batch=1 即 1）
@@ -457,6 +514,7 @@ class GeneratePipeline:
     def _new_record(
         self, req_id: str, prompt: str, size: str, batch_size: int,
         persist_flag: bool, ratio: Optional[str] = None,
+        images: Optional[Sequence[str]] = None,
     ) -> logline_mod.LogRecord:
         return logline_mod.LogRecord(
             req_id=req_id,
@@ -465,6 +523,7 @@ class GeneratePipeline:
                 f"model=agnes-image;size={size};"
                 + (f"ratio={ratio};" if ratio is not None else "")
                 + f"batch={batch_size};"
+                + (f"refs={len(images)};" if images else "")
                 + f"persist={'true' if persist_flag else 'false'}"
             ),
         )

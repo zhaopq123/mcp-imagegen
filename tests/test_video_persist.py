@@ -72,10 +72,13 @@ class FakeVideoApi:
         self.query_calls: list[dict] = []
 
     async def submit_video(self, *, model, prompt, seconds, aspect_ratio,
-                           deadline, seed=None):
+                           deadline, seed=None, mode="text", first_frame=None,
+                           last_frame=None, reference_images=None):
         self.submit_calls.append({
             "model": model, "prompt": prompt, "seconds": seconds,
             "aspect_ratio": aspect_ratio, "deadline": deadline, "seed": seed,
+            "mode": mode, "first_frame": first_frame,
+            "last_frame": last_frame, "reference_images": reference_images,
         })
         return self.submit_result
 

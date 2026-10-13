@@ -41,6 +41,9 @@ class MetaInfo:
     delivered: Optional[int] = None             # 实际交付张数（M<N 时必填）
     persist_status: Optional[str] = None        # persisted / persist_failed / None
     disk_note: Optional[str] = None             # disk_watermark: xx%（C10）
+    # V4：参考图实况（None 不输出——纯文生图与 V3 契约逐字一致）
+    reference_count: Optional[int] = None       # 本次实际使用的参考图张数
+    reference_sources: Optional[tuple] = None   # 各图来源标记（url/inline/local）
 
 
 def format_success(urls: Sequence[str], meta: MetaInfo) -> str:
@@ -58,6 +61,11 @@ def _format_meta(meta: MetaInfo) -> str:
         fields.append(f"requested={meta.requested}")
     if meta.delivered is not None:
         fields.append(f"delivered={meta.delivered}")
+    # V4：参考图实况（放在 persist 标记之前，保持「输入实况 → 产出实况」可读顺序）
+    if meta.reference_count:
+        fields.append(f"refs={meta.reference_count}")
+        if meta.reference_sources:
+            fields.append("ref_src=" + ",".join(meta.reference_sources))
     if meta.persist_status == "persisted":
         fields.append("persisted")
     elif meta.persist_status == "persist_failed":
@@ -78,32 +86,6 @@ def _format_meta(meta: MetaInfo) -> str:
 META_PREFIX = chr(91) + "meta] "
 
 
-def format_video_success(url: str, meta: "VideoMeta") -> str:
-    """视频成功（T7a/T7c）：URL 行 + meta 行。
-
-    meta 顺序固定：model/seconds/aspect_ratio(±seed)/elapsed → persist 标记
-    （persisted / persist_failed / url_expires 三态，对齐生图 format_success；
-    标记顺序契约：persisted/persist_failed/url_expires——失败降级返原上游
-    URL 时标 persist_failed，不产生 [error] 行，R5）。
-    """
-    fields = [
-        f"model={meta.model}",
-        f"seconds={meta.seconds}",
-        f"aspect_ratio={meta.aspect_ratio}",
-    ]
-    if meta.seed is not None:
-        fields.append(f"seed={meta.seed}")
-    fields.append(f"elapsed={meta.elapsed_sec:.1f}s")
-    if meta.persist_status == "persisted":
-        fields.append("persisted")
-    elif meta.persist_status == "persist_failed":
-        fields.append("persist_failed")
-    else:
-        # 未 persist → 短效警示（E13）；与生图同语义
-        fields.append(URL_EXPIRES_NOTE)
-    return url + "\n" + META_PREFIX + " ".join(fields)
-
-
 def format_video_deferred(task_id: str, waited_sec: float) -> str:
     """E17：deadline 到仍 running → meta 行 task_id+status=running 非错误。
 
@@ -117,15 +99,6 @@ def format_video_deferred(task_id: str, waited_sec: float) -> str:
     )
 
 
-def format_video_status(task_id: str, status: str) -> str:
-    """query_video 非终态（T7b）：meta 状态行（task_id + 最近上游实况）。"""
-    return (
-        META_PREFIX
-        + f"task_id={task_id} status={status} "
-        + "上游仍在生成，请稍后再次查询"
-    )
-
-
 @dataclass(frozen=True)
 class VideoMeta:
     """视频成功行 meta 组装参数（对齐生图 MetaInfo 的扩展，方案 2.4）。"""
@@ -136,6 +109,68 @@ class VideoMeta:
     elapsed_sec: float
     seed: Optional[int] = None                # D3：显式传入的随机种子（None 不输出）
     persist_status: Optional[str] = None    # persisted / persist_failed / None
+    # V4：生成模式与参考图实况（text 模式不输出，保持 V3 契约逐字一致）
+    mode: Optional[str] = None               # text / keyframe / reference
+    reference_count: Optional[int] = None    # 参考图/首尾帧张数
+
+
+def format_video_success(url: str, meta: "VideoMeta") -> str:
+    """视频成功（T7a/T7c）：URL 行 + meta 行。
+
+    meta 顺序固定：model/seconds/aspect_ratio(±seed) → persist 标记
+    （persisted / persist_failed / url_expires 三态，对齐生图 format_success；
+    标记顺序契约：persisted/persist_failed/url_expires——失败降级返原上游
+    URL 时标 persist_failed，不产生 [error] 行，R5）。
+
+    V4：mode 非 text 时输出 mode 与 refs（让用户看得见「确实用了首帧/参考图」）。
+    """
+    fields = [
+        f"model={meta.model}",
+        f"seconds={meta.seconds}",
+        f"aspect_ratio={meta.aspect_ratio}",
+    ]
+    if meta.seed is not None:
+        fields.append(f"seed={meta.seed}")
+    if meta.mode and meta.mode != "text":
+        fields.append(f"mode={meta.mode}")
+    if meta.reference_count:
+        fields.append(f"refs={meta.reference_count}")
+    fields.append(f"elapsed={meta.elapsed_sec:.1f}s")
+    if meta.persist_status == "persisted":
+        fields.append("persisted")
+    elif meta.persist_status == "persist_failed":
+        fields.append("persist_failed")
+    else:
+        # 未 persist → 短效警示（E13）；与生图同语义
+        fields.append(URL_EXPIRES_NOTE)
+    return url + "\n" + META_PREFIX + " ".join(fields)
+
+
+def format_video_queued(task_id: str, waited_sec: float, reason: str = "") -> str:
+    """V4：上游队列满 → 服务端代为排队（非错误）。
+
+    与 E17（deadline 到仍 running）的区别：这里**还没提交成功**，
+    作业在本端排队，后台 worker 会按退避持续尝试提交；提交成功后
+    自动转入正常轮询。用户侧动作一致：拿 task_id，稍后 query_video。
+
+    status=queued 明确区分「排队中」与「上游已生成中」，Agent 不会误判。
+    """
+    detail = f"（{reason}）" if reason else ""
+    return (
+        META_PREFIX
+        + f"task_id={task_id} status=queued "
+        + f"上游队列已满，服务端代为排队{detail}；"
+        + f"已排队 {waited_sec:.0f}s，请稍后调用 query_video 查询"
+    )
+
+
+def format_video_status(task_id: str, status: str) -> str:
+    """query_video 非终态（T7b）：meta 状态行（task_id + 最近上游实况）。"""
+    return (
+        META_PREFIX
+        + f"task_id={task_id} status={status} "
+        + "上游仍在生成，请稍后再次查询"
+    )
 
 
 def format_error(info: errors.ErrorInfo) -> str:

@@ -14,7 +14,10 @@ from __future__ import annotations
 
 import hmac
 import logging
+import os
 import re
+import secrets
+import uuid
 from pathlib import Path
 from typing import Callable, Iterable
 
@@ -92,6 +95,116 @@ def make_files_endpoint(image_dir: str, video_dir: "str | None" = None):
     return files_endpoint
 
 
+def _image_extension(data: bytes) -> str | None:
+    """按文件签名识别受支持的图片类型；不信任请求头或文件名。"""
+    if data.startswith(b"\x89PNG\r\n\x1a\n"):
+        return ".png"
+    if data.startswith(b"\xff\xd8\xff"):
+        return ".jpg"
+    if data.startswith((b"GIF87a", b"GIF89a")):
+        return ".gif"
+    if len(data) >= 12 and data.startswith(b"RIFF") and data[8:12] == b"WEBP":
+        return ".webp"
+    return None
+
+
+def make_upload_endpoint(image_dir: str, *, max_bytes: int):
+    """POST /upload：限大小、按 magic bytes 识别并保存图片。
+
+    客户端发送原始文件字节（例如 curl --data-binary @image.png）。文件名由
+    服务端生成；响应给出的 ``url`` 可直接作为参考图参数。认证由最外层
+    BearerGate 执行，避免端点漏鉴权。
+    """
+    root = Path(image_dir).resolve()
+
+    async def upload_endpoint(request: Request) -> Response:
+        content_length = request.headers.get("content-length", "")
+        try:
+            if content_length and int(content_length) > max_bytes:
+                return JSONResponse(
+                    {"ok": False, "error": "upload_too_large", "max_bytes": max_bytes},
+                    status_code=413,
+                )
+        except ValueError:
+            return JSONResponse(
+                {"ok": False, "error": "invalid_content_length"}, status_code=400
+            )
+
+        chunks: list[bytes] = []
+        size = 0
+        async for chunk in request.stream():
+            size += len(chunk)
+            if size > max_bytes:
+                return JSONResponse(
+                    {"ok": False, "error": "upload_too_large", "max_bytes": max_bytes},
+                    status_code=413,
+                )
+            chunks.append(chunk)
+        data = b"".join(chunks)
+        if not data:
+            return JSONResponse({"ok": False, "error": "empty_upload"}, status_code=400)
+
+        extension = _image_extension(data)
+        if extension is None:
+            return JSONResponse(
+                {"ok": False, "error": "unsupported_image_format"}, status_code=415
+            )
+
+        try:
+            root.mkdir(parents=True, exist_ok=True)
+            path = None
+            for _ in range(3):
+                name = f"{uuid.uuid4().hex[:12]}-00-{secrets.token_hex(4)}{extension}"
+                candidate = root / name
+                try:
+                    fd = os.open(candidate, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+                except FileExistsError:
+                    continue
+                try:
+                    with os.fdopen(fd, "wb") as stream:
+                        stream.write(data)
+                except OSError:
+                    candidate.unlink(missing_ok=True)
+                    raise
+                path = candidate
+                break
+            if path is None:
+                return JSONResponse(
+                    {"ok": False, "error": "upload_name_collision"}, status_code=503
+                )
+        except OSError:
+            logger.exception("参考图上传落盘失败")
+            return JSONResponse({"ok": False, "error": "upload_storage_failed"}, status_code=500)
+
+        try:
+            os.chmod(path, 0o600)
+        except OSError:  # Windows 没有 POSIX 权限语义；创建标志已尽量收紧
+            pass
+        name = path.name
+        return JSONResponse(
+            {
+                "ok": True,
+                "name": name,
+                "url": f"/files/{name}",
+                "bytes": len(data),
+                "content_type": {
+                    ".png": "image/png", ".jpg": "image/jpeg",
+                    ".gif": "image/gif", ".webp": "image/webp",
+                }[extension],
+            },
+            status_code=201,
+        )
+
+    return upload_endpoint
+
+
+def upload_route(image_dir: str, *, max_bytes: int) -> Route:
+    return Route(
+        "/upload", make_upload_endpoint(image_dir, max_bytes=max_bytes),
+        methods=["POST"],
+    )
+
+
 def healthz_route() -> Route:
     return Route("/healthz", healthz_endpoint, methods=["GET"])
 
@@ -101,17 +214,19 @@ def files_route(image_dir: str, video_dir: "str | None" = None) -> Route:
 
 
 # ---------------------------------------------------------------------------
-# /mcp Bearer 鉴权门（纯 ASGI：包住 fastmcp http_app，只拦 /mcp*）
+# /mcp 与 /upload Bearer 鉴权门（纯 ASGI：包住 fastmcp http_app）
 # ---------------------------------------------------------------------------
 class BearerGate:
-    """401 + [error] mcp_auth 行（验收⑫）；常量时间比较防时序侧信道。"""
+    """保护 MCP 调用与参考图上传；常量时间比较防时序侧信道。"""
 
     def __init__(self, inner, token: str) -> None:
         self._inner = inner
         self._expected = f"Bearer {token}".encode("utf-8")
 
     async def __call__(self, scope, receive, send) -> None:
-        if scope["type"] == "http" and scope.get("path", "").startswith("/mcp"):
+        path = scope.get("path", "")
+        protected = path.startswith("/mcp") or path == "/upload"
+        if scope["type"] == "http" and protected:
             if not self._authorized(scope.get("headers") or []):
                 await self._deny(send)
                 return

@@ -110,6 +110,9 @@ def build_app(
         endpoints.make_healthz_endpoint(components))
     mcp.custom_route("/files/{name}", methods=["GET"])(
         endpoints.make_files_endpoint(cfg.image_dir, cfg.video_dir))
+    mcp.custom_route("/upload", methods=["POST"])(
+        endpoints.make_upload_endpoint(
+            cfg.image_dir, max_bytes=cfg.upload_max_bytes))
 
     inner = mcp.http_app(path="/mcp")
     return BearerApp(inner, cfg.mcp_access_token, lifespan_holder=lifespan)

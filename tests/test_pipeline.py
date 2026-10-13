@@ -47,9 +47,11 @@ class FakeApi:
         self.calls: list[dict] = []
         self.on_call = on_call
 
-    async def generate_image(self, *, model, prompt, size, deadline, ratio=None):
+    async def generate_image(self, *, model, prompt, size, deadline, ratio=None,
+                             images=None):
         self.calls.append(
-            {"model": model, "prompt": prompt, "size": size, "ratio": ratio})
+            {"model": model, "prompt": prompt, "size": size, "ratio": ratio,
+             "images": images})
         if self.on_call is not None:
             self.on_call()
         if self.results:
