@@ -21,7 +21,7 @@ import time
 
 import httpx
 
-BASE = os.environ.get("MCP_BASE", "http://192.168.3.35:8000/mcp")
+BASE = os.environ.get("MCP_BASE", "http://127.0.0.1:8000/mcp")
 TOKEN = os.environ.get("MCP_TOKEN", "a3f1c9d27e6b4805b12f8ce04d7a9163")
 
 

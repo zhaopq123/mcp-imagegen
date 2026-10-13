@@ -74,7 +74,7 @@ def test_public_url_passthrough_untouched(url):
 
 @pytest.mark.parametrize("host", [
     "localhost", "printer.local", "127.0.0.1", "::1", "169.254.1.1",
-    "10.1.2.3", "192.168.3.35", "172.16.0.1", "172.31.255.255",
+    "10.1.2.3", "192.168.1.100", "172.16.0.1", "172.31.255.255",
 ])
 def test_private_host_is_detected(host):
     assert _is_private_host(host) is True
@@ -89,7 +89,7 @@ def test_public_host_is_not_flagged(host):
 
 
 @pytest.mark.parametrize("url", [
-    "http://192.168.3.35/files/x.png",
+    "http://192.168.1.100/files/x.png",
     "https://localhost/files/x.png",
     "http://127.0.0.1:8000/files/x.png",
 ])
@@ -150,7 +150,7 @@ def test_non_string_input_rejected():
 @pytest.mark.parametrize("value", [
     PNG_NAME,                                  # 裸产物名
     f"/files/{PNG_NAME}",                      # files 路径
-    f"http://192.168.3.35:8000/files/{PNG_NAME}",  # 本服务内网 URL（关键闭环）
+    f"http://192.168.1.100:8000/files/{PNG_NAME}",  # 本服务内网 URL（关键闭环）
 ])
 def test_own_artifact_is_read_and_inlined(tmp_path, roots, value):
     """「挑一张自己的产物当参考图」必须三种写法都能闭环。
