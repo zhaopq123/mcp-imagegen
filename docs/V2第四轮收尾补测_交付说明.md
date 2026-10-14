@@ -1,5 +1,6 @@
 # V2 第四轮收尾 · 补测交付说明（T7c/T8/T9 收口 + 覆盖补全）
 
+> **历史存档**：本文是 V2 阶段的设计/验收记录。V5 起上游已改为「服务提供方」可由用户自行配置，代码与文档不再绑定任何厂商；以 [README](README.md) 为准。
 | 项 | 内容 |
 |---|---|
 | 轮次 | V2 第四轮收尾（上轮主体续作 + 本轮补测） |
@@ -35,10 +36,10 @@ schema 层不做硬范围约束（A2：范围校验在 pipeline 层，`test_sche
 ### 3. --check（带环境变量冒烟，本轮复跑）
 
 ```
-MCPACCESS_TOKEN=… AGNES_TOKEN=… python server.py --check   → exit=0
+MCPACCESS_TOKEN=… UPSTREAM_TOKEN=… python server.py --check   → exit=0
 [config] 嵌套不等式自检: read ≤ 分档(max=30s) ≤ deadline(200s) < Agent建议(210s) < TimeoutStop(220s) ✓
 [config] 队列等待 30s ≤ 总预算 ✓ | persist 下载 图30s/视频120s ≤ 总预算 ✓ | 并发槽 3 | 熔断 硬600s/软300s
-[config] V2 Agnes read 档自检: 生图 30s / 提交 30s / 单查 10s ≤ 单查 ≤ 提交 ≤ deadline (200s) ✓ | 轮询 5s | 任务表 TTL 7200s / 容量 100 ✓
+[config] V2 上游服务提供方 read 档自检: 生图 30s / 提交 30s / 单查 10s ≤ 单查 ≤ 提交 ≤ deadline (200s) ✓ | 轮询 5s | 任务表 TTL 7200s / 容量 100 ✓
 ```
 
 ---
@@ -93,9 +94,9 @@ logline 联动（T7c 字段）：三分支各断言恰好一行访问日志，�
 
 ## 四、遗留与风险
 
-1. **e2e 脚本待 T10 改造（非功能回归，已实证定位）**：本轮 `--fast` 冒烟跑 acceptance/e2e_acceptance.py，场景①在 `s_handshake` 断言"恰 1 个工具"（写于单工具时代）——三工具注册后该断言必然失败，属 e2e 场景改造范围（方案 T10："e2e 场景改造（删硅基/加视频 mock 状态机）"），非功能回归。既有 e2e_results.json 为生图轮 16/16 通过的历史证据。
+1. **e2e 脚本待 T10 改造（非功能回归，已实证定位）**：本轮 `--fast` 冒烟跑 acceptance/e2e_acceptance.py，场景①在 `s_handshake` 断言"恰 1 个工具"（写于单工具时代）——三工具注册后该断言必然失败，属 e2e 场景改造范围（方案 T10："e2e 场景改造（删另一家上游/加视频 mock 状态机）"），非功能回归。既有 e2e_results.json 为生图轮 16/16 通过的历史证据。
 2. **app/contract.py docstring 三处 meta 字面量（ord 核实，范围外未动）**：偏移 182 / 1374 / 1973 处存在 ord 序列 91,109,101,116,97,93（docstring 说明文字）；`META_PREFIX` 常量本身为 `chr(91) + "meta] "` 拼接、功能零影响。但渲染层吞 91,109 序列现象本轮再次实证（终端显示 / Read 回显均可见），后续轮次若经渲染层读该文件可能误判"污染"——建议后续轮次顺手将三处 docstring 改写为不含该序列的表述，或按本说明偏移直接 ord 级核对。
-3. **A-5 真机联调**：仍待有效 Agnes Key（上轮已知：当前 Key 上游 401 Invalid token）；三工具 + 325→366 单测不受影响。
+3. **A-5 真机联调**：仍待有效 上游服务提供方 Key（上轮已知：当前 Key 上游 401 Invalid token）；三工具 + 325→366 单测不受影响。
 4. **deploy 文档层未同步 VIDEO_DIR（已核实，功能不受影响）**：install.md 变量表与 mcp-imagegen.service 注释仍只提 IMAGE_DIR；VIDEO_DIR 有默认值（/var/lib/mcp-imagegen/videos）、`ProtectSystem=full` 不禁止 /var/lib 写入、磁盘水位检查经 `PersistService.disk_usage_ratio()` 代码层已覆盖 images/+videos/ 双目录——故功能无碍，建议 T10 或部署轮在文档/注释补一句视频目录说明。
 
 ---

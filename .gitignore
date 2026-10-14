@@ -30,6 +30,10 @@ config.env
 *.p12
 *.pfx
 
+# ---- V5：store.json 里是服务提供方密钥 + 管理员口令哈希，绝不入库 ----
+data/
+store.json
+
 # ---- 运行时产物 ----
 images/
 videos/

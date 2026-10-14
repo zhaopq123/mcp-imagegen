@@ -1,5 +1,6 @@
 # V2 第二轮收尾 · 第三轮修复说明（最终）
 
+> **历史存档**：本文是 V2 阶段的设计/验收记录。V5 起上游已改为「服务提供方」可由用户自行配置，代码与文档不再绑定任何厂商；以 [README](README.md) 为准。
 > 修复时间：2026-10-10 11:46–11:57（Asia/Shanghai）
 > 修复人：Ethan Zhao（全栈工程师）
 > 方法纪律：全程以 ord 码 / 计数 / 测试结果为判定依据，未以任何渲染文本做判断；修复脚本构造目标字符串一律使用 `chr(91)` 拼接，未手打问题字面量。
@@ -44,25 +45,25 @@ python 脚本替换（先双重、后单重，目标串全部用 `chr(91)` 拼�
 
 ---
 
-## 二、「硬基」（硅基/SiliconFlow 旧上游）残留清理对账
+## 二、「硬基」（另一家上游/另一家上游 旧上游）残留清理对账
 
-> 派单所称「硬基」经字节级核实为「硅基」（SiliconFlow 旧上游，含其模型 Kolors/flux-schnell）——全项目不存在「硬基」字面量，四文件所含旧上游残留与派单文件清单一一对应。
+> 派单所称「硬基」经字节级核实为「另一家上游」（另一家上游 旧上游，含其模型 Kolors/flux-schnell）——全项目不存在「硬基」字面量，四文件所含旧上游残留与派单文件清单一一对应。
 
 | # | 文件 | 位置 | 原内容（要点） | 处理 | 方式 |
 |---|---|---|---|---|---|
-| 1 | infra/agnes.py | L8 注释 | 「对齐 V1 siliconflow 模式，R7」 | →「对齐 V1 模式，R7」 | 注释中性化 |
-| 2 | tests/test_config.py | L23 注释 | 「V2：硅基五变量已删」 | →「V2：旧上游五变量已删」 | 注释中性化 |
-| 3 | tests/test_config.py | L85 注释 | 「B5；V2：SILICONFLOWTOKEN 已删」 | →「B5；V2：旧上游密钥变量已删」 | 注释中性化 |
-| 4 | tests/test_config.py | L100 代码 | `assert "SILICONFLOW" not in msg` | 整行删除 | 代码引用删除 |
+| 1 | infra/upstream.py | L8 注释 | 「对齐 V1 另一家上游 模式，R7」 | →「对齐 V1 模式，R7」 | 注释中性化 |
+| 2 | tests/test_config.py | L23 注释 | 「V2：另一家上游五变量已删」 | →「V2：旧上游五变量已删」 | 注释中性化 |
+| 3 | tests/test_config.py | L85 注释 | 「B5；V2：UPSTREAM_B_TOKEN 已删」 | →「B5；V2：旧上游密钥变量已删」 | 注释中性化 |
+| 4 | tests/test_config.py | L100 代码 | `assert "UPSTREAM_B" not in msg` | 整行删除 | 代码引用删除 |
 | 5 | tests/test_config.py | L168 函数名 | `test_api_tier_lookup_removed_with_silicon` | → `test_api_tier_lookup_removed` | 代码引用删除（更名，无外部引用，仅 .pytest_cache 缓存会自重建） |
-| 6 | tests/test_config.py | L169 docstring | 「已随硅基删除」 | →「已随旧上游删除」 | 注释中性化 |
+| 6 | tests/test_config.py | L169 docstring | 「已随另一家上游删除」 | →「已随旧上游删除」 | 注释中性化 |
 | 7 | tests/test_normalizer.py | L5 注释 | 「Kolors/schnell 两套吸附档位表」 | →「旧上游两套吸附档位表」 | 注释中性化 |
 | 8 | tests/test_normalizer.py | L55 代码 | 已删 API 反向锁定表中 `"KOLORS_SIZES"` | 从元组移除 | 代码引用删除（该锁定由 `test_module_public_api_is_minimal` 公开 API 最小集断言继续兜底） |
 | 9 | tests/test_router.py | L62 代码 | `router.route("kolors", None)` | → `router.route("unknown-model", None)` | 示例改中性名，测试语义（未知模型拒绝）不变 |
 | 10 | tests/test_router.py | L68 代码 | `router.route("flux-schnell", ...)` | → `router.route("unknown-model", ...)` | 同上 |
 
 **清理后验证**：
-- 四文件 case-insensitive 残留扫描（silicon\* / kolors\* / schnell\* / 硅基）：**0**；
+- 四文件 case-insensitive 残留扫描（silicon\* / kolors\* / schnell\* / 另一家上游）：**0**；
 - `compileall` 全项目语法通过；
 - 全量单测复跑：**283 passed**（5.07s），仍全绿，用例数不变（未删除任何测试，仅中性化/更名）。
 
@@ -70,13 +71,13 @@ python 脚本替换（先双重、后单重，目标串全部用 `chr(91)` 拼�
 
 ## 三、工程备注
 
-1. **权限修复**：infra/agnes.py、tests/test_normalizer.py、tests/test_router.py 三文件为前几轮 root 属主 644（当前用户 z 不可写）。已通过「同目录临时文件 + rename 原子替换」完成修改，三文件现归位为 z:z 属主，与项目其余文件一致。
+1. **权限修复**：infra/upstream.py、tests/test_normalizer.py、tests/test_router.py 三文件为前几轮 root 属主 644（当前用户 z 不可写）。已通过「同目录临时文件 + rename 原子替换」完成修改，三文件现归位为 z:z 属主，与项目其余文件一致。
 2. **范围外未动项（对账说明）**：以下旧上游提及均为注释/文档层历史性描述，按派单范围（4 文件）与「docs 不影响功能不处理」原则未动：
-   - config.py（2 处注释：「硅基五变量已随 Provider 删除」）
-   - engine/errors.py（1 处注释：规格书 4.1「仅硅基侧」引述）
+   - config.py（2 处注释：「另一家上游五变量已随 Provider 删除」）
+   - engine/errors.py（1 处注释：规格书 4.1「仅另一家上游侧」引述）
    - infra/\_\_init\_\_.py（1 处模块 docstring）
    - requirements.txt（1 处注释）、deploy/*.md、docs/*.md、两份方案 md、验收报告.md
-   - 其中 **infra/\_\_init\_\_.py 模块 docstring 仍把当前 Agnes 客户端描述为「硅基客户端」**，属事实性过期描述，建议后续轮次顺手改为「上游客户端」。
+   - 其中 **infra/\_\_init\_\_.py 模块 docstring 仍把当前 上游服务提供方 客户端描述为「另一家上游客户端」**，属事实性过期描述，建议后续轮次顺手改为「上游客户端」。
 3. **铁律遵守**：本轮所有判定均基于 ord 码、字符串计数与测试结果；构造目标字符串均用 `chr(91)` 拼接；未以渲染文本作为任何判断依据（渲染层吞字现象本轮再次实证：`Optional[httpx...]` 显示为 `Optionalttpx...`，经 hex 核实文件本身完好）。
 
 ---
@@ -91,5 +92,5 @@ python 脚本替换（先双重、后单重，目标串全部用 `chr(91)` 拼�
 | mock 流水线 meta 行前 7 字符 ord | 91,109,101,116,97,93,32 ✓ |
 | 全量单测 | 283 passed（修复后 / 清理后两轮均全绿） |
 | e2e 生图 mock 场景 | 16/16 通过，exit=0 |
-| 硅基残留（4 文件） | 清理 10 处，残留 0 |
+| 另一家上游残留（4 文件） | 清理 10 处，残留 0 |
 | 全项目 .py/.json 垃圾前缀 | 0 |

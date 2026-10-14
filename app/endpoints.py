@@ -1,17 +1,23 @@
-"""端点层（规格书一、二；S3.3）。
+"""端点层。
 
-- /mcp：FastMCP streamable-http 工具端点（由 fastmcp http_app 提供）；
-  Bearer=MCPACCESS_TOKEN 鉴权 → 错误 Token 返回 **HTTP 401 + [error]
-  mcp_auth 契约行**（验收⑫：返回体即 [error] category=mcp_auth
-  retry=no，Agent 可直接读懂）；
-- /healthz：人工巡检（无鉴权探活；**不参与僵死判据**——watchdog 只认
-  心跳，C7）；
-- /files/<name>：persist 图片/视频静态服务（无鉴权；文件名仅单段、白名单
-  字符校验 + 路径归一双重防穿越；T7c/T8 起按扩展名分流——.mp4/.webm 查
-  VIDEO_DIR，其余查 IMAGE_DIR，两目录同一校验纪律）。
+- /mcp：MCP streamable-http 工具端点（由 fastmcp http_app 提供）；
+  Bearer 访问令牌鉴权 → 错误令牌返回 **HTTP 401 + [error] mcp_auth
+  契约行**（Agent 可直接读懂）；
+- /healthz：人工巡检 / 探活（无鉴权；**不参与僵死判据**——watchdog 只认
+  心跳）；
+- /files/<name>：产物静态服务（图片/视频；单段文件名白名单 + 路径归一
+  双重防穿越）；
+- /upload：参考图上传（受访问令牌保护）；
+- /admin：管理面板（自带管理员口令会话鉴权，不走 MCP 令牌）。
+
+V5：访问令牌从「单个环境变量」变成「面板里可增删改查的多个令牌」，
+并在网关层做两件事——
+  1. 把命中的令牌挂到 ContextVar 上，供管道深处做路由与隔离；
+  2. 按令牌的并发上限做准入，让某个会话再忙也挤不干别人的额度。
 """
 from __future__ import annotations
 
+import asyncio
 import hmac
 import logging
 import os
@@ -24,6 +30,8 @@ from typing import Callable, Iterable
 from starlette.requests import Request
 from starlette.responses import FileResponse, JSONResponse, PlainTextResponse, Response
 from starlette.routing import Route
+
+from app import context as context_mod
 
 logger = logging.getLogger("mcp_imagegen.endpoints")
 
@@ -45,7 +53,7 @@ def healthz_endpoint(request: Request) -> Response:
 
 
 def make_healthz_endpoint(components=None) -> Callable[[Request], Response]:
-    """V3：带队列实况的 /healthz（巡检/压测看积压）。
+    """带运行实况的 /healthz（巡检/压测看积压）。
 
     components 为 None 时退化为纯探活（兼容既有调用与单测）。
     """
@@ -60,6 +68,13 @@ def make_healthz_endpoint(components=None) -> Callable[[Request], Response]:
                             "_table", None)
             if table is not None:
                 payload["video_jobs"] = len(table)
+            gateway = getattr(components, "gateway", None)
+            if gateway is not None:
+                payload["capabilities"] = {
+                    kind: gateway.has_capability(kind)
+                    for kind in ("image", "video")
+                }
+                payload["providers"] = len(gateway.stats())
         return JSONResponse(payload)
 
     return _endpoint
@@ -236,48 +251,116 @@ def files_route(image_dir: str, video_dir: "str | None" = None) -> Route:
 
 
 # ---------------------------------------------------------------------------
-# /mcp 与 /upload Bearer 鉴权门（纯 ASGI：包住 fastmcp http_app）
+# /mcp 与 /upload 的访问令牌门（纯 ASGI：包住 fastmcp http_app）
+#
+# V5：令牌可以在面板里增删改查（不再是一个写死的环境变量），且每个令牌
+# 可独立限并发——这条是「多会话 / 多工作空间互不干扰」的关键：
+#  pipelines 的泳道额度是全局的，令牌额度是租户级的，两者都要过。
 # ---------------------------------------------------------------------------
-class BearerGate:
-    """保护 MCP 调用与参考图上传；常量时间比较防时序侧信道。"""
+# 单个令牌等待**并发准入**的上限：超过就快失败（宁可让对方稍后重试，
+# 也不能让排队排到 deadline 耗尽——那会浪费它已经拿到的上游额度）
+TOKEN_QUEUE_WAIT_SEC = 5.0
 
-    def __init__(self, inner, token: str) -> None:
+
+class AccessGate:
+    """多令牌鉴权 + 租户级并发准入；兼容旧名 BearerGate。"""
+
+    def __init__(self, inner, store, *, wait_sec: float = TOKEN_QUEUE_WAIT_SEC,
+                 logger_=None) -> None:
         self._inner = inner
-        self._expected = f"Bearer {token}".encode("utf-8")
+        self._store = store
+        self._wait_sec = wait_sec
+        self._gates: dict = {}
+        self._log = logger_ or logger
 
+    # ------------------------------------------------------------------
     async def __call__(self, scope, receive, send) -> None:
+        if scope.get("type") != "http":
+            await self._inner(scope, receive, send)
+            return
         path = scope.get("path", "")
-        protected = path.startswith("/mcp") or path == "/upload"
-        if scope["type"] == "http" and protected:
-            if not self._authorized(scope.get("headers") or []):
-                await self._deny(send)
-                return
-        await self._inner(scope, receive, send)
+        protected = path.startswith("/mcp") or path.startswith("/upload")
+        if not protected:
+            await self._inner(scope, receive, send)
+            return
 
-    def _authorized(self, headers: Iterable) -> bool:
+        secret = self._bearer(scope.get("headers") or [])
+        record = self._store.find_token_by_secret(secret) if secret else None
+        if record is None or not record.enabled:
+            await self._deny(send)
+            return
+
+        gate = self._gate_for(record)
+        if gate is not None:
+            try:
+                await asyncio.wait_for(gate.acquire(), timeout=self._wait_sec)
+            except asyncio.TimeoutError:
+                await self._deny_busy(send)
+                return
+        try:
+            token_ctx = context_mod.current_token
+            previous = token_ctx.set(record)
+            self._store.touch_token(record)
+            try:
+                await self._inner(scope, receive, send)
+            finally:
+                token_ctx.reset(previous)
+        finally:
+            if gate is not None:
+                gate.release()
+
+    # ------------------------------------------------------------------
+    def _gate_for(self, record):
+        """租户级并发闸门（max_concurrency=0 → 不限，返回 None）。"""
+        limit = int(getattr(record, "max_concurrency", 0) or 0)
+        if limit <= 0:
+            return None
+        gate = self._gates.get(record.id)
+        if gate is None:
+            gate = asyncio.Semaphore(limit)
+            self._gates[record.id] = gate
+        return gate
+
+    @staticmethod
+    def _bearer(headers: Iterable) -> str:
         for name, value in headers:
-            if name == b"authorization":
-                return hmac.compare_digest(bytes(value), self._expected)
-        return False
+            if bytes(name).lower() == b"authorization":
+                text = bytes(value).decode("latin-1").strip()
+                if text[:7].lower() == "bearer ":
+                    return text[7:].strip()
+                return ""
+        return ""
 
     @staticmethod
     async def _deny(send) -> None:
         from engine import errors
 
         body = errors.mcp_auth_error()
+        await AccessGate._send_error(send, 401, body)
+
+    @staticmethod
+    async def _deny_busy(send) -> None:
+        from engine import errors
+
+        body = errors.busy_error(TOKEN_QUEUE_WAIT_SEC)
+        await AccessGate._send_error(send, 429, body)
+
+    @staticmethod
+    async def _send_error(send, status: int, body) -> None:
         text = (
             f"[error] category={body.category} retry={body.retry} "
             f"reason={body.reason} suggestion={body.suggestion}"
         ).encode("utf-8")
-        await send(
-            {
-                "type": "http.response.start",
-                "status": 401,
-                "headers": [
-                    (b"content-type", b"text/plain; charset=utf-8"),
-                    (b"www-authenticate", b"Bearer"),
-                    (b"content-length", str(len(text)).encode("ascii")),
-                ],
-            }
-        )
+        headers = [
+            (b"content-type", b"text/plain; charset=utf-8"),
+            (b"content-length", str(len(text)).encode("ascii")),
+        ]
+        if status == 401:
+            headers.append((b"www-authenticate", b"Bearer"))
+        await send({"type": "http.response.start", "status": status,
+                    "headers": headers})
         await send({"type": "http.response.body", "body": text})
+
+
+# 兼容旧命名（历史测试与外部引用）
+BearerGate = AccessGate

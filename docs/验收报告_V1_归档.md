@@ -1,8 +1,9 @@
 # MCP 图片生成 Server · 验收报告
 
+> **历史存档**：本文是 V2 阶段的设计/验收记录。V5 起上游已改为「服务提供方」可由用户自行配置，代码与文档不再绑定任何厂商；以 [README](README.md) 为准。
 - **验收对象**：mcp-imagegen（FastMCP + uvicorn，规格书十一节实施顺序 S5 验收阶段）
 - **验收日期**：2026-10-10
-- **执行环境**：本机沙箱（真实 uvicorn 临时端口 + 真实 MCP streamable-http 协议：initialize → tools/list → tools/call，唯一替换项为"硅基流动上游"与"persist 图片下载"两处注入式 mock transport）
+- **执行环境**：本机沙箱（真实 uvicorn 临时端口 + 真实 MCP streamable-http 协议：initialize → tools/list → tools/call，唯一替换项为"另一家上游上游"与"persist 图片下载"两处注入式 mock transport）
 - **总体结论**：
   - **单测：225/225 全绿**（`python -m pytest -q`，4.73s）
   - **e2e 可模拟项：20/20 全 PASS**（`python acceptance/e2e_acceptance.py`，约 5 分钟；含 ⑲ 181.6s 慢死路径）
@@ -306,7 +307,7 @@ sudo /opt/mcp-imagegen/venv/bin/py-spy dump --pid $(systemctl show -p MainPID --
 - **修复**（产品 `app/tool.py`）：`get_http_headers(include_all=True)` 取全量后**白名单过滤**（仅放行 host / x-forwarded-host / x-forwarded-proto 三个 URL 构造所需头，不向 pipeline 深处扩散）。修后证据：URL 为 `http://127.0.0.1:<真实端口>/files/…`。
 
 ### 4.4 ⑳ schnell 30s 边界对照（曾判 FAIL："上游调用 1 次"与"第 1 次超时第 2 次成功"矛盾）
-- **判定：测试基建缺口，产品无 bug**。经核实：计数口径无误（按场景环境统计上游请求总数）；矛盾的真因是 **httpx 把 per-request 超时写入 `request.extensions["timeout"]`，超时的执行属于 transport 层**——真实 httpcore 会在 socket 读超时后抛 ReadTimeout，而 e2e 自定义 mock transport（TimedRelease/NeverRelease）忽略 extensions → 挂起请求永不超时 → 首调一直等到 31s 释放点成功返回 → 上游恰 1 次调用，"read=30s 超时→退避重试 1 次"路径从未触发。产品侧正确性已由单测证明：`compute_read_timeout` 对 schnell（batch=1）恰返回 30s，经 per-request timeout 传入 httpx（tests/test_siliconflow.py 覆盖）；真实上游挂起时由 httpcore 执行该超时。
+- **判定：测试基建缺口，产品无 bug**。经核实：计数口径无误（按场景环境统计上游请求总数）；矛盾的真因是 **httpx 把 per-request 超时写入 `request.extensions["timeout"]`，超时的执行属于 transport 层**——真实 httpcore 会在 socket 读超时后抛 ReadTimeout，而 e2e 自定义 mock transport（TimedRelease/NeverRelease）忽略 extensions → 挂起请求永不超时 → 首调一直等到 31s 释放点成功返回 → 上游恰 1 次调用，"read=30s 超时→退避重试 1 次"路径从未触发。产品侧正确性已由单测证明：`compute_read_timeout` 对 schnell（batch=1）恰返回 30s，经 per-request timeout 传入 httpx（tests/test_upstream_b.py 覆盖）；真实上游挂起时由 httpcore 执行该超时。
 - **修复**（acceptance 侧）：
   1. mock transport 补齐 read 超时执行——`_await_release_or_read_timeout()` 按 extensions 的 read 值对挂起等待加帽，到期抛 `httpx.ReadTimeout`（与 httpx 内置 transport 的映射产物同类，产品侧 `httpx.TimeoutException` 捕获路径一致），使 mock 与生产行为对齐；
   2. 断言口径修正——G1/G2 耗时下界 30.5/31.0 → 30.0（31s 释放计时自 mock 创建起算、早于工具调用起点，按调用起点计可达 30.x；行为主证据是上游调用计数：G1 calls==1 证明未误杀、G2 calls==2 证明恰重试 1 次，符合 C4）。
@@ -325,7 +326,7 @@ sudo /opt/mcp-imagegen/venv/bin/py-spy dump --pid $(systemctl show -p MainPID --
 | tests/test_fallback.py | 18 | 可切换类才切、切换仅 1 次、两模型各试一遍、Q2 快失败 | ⑧ 切换+meta、⑩ 不切换、㉑ 4 次调用/请求 |
 | tests/test_circuit.py | 22 | 三态全迁移（OPEN 续期/HALF_OPEN 探针/CLOSED）、硬 600s/软 300s 窗口、软计数清零、显式失败照写回 | ⑧⑨⑪ 熔断全行为 |
 | tests/test_budget.py | 14 | 排队计入 deadline、退避计入、剩余预算、外层 guard | ⑲ 预算贯穿（R3） |
-| tests/test_siliconflow.py | 30 | read=min(分档, 剩余) 动态计算（30/60/120）、C4 重试纪律（5xx/超时重试 1 次；429/402/4xx 零重试）、rotate 指针热切换+排空 | ⑳ 动态 read 与重试路径；⑮ 客户端重建（E6） |
+| tests/test_upstream_b.py | 30 | read=min(分档, 剩余) 动态计算（30/60/120）、C4 重试纪律（5xx/超时重试 1 次；429/402/4xx 零重试）、rotate 指针热切换+排空 | ⑳ 动态 read 与重试路径；⑮ 客户端重建（E6） |
 | tests/test_tool.py | 19 | tools/list 七参数 schema、A1 description 逐字符全等、A2 越界走 pipeline | ①；⑪附 |
 | tests/test_no_threads.py | 2 | R2 无线程铁律（全部逻辑在事件循环内） | ⑬⑮ 自愈/优雅停机的正确性底座 |
 

@@ -2,14 +2,14 @@
 """S5 端到端验收脚本（V2 全量三工具版；方案 V2 四节 31 项映射）。
 
 驱动方式：真实 uvicorn（127.0.0.1 临时端口）+ 真实 MCP streamable-http
-协议（initialize → tools/list → tools/call），唯一替换项是"Agnes 上游"
+协议（initialize → tools/list → tools/call），上游由本地 mock 提供方代替
 （生图/视频提交/视频查询三端点，VideoScript 分发 mock）与"persist
 图片/视频下载"（注入脚本式/挂起式 mock transport）。
 
 V2 场景映射（编号对齐方案 V2 四节 31 项验收清单）：
-    ⑲ /healthz | ⑫ 错 Token 401 | ⑬ 错上游 Token 401（provider=Agnes）
+    ⑲ /healthz | ⑫ 错 Token 401 | ⑬ 错上游 Token 401（厂商中立文案）
     ① 握手恰 3 工具（名称集合精确匹配 + A1′/A2′/A3′ 全等）
-    ㉖ 中英文→agnes-image 生成成功（route=auto + E25 三键锁定）
+    ㉖ 中英文→image 生成成功（route=auto + E25 三键锁定）
     ㉗ size 直传 | ㉕ url_expires | ⑥ batch=4 全成 | ㉙ batch 部分成功
     ⑩ 审核 400 | ⑪附 越界 invalid_params | ㉒ 10 连败槽不泄漏
     ⑨ 429 → OPEN_HARD → E24 快失败 → 半开探针恢复（改写）
@@ -50,7 +50,7 @@ from config import load_config  # noqa: E402
 from server import Components, build_app  # noqa: E402
 
 MCP_TOKEN = "e2e-mcp-token"
-AGNES_TOKEN = "e2e-agnes-token"
+UPSTREAM_TOKEN = "e2e-upstream-token"
 PROTOCOL_VERSION = "2025-06-18"
 
 # ---------------------------------------------------------------------------
@@ -149,7 +149,7 @@ class VideoScript(Script):
     - POST /v1/images/generations → 沿用父类 Script 队列（生图场景兼容）；
     - POST /v1/videos → video_script 队列（dict=200 JSON；耗尽→自增
       video_id 200，如 vid-e2e-001）；
-    - GET /agnesapi?video_id=… → queries[video_id] 队列（dict=200 JSON；
+    - GET /v1/videos/query?video_id=… → queries[video_id] 队列（dict=200 JSON；
       HANG 哨兵=挂起至 read 超时；耗尽→{"status": "running"}）。
     requests 三端点统一记录（环境内全局共享）。
     """
@@ -178,7 +178,7 @@ class VideoScript(Script):
                 self._seq += 1
                 item = {"video_id": f"vid-e2e-{self._seq:03d}"}
             return self._materialize(item, request)
-        if path == "/agnesapi":
+        if path == "/v1/videos/query":
             self.requests.append(request)
             vid = request.url.params.get("video_id", "")
             queue = self.queries.get(vid)
@@ -260,7 +260,7 @@ async def spawn_env(*, cfg_overrides: dict | None = None, api=None,
     tmpdir = Path(tempfile.mkdtemp(prefix="mcp-e2e-"))
     env_map = {
         "MCPACCESS_TOKEN": MCP_TOKEN,
-        "AGNES_TOKEN": AGNES_TOKEN,
+        "UPSTREAM_TOKEN": UPSTREAM_TOKEN,
         "IMAGE_DIR": str(tmpdir / "images"),
         "PORT": "0",
     }
@@ -483,8 +483,8 @@ async def s_handshake(env: Env) -> None:
 
 
 async def s_single_model_and_e25(env: Env) -> None:
-    """㉖ 中英文 prompt → agnes-image 生成成功（Q1=A 无 model 参数，auto
-    直通即显式 agnes-image）；E25 payload 三键锁定。"""
+    """㉖ 中英文 prompt → image 生成成功（Q1=A 无 model 参数，auto
+    直通即显式 image）；E25 payload 三键锁定。"""
     for prompt in ("一只戴墨镜的橘猫，赛博朋克风格", "a cyberpunk orange cat"):
         env.api.push(ok_response())
         since = len(env.log.lines)
@@ -492,13 +492,13 @@ async def s_single_model_and_e25(env: Env) -> None:
         line = access_line(env, since)
         payload = upstream_payload(env)
         meta = text.splitlines()[-1]
-        ok = ("model=agnes-image" in meta and "route=auto" in line
+        ok = ("model=image" in meta and "route=auto" in line
               and set(payload.keys()) == {"model", "prompt", "size"}
-              and payload["model"] == "agnes-image-2.5-flash"
+              and payload["model"] == "example-image-1"
               and len(env.log.lines[since:]) == 1)
         assert ok, f"E25/单模型断言失败: prompt={prompt!r} payload={payload}"
-    record("㉖", "中英文→agnes-image 生成成功 + E25 三键", True, "\n".join([
-        "中文/英文 prompt 均 route=auto → model=agnes-image（Q1=A：无 model 参数，"
+    record("㉖", "中英文→image 生成成功 + E25 三键", True, "\n".join([
+        "中文/英文 prompt 均 route=auto → model=image（Q1=A：无 model 参数，"
         "直通唯一生图模型）",
         f"上游 payload 键集 = {set(upstream_payload(env).keys())}（E25：仅 model/prompt/size，"
         "quality/steps/guidance/seed 一律不注入）",
@@ -508,8 +508,8 @@ async def s_single_model_and_e25(env: Env) -> None:
 
 
 async def s_upstream_auth_401(env: Env) -> None:
-    """⑬ 错 AGNES_TOKEN → 上游 401 → [error] upstream_auth（retry=no，
-    provider=Agnes，指向 AGNES_TOKEN）；C4 零重试（恰 1 次上游调用）。"""
+    """⑬ 错 UPSTREAM_TOKEN → 上游 401 → [error] upstream_auth（retry=no，
+    文案只指向管理面板，不归属任何厂商）；C4 零重试（恰 1 次上游调用）。"""
     before = len(env.api.requests)
     env.api.push(httpx.Response(
         401, json={"error": {"code": "invalid_api_key",
@@ -519,10 +519,10 @@ async def s_upstream_auth_401(env: Env) -> None:
     calls = len(env.api.requests) - before
     ok = ("[error] category=upstream_auth" in text
           and "retry=no" in text
-          and "provider=Agnes" in text
-          and "AGNES_TOKEN" in text
+          and "provider=" not in text
+          and "UPSTREAM_TOKEN" in text
           and calls == 1)
-    record("⑬", "错上游 Token 401（provider=Agnes）", ok, "\n".join([
+    record("⑬", "错上游 Token 401（厂商中立文案）", ok, "\n".join([
         f"返回体: {text}",
         f"上游调用次数 = {calls}（C4：401 零重试，E19 无切换）",
         "错误体 error.message 透传（内含请求 id，便于对账）",
@@ -567,7 +567,7 @@ async def s_batch_split(env: Env) -> None:
     payloads = [json.loads(r.content) for r in env.api.requests[before:]]
     ok = (calls == 4 and len(url_lines) == 4
           and all(f"https://img.example/b{i}.png" in url_lines for i in range(4))
-          and "model=agnes-image" in meta
+          and "model=image" in meta
           and "requested=" not in meta  # 全成功：无部分成功标记（R17）
           and all(p.get("size") == "1024x1024" for p in payloads)
           and all("batch_size" not in p for p in payloads))
@@ -722,7 +722,7 @@ async def env_hard_circuit() -> None:
         line3 = access_line(env, since)
         snap = env.components.circuit.snapshot()
         ok9b = ("https://img.example" in text3 and "route=auto" in line3
-                and snap.get("agnes-image") == "CLOSED")
+                and snap.get("image") == "CLOSED")
         record("⑨", "熔断到期半开探针→成功→CLOSED", ok9b, "\n".join([
             f"返回体: {text3}", f"访问日志: {line3}",
             f"探针后熔断状态: {snap}",
@@ -741,21 +741,21 @@ async def env_probe_renewal() -> None:
         snap1 = env.components.circuit.snapshot()
         # 到期半开 → 探针失败（500×2）→ 续期 OPEN_SOFT
         await asyncio.sleep(2.6)
-        opened_before = env.components.circuit._entries["agnes-image"].opened_at
+        opened_before = env.components.circuit._entries["image"].opened_at
         env.api.push(status_response(500, "probe fail"))
         env.api.push(status_response(500, "probe fail"))
         text = await call_tool(env, prompt="探针失败猫")
         snap2 = env.components.circuit.snapshot()
-        opened_after = env.components.circuit._entries["agnes-image"].opened_at
+        opened_after = env.components.circuit._entries["image"].opened_at
         # 再到期 → 探针成功 → CLOSED（证明续期未卡死半开）
         await asyncio.sleep(2.6)
         env.api.push(ok_response())
         text2 = await call_tool(env, prompt="探针成功猫")
         snap3 = env.components.circuit.snapshot()
-        ok = (snap1.get("agnes-image") == "OPEN_SOFT"
-              and snap2.get("agnes-image") == "OPEN_SOFT"
+        ok = (snap1.get("image") == "OPEN_SOFT"
+              and snap2.get("image") == "OPEN_SOFT"
               and opened_after > opened_before
-              and snap3.get("agnes-image") == "CLOSED"
+              and snap3.get("image") == "CLOSED"
               and "[error]" in text and "[error]" not in text2)
         record("⑪", "半开探针失败→OPEN 续期一轮", ok, "\n".join([
             f"连败 2 次后: {snap1}",
@@ -834,7 +834,7 @@ async def env_dynamic_read() -> None:
     """㉑ read 动态：注入 20s 档挂 21s → read 超时 → C4 重试 1 次成功（calls==2）。
 
     V2 验收轮（芳 2026-10-10）：场景原按默认 30s 档设计（挂 31s）；D5 已将
-    TIMEOUT_AGNES_IMAGE_SEC 默认调至 60，31s 挂起在 60s 窗口内首次即成功
+    TIMEOUT_UPSTREAM_IMAGE_SEC 默认调至 60，31s 挂起在 60s 窗口内首次即成功
     （calls=1，行为无 bug，断言口径过时）。改为显式注入 20s 档 + 挂 21s，
     回归"read 档先响 + 重试 1 次"语义，不再耦合全局默认值。
     """
@@ -862,7 +862,7 @@ async def env_dynamic_read() -> None:
             return ok_response()
 
     async with spawn_env(api=Hold21(),
-                         cfg_overrides={"TIMEOUT_AGNES_IMAGE_SEC": 20}) as env:
+                         cfg_overrides={"TIMEOUT_UPSTREAM_IMAGE_SEC": 20}) as env:
         await mcp_initialize(env)
         t0 = time.monotonic()
         text = await call_tool(env, prompt="slow cat")
@@ -897,16 +897,16 @@ async def s_video_sync_success(env: Env) -> None:
     ok = (
         len(lines) == 2
         and url == "https://video.example/sync001.mp4"
-        and "model=agnes-video" in meta and "seconds=5" in meta
+        and "model=video" in meta and "seconds=5" in meta
         and "aspect_ratio=16:9" in meta and "elapsed=" in meta
         and "url_expires=1h" in meta and "persisted" not in meta
         and set(submit_payload.keys())
         == {"model", "prompt", "seconds", "mode", "size", "aspect_ratio"}
         and submit_payload["seconds"] == "5"   # E21：int → str
         and submit_payload["mode"] == "text" and submit_payload["size"] == "720P"
-        and submit_payload["model"] == "agnes-video-2.5-flash"
+        and submit_payload["model"] == "example-video-1"
         and query_req.url.params["video_id"] == "vid-sync-001"
-        and query_req.url.params["model_name"] == "agnes-video-2.5-flash"
+        and query_req.url.params["model_name"] == "example-video-1"
         and "task_id=vid-sync-001" in line and "result=ok" in line
         and "poll_count=1" in line
         and "[error]" not in text
@@ -977,7 +977,7 @@ async def s_video_failed_classifications(env: Env) -> None:
         and "[error] category=upstream_error" in text_c
         and "retry=yes" in text_c and "上游服务错误(500)" in text_c
         and calls_c == 3   # 1 提交 + 2 查询（C4 恰重试 1 次）
-        and "agnes-video" not in snapshot  # 视频路径零熔断写入（E19）
+        and "video" not in snapshot  # 视频路径零熔断写入（E19）
         and "切换" not in joined and "fallback" not in joined
     )
     record("㊞", "视频失败分类不切换（failed/400/500）", ok, "\n".join([
@@ -985,7 +985,7 @@ async def s_video_failed_classifications(env: Env) -> None:
         f"(b) 查询 400: {text_b}",
         f"(c) 查询 500: {text_c}",
         f"(c) 上游调用 = {calls_c} 次（1 提交 + 2 查询，C4 重试 1 次）",
-        f"熔断快照: {snapshot}（无 agnes-video 键：视频路径不写熔断）",
+        f"熔断快照: {snapshot}（无 video 键：视频路径不写熔断）",
         "三态均无 切换/fallback 字样（E19：唯一视频模型）",
     ]))
 
@@ -1059,7 +1059,7 @@ async def env_video_overbudget() -> None:
     async with spawn_env(
         cfg_overrides={
             "TOTALBUDGETSEC": 4, "QUEUEWAIT_SEC": 2,
-            "TIMEOUT_AGNES_IMAGE_SEC": 2,
+            "TIMEOUT_UPSTREAM_IMAGE_SEC": 2,
             "VIDEO_SUBMIT_TIMEOUT_SEC": 2, "VIDEO_QUERY_TIMEOUT_SEC": 1,
             "PERSIST_TIMEOUT_IMAGE_SEC": 2, "PERSIST_TIMEOUT_VIDEO_SEC": 2,
             "VIDEO_POLL_INTERVAL_SEC": 0.2,
@@ -1109,7 +1109,7 @@ async def env_video_overbudget() -> None:
                                  seconds=5)
         hang_sec = time.monotonic() - t0
         hang_calls = [r for r in env.api.requests
-                      if r.url.path == "/agnesapi"
+                      if r.url.path == "/v1/videos/query"
                       and r.url.params.get("video_id") == "vid-hang-001"]
         slot_free2 = getattr(env.components.pool._sem, "_value", None) == 3
         ok2 = ("[error] category=upstream_error" in text2

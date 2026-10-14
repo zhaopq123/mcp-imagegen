@@ -1,9 +1,9 @@
 """C3 / R10 门禁：错误分类矩阵（V2 改造版）。
 
 V2 变更：
-- 402 分支已删（Agnes 无限期间免费，不可能出现）；
+- 402 分支已删（该计费模型不适用）；
 - task_not_found 新增（fixthenretry，R16）；
-- upstream_auth 注明 provider=Agnes / AGNES_TOKEN；
+- upstream_auth 只指向「管理面板改服务提供方密钥」，不点名任何厂商；
 - switchable 恒 False（唯一模型无切换，E19）。
 """
 from __future__ import annotations
@@ -21,7 +21,17 @@ def test_matrix_categories_match_v2():
         "invalid_params", "mcp_auth", "upstream_auth", "rate_limit",
         "upstream_error", "content_policy", "upstream_422", "persist_failed",
         "busy", "task_not_found",
+        # V5：没有任何可用服务提供方（未配置 ≠ 上游故障，retry=no）
+        "not_configured",
     }
+
+
+def test_not_configured_is_not_retryable():
+    """配置缺失必须 retry=no：没配好之前重试一万次也是同一个结果。"""
+    info = errors.not_configured_error("image", "面板里没有启用任何提供方")
+    assert info.category == errors.NOT_CONFIGURED
+    assert info.retry == "no"
+    assert "管理面板" in info.suggestion
 
 
 def test_matrix_values_match_spec():
@@ -37,7 +47,7 @@ def test_matrix_values_match_spec():
 
 
 def test_matrix_has_402_removed():
-    """402 不再是限流触发（Agnes 无限期间免费）——落入未定义状态兜底。"""
+    """402 不再是限流触发（该计费模型不适用）——落入未定义状态兜底。"""
     info = errors.classify_http_status(402, "err")
     assert info.category == errors.UPSTREAM_ERROR   # 不再是 rate_limit
     assert info.retry == "yes"
@@ -79,13 +89,12 @@ def test_classify_400_is_content_policy_regardless_of_detail():
 
 
 @pytest.mark.parametrize("status", [401, 403])
-def test_classify_upstream_auth_mentions_agnes(status):
-    """上游 401/403 注明 provider=Agnes，指向 AGNES_TOKEN。"""
+def test_classify_upstream_auth_points_to_panel(status):
+    """上游 401/403：指向「管理面板改服务提供方密钥」，不绑定任何厂商。"""
     info = errors.classify_http_status(status, "Invalid token")
     assert info.category == errors.UPSTREAM_AUTH
     assert info.retry == "no"
-    assert "Agnes" in info.reason
-    assert "AGNES_TOKEN" in info.suggestion
+    assert "管理面板" in info.suggestion
 
 
 @pytest.mark.parametrize("status", [404, 405])
@@ -137,7 +146,9 @@ def test_circuit_open_error():
     assert info.category == errors.RATE_LIMIT
     assert info.retry == "yes"
     assert "约 317" in info.reason
-    assert "Agnes" in info.reason
+    # 厂商中立：错误文案里不许出现任何 provider=<厂商名> 的归属
+    assert "provider=" not in info.reason
+    assert "provider=" not in info.suggestion
 
 
 def test_video_failed_error():

@@ -31,9 +31,9 @@ class FakeClock:
 
 def make_config(**overrides) -> Config:
     env = {
+        # V5：上游凭据不再由环境变量注入——Provider 与访问令牌全部走
+        # data/store.json（管理面板维护），load_config 不再认识任何厂商变量。
         "MCPACCESS_TOKEN": "test-mcp-token",
-        # V2（T1）：AGNES_TOKEN 必填 → 测试占位值（本轮唯一测试基建改动）
-        "AGNES_TOKEN": "test-agnes-token",
     }
     for key, value in overrides.items():
         env[key.upper()] = str(value)
@@ -49,6 +49,23 @@ def cfg():
 @pytest.fixture
 def clock():
     return FakeClock()
+
+
+def make_store(path, tokens: tuple = ()):
+    """建一个落盘 store，并按需预置访问令牌。
+
+    V5：访问令牌 / 服务提供方都在 store 里（管理面板维护），不再由环境变量
+    注入——测试想让某个 token 通过门禁，就得先把它写进 store。
+    """
+    from providers import schema as provider_schema
+    from providers.store import Store
+
+    store = Store(str(path))
+    store.load()
+    for index, secret in enumerate(tokens):
+        store.upsert_token(provider_schema.TokenRecord(
+            id=f"t{index}", name=f"token-{index}", token=secret))
+    return store
 
 
 def network_error(request: httpx.Request) -> Exception:

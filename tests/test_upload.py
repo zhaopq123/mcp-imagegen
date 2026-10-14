@@ -10,8 +10,8 @@ from starlette.applications import Starlette
 from starlette.routing import Route
 
 from app import endpoints
-from conftest import make_config
-from server import build_app
+from conftest import make_config, make_store
+from server import Components, build_app
 
 PNG = b"\x89PNG\r\n\x1a\n" + b"test-png-payload"
 JPEG = b"\xff\xd8\xff" + b"test-jpeg-payload"
@@ -86,7 +86,9 @@ async def test_bearer_gate_protects_upload_but_not_file_reads(tmp_path):
         Route("/upload", upload, methods=["POST"]),
         Route("/files/{name}", files, methods=["GET"]),
     ])
-    gated = endpoints.BearerGate(app, "test-upload-token")
+    # V5：门禁认的是 store 里的访问令牌（面板维护），不是环境变量常量
+    store = make_store(tmp_path / "gate-store.json", tokens=("test-upload-token",))
+    gated = endpoints.AccessGate(app, store)
     async with make_client(gated) as client:
         denied = await client.post("/upload", content=PNG)
         accepted = await client.post(
@@ -146,16 +148,23 @@ async def test_absurd_content_length_is_rejected_without_reading(tmp_path):
 @pytest.mark.asyncio
 async def test_build_app_exposes_upload_and_enforces_auth(tmp_path):
     image_dir = tmp_path / "images"
-    cfg = make_config(image_dir=image_dir, video_dir=tmp_path / "videos")
-    components = SimpleNamespace(pipeline=object(), video_pipeline=object())
+    cfg = make_config(image_dir=image_dir, video_dir=tmp_path / "videos",
+                      store_path=tmp_path / "store.json")
+    store = make_store(cfg.store_path, tokens=("test-mcp-token",))
+    components = Components.build(cfg, store=store)
     app = build_app(cfg, components=components)
 
-    async with make_client(app) as client:
-        denied = await client.post("/upload", content=PNG)
-        accepted = await client.post(
-            "/upload", content=PNG,
-            headers={"authorization": "Bearer test-mcp-token"},
-        )
+    try:
+        async with make_client(app) as client:
+            denied = await client.post("/upload", content=PNG)
+            accepted = await client.post(
+                "/upload", content=PNG,
+                headers={"authorization": "Bearer test-mcp-token"},
+            )
+    finally:
+        # ASGITransport 不走 lifespan，这里自己收尾，别留着 httpx 连接池
+        await components.gateway.aclose()
+        await components.persist.aclose()
 
     assert denied.status_code == 401
     assert accepted.status_code == 201

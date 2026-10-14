@@ -34,7 +34,7 @@ MemoryMax=512M
 User=mcp-imagegen
 Group=mcp-imagegen
 WorkingDirectory=/opt/mcp-imagegen
-# 密钥与运行参数（含 SILICONFLOWTOKEN / MCPACCESS_TOKEN）：
+# 密钥与运行参数（含 UPSTREAM_B_TOKEN / MCPACCESS_TOKEN）：
 #   文件须为 root:root 600 —— systemd(PID 1) 读取后注入进程环境，服务用户无需可读
 EnvironmentFile=/etc/mcp-imagegen/env
 # 启动前配置自检（server.py --check，退出码 2 = 嵌套不等式/密钥违例 → 阻止启动，B6 fail-fast）

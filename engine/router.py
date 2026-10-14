@@ -2,16 +2,16 @@
 
 单 Provider 单生图模型 → 路由链①–⑤全删，退化为：
 
-    显式 model="agnes-image"（内部别名）→ 探针标记直达（E2：绕过熔断表——用户
+    显式 model="image"（内部能力别名）→ 探针标记直达（E2：绕过熔断表——用户
         自救通道，其成功/失败结果仍写熔断）；
     auto → 熔断门：
         OPEN（硬/软）→ 快失败决策（E24：pipeline 转为 rate_limit
             [error] 行，retry=yes，注明"约 X 秒后重试"）；
-        CLOSED / HALF_OPEN → 直达 agnes-image（半开首个请求获探针
-            资格 E8，未发出时归还）。
+        CLOSED / HALF_OPEN → 直达当前可用的服务提供方（半开首个请求获
+            探针资格 E8，未发出时归还）。
 
-模型别名（E15 精神延续）：对外只暴露内部别名 agnes-image，
-真实上游模型 ID 由配置提供，禁止自由文本 model。
+能力别名：对外只暴露内部别名 image / video，真实的上游模型名写在
+服务提供方的配置里（同一个 capability.model），不在工具层面暴露。
 
 reason_tag 有限枚举（进日志"路由决策来源"字段）：
     explicit / auto / circuit_open
@@ -22,13 +22,12 @@ import math
 from dataclasses import dataclass
 from typing import Optional, Protocol
 
-# 唯一生图模型（视频 agnes-video 不走路由——提交/查询直接指定）
-MODEL_IMAGE = "agnes-image"
+# 生图能力别名（视频不参与路由——提交/查询直接按能力选择提供方）
+MODEL_IMAGE = "image"
 MODELS = (MODEL_IMAGE,)
 
-# 内部别名 → 真实模型 id 的解析**不在本模块**：真实模型 ID 由配置
-# （AGNES_IMAGE_MODEL / AGNES_VIDEO_MODEL）驱动，见 infra/agnes.resolve_model_ids()。
-# 本模块只负责「别名」层面的路由决策，不感知上游模型名。
+# 别名 → 真实模型名的解析**不在本模块**：由服务提供方配置驱动
+# （providers/gateway.py 渲染请求模板时注入 capability.model）。
 # 保留此常量仅为向后兼容（无调用点）。
 MODEL_ALIASES: dict[str, str] = {}
 
@@ -44,7 +43,7 @@ REASONS = (REASON_EXPLICIT, REASON_AUTO, REASON_CIRCUIT_OPEN)
 class RouteDecision:
     """路由决策。
 
-    - 正常：model=agnes-image（reason=explicit|auto；probe=探针资格）；
+    - 正常：model=image（reason=explicit|auto；probe=探针资格）；
     - OPEN 拒绝：model=None（reason=circuit_open），retry_after_sec 供
       E24 文案"约 X 秒后重试"（向上取整到秒）。
     """

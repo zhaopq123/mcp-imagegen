@@ -30,7 +30,9 @@ from conftest import FakeClock, FakeSleeper, make_config, scripted
 import app.video_pipeline as vp_mod
 from app import contract as contract_mod
 from app.video_pipeline import VideoPipeline, validate_video_params
-from infra import agnes as agnes_mod
+from providers import gateway as gateway_mod
+from providers import schema as schema_mod
+from providers.store import Store
 from infra import budget as budget_mod
 from infra import tasks as tasks_mod
 from ops import logline as logline_mod
@@ -44,30 +46,30 @@ ORD_META = [91, 109, 101, 116, 97, 93, 32]
 # ---------------------------------------------------------------------------
 # 工具：结果工厂 / 假客户端 / 假 sleep / 装配
 # ---------------------------------------------------------------------------
-def submit_ok(video_id: str = "vid-1") -> agnes_mod.ApiCallResult:
-    return agnes_mod.ApiCallResult(
-        ok=True, status_code=200, model_id="agnes-video-2.5-flash",
+def submit_ok(video_id: str = "vid-1") -> gateway_mod.ApiCallResult:
+    return gateway_mod.ApiCallResult(
+        ok=True, status_code=200, provider_id="video", model_id="video",
         video_id=video_id)
 
 
 def query_result(
     status: str = "running", url: str | None = None,
-) -> agnes_mod.ApiCallResult:
-    return agnes_mod.ApiCallResult(
-        ok=True, status_code=200, model_id="agnes-video-2.5-flash",
+) -> gateway_mod.ApiCallResult:
+    return gateway_mod.ApiCallResult(
+        ok=True, status_code=200, provider_id="video", model_id="video",
         video_status=status, video_url=url)
 
 
 def api_error(
     status_code: int, detail: str = "boom",
-) -> agnes_mod.ApiCallResult:
-    return agnes_mod.ApiCallResult(
-        ok=False, status_code=status_code, model_id="agnes-video-2.5-flash",
+) -> gateway_mod.ApiCallResult:
+    return gateway_mod.ApiCallResult(
+        ok=False, status_code=status_code, provider_id="video", model_id="video",
         error_detail=detail)
 
 
 class FakeVideoApi:
-    """AgnesClient 假替身：脚本化 submit/query；记录调用与占槽实况。"""
+    """ProviderGateway 假替身：脚本化 submit/query；记录调用与占槽实况。"""
 
     def __init__(self, submit_result=None, query_script=None, pool=None):
         self.submit_result = submit_result
@@ -79,9 +81,9 @@ class FakeVideoApi:
         self.in_use_at_query: list[int] = []
         self.submit_arrived = asyncio.Event()
 
-    async def submit_video(self, *, model, prompt, seconds, aspect_ratio, deadline,
+    async def submit_video(self, *, model=None, prompt, seconds, aspect_ratio, deadline,
                            seed=None, mode="text", first_frame=None,
-                           last_frame=None, reference_images=None):
+                           last_frame=None, reference_images=None, provider=None):
         self.submit_calls.append({
             "model": model, "prompt": prompt, "seconds": seconds,
             "aspect_ratio": aspect_ratio, "deadline": deadline, "seed": seed,
@@ -93,7 +95,7 @@ class FakeVideoApi:
             raise self.submit_result
         return self.submit_result
 
-    async def query_video(self, *, video_id, model, deadline):
+    async def query_video(self, *, video_id, model=None, deadline, provider=None):
         if self.pool is not None:
             self.in_use_at_query.append(self.pool.in_use())
         self.query_calls.append({
@@ -249,7 +251,7 @@ async def test_run_success_contract_table_and_log(caplog):
     assert lines[0] == "https://v.example/1.mp4"
     meta_line = lines[1]
     assert [ord(c) for c in meta_line[:7]] == ORD_META   # ord 逐码验证
-    assert "model=agnes-video" in meta_line
+    assert "model=video" in meta_line
     assert "seconds=5" in meta_line
     assert "aspect_ratio=16:9" in meta_line
     iv = ns.cfg.video_poll_interval_sec          # D7：默认 2s
@@ -260,7 +262,7 @@ async def test_run_success_contract_table_and_log(caplog):
     # 任务表：register（task_id=video_id）→ 每次轮询 update 至最近实况
     entry = ns.table.get("vid-1")
     assert entry is not None
-    assert entry.model == "agnes-video"
+    assert entry.model == "video"
     assert entry.status == "completed"
     assert entry.url == "https://v.example/1.mp4"
     assert entry.prompt_hash == logline_mod.prompt_hash("a cat")
@@ -280,7 +282,7 @@ async def test_run_success_contract_table_and_log(caplog):
     access = access_records(caplog)
     assert len(access) == 1
     rendered = access[0].getMessage()
-    for field in ("req_id=", "model=agnes-video", "seconds=5",
+    for field in ("req_id=", "model=video", "seconds=5",
                    "result=ok", "total="):
         assert field in rendered, rendered
 
@@ -485,9 +487,9 @@ def test_query_read_tier_nesting_pure():
     # 纯函数锁定：满预算 → 档位生效；剩余不足 → 按剩余钳制
     clock = FakeClock()
     deadline = budget_mod.Deadline(200.0, clock=clock)
-    assert agnes_mod.compute_read_timeout(10.0, deadline) == 10.0
+    assert gateway_mod.compute_read_timeout(10.0, deadline) == 10.0
     clock.advance(197.0)
-    assert agnes_mod.compute_read_timeout(10.0, deadline) == pytest.approx(3.0)
+    assert gateway_mod.compute_read_timeout(10.0, deadline) == pytest.approx(3.0)
 
 
 def test_deadline_passed_to_submit_and_query_is_request_scoped():
@@ -504,9 +506,13 @@ def test_deadline_passed_to_submit_and_query_is_request_scoped():
     assert query_call["deadline"].total == ns.cfg.video_job_max_wait_sec
 
 
-async def test_integration_real_client_submit_and_poll(scripted, cfg):
+async def test_integration_real_client_submit_and_poll(scripted, cfg, tmp_path):
     # 真客户端 + 脚本 transport（零真实 API）：请求体契约（E21 seconds=str）
-    # + read 档嵌套（提交 30 / 单查 10）+ 全链路输出
+    # + read 档嵌套（提交 30 / 单查 10）+ 全链路输出。
+    #
+    # V5：client 由厂商客户端换成 ProviderGateway，上游完全由 store 里的
+    # provider 配置描述——这条用例因此一次锁住「模板渲染 → 真 httpx →
+    # 路径抽取 → 状态归一」整条链路，而不只是管道自身。
     def ok(json_body):
         return lambda req: httpx.Response(200, json=json_body, request=req)
 
@@ -515,7 +521,26 @@ async def test_integration_real_client_submit_and_poll(scripted, cfg):
         ok({"status": "running"}),
         ok({"status": "completed", "url": "https://v.example/int.mp4"}),
     ])
-    client = agnes_mod.AgnesClient(cfg, transport=transport, sleep=FakeSleeper())
+    store = Store(str(tmp_path / "store.json"))
+    store.load()
+    store.upsert_provider(schema_mod.ProviderConfig(
+        id="v-int", name="v-int", base_url="https://api.example.com",
+        auth=schema_mod.AuthSpec(kind=schema_mod.AUTH_BEARER, token="sk-test"),
+        capabilities={"video": schema_mod.CapabilitySpec(
+            model="vid-int",
+            request=schema_mod.RequestSpec(
+                method="POST", path="/v1/videos",
+                body={"model": "{model}", "prompt": "{prompt}",
+                      "seconds": "{seconds}", "aspect_ratio": "{aspect_ratio}",
+                      "seed": "{{seed}}"}),
+            extract=schema_mod.ExtractSpec(task_id="video_id"),
+            poll=schema_mod.RequestSpec(
+                method="GET", path="/v1/videos/query",
+                query={"video_id": "{task_id}"}),
+            poll_extract=schema_mod.ExtractSpec(status="status", url="url"),
+        )}))
+    client = gateway_mod.ProviderGateway(cfg, store, transport=transport,
+                                         sleep=FakeSleeper())
     try:
         clock = FakeClock()
         table = tasks_mod.TaskTable(
@@ -537,17 +562,20 @@ async def test_integration_real_client_submit_and_poll(scripted, cfg):
     # 提交契约：POST /v1/videos；E21：seconds 以字符串入体
     assert r0.method == "POST"
     assert str(r0.url).endswith("/v1/videos")
+    # V5：body 完全等于 provider 模板渲染结果——本端不塞任何厂商字段。
+    # "mode"/"size" 这类旧厂商字段必须彻底消失，否则用户在面板里配什么
+    # 都会被偷偷改写。
     assert json.loads(r0.content) == {
-        "model": "agnes-video-2.5-flash", "prompt": "a cat",
-        "seconds": "5", "mode": "text", "size": "720P",
-        "aspect_ratio": "16:9"}
+        "model": "vid-int", "prompt": "a cat",
+        "seconds": "5", "aspect_ratio": "16:9"}
     assert r0.extensions["timeout"]["read"] == pytest.approx(30.0)
-    # 查询契约：GET /agnesapi?video_id=&model_name=；read 单查档 10
+    # 查询契约：GET provider 模板里的 poll 端点；read 单查档 10。
+    # 查询串也由模板决定（这里只配了 video_id），本端不附加任何默认参数。
     for r in (r1, r2):
         assert r.method == "GET"
-        assert r.url.path.endswith("/agnesapi")
+        assert r.url.path.endswith("/v1/videos/query")
         assert r.url.params["video_id"] == "vid-int"
-        assert r.url.params["model_name"] == "agnes-video-2.5-flash"
+        assert "model_name" not in r.url.params
         assert r.extensions["timeout"]["read"] == pytest.approx(10.0)
     entry = table.get("vid-int")
     assert entry.status == "completed"
@@ -602,7 +630,7 @@ async def test_query_completed_returns_url_and_updates_table():
 
 async def test_query_running_returns_status_line():
     ns = make_pipeline(submit_result=submit_ok())
-    ns.table.register(task_id="vid-qr", model="agnes-video", prompt_hash="x")
+    ns.table.register(task_id="vid-qr", model="video", prompt_hash="x")
     out = await ns.vp.query(task_id="vid-qr")    # 默认查询结果 running
     assert [ord(c) for c in out[:7]] == ORD_META
     assert "task_id=vid-qr" in out
@@ -613,7 +641,7 @@ async def test_query_running_returns_status_line():
 
 async def test_query_failed_returns_classified_error():
     ns = make_pipeline(submit_result=submit_ok())
-    ns.table.register(task_id="vid-qf", model="agnes-video", prompt_hash="x")
+    ns.table.register(task_id="vid-qf", model="video", prompt_hash="x")
     ns.api.query_script = [query_result("failed")]
     out = await ns.vp.query(task_id="vid-qf")
     assert out.startswith(ERROR_PREFIX)
@@ -625,7 +653,7 @@ async def test_query_failed_returns_classified_error():
 async def test_query_upstream_error_classified_no_table_corruption():
     # 查询请求本身失败（5xx）→ 分类错误返回；表内状态不被污染
     ns = make_pipeline(submit_result=submit_ok())
-    ns.table.register(task_id="vid-qe", model="agnes-video", prompt_hash="x")
+    ns.table.register(task_id="vid-qe", model="video", prompt_hash="x")
     ns.api.query_script = [api_error(500, "boom")]
     out = await ns.vp.query(task_id="vid-qe")
     assert out.startswith(ERROR_PREFIX)
@@ -637,7 +665,7 @@ async def test_query_does_not_take_slot():
     # E20：查询路径不占并发槽——唯一槽被占住时 query 照常完成
     cfg = make_config(MAXCONCURRENCY=1)
     ns = make_pipeline(submit_result=submit_ok(), cfg=cfg)
-    ns.table.register(task_id="vid-noslot", model="agnes-video", prompt_hash="x")
+    ns.table.register(task_id="vid-noslot", model="video", prompt_hash="x")
     ns.api.query_script = [query_result("completed", "https://v.example/ns.mp4")]
     async with ns.pool.slot(budget_mod.Deadline(50.0, clock=ns.clock), "holder"):
         out = await ns.vp.query(task_id="vid-noslot")

@@ -101,7 +101,7 @@ class PersistService:
             transport=self._transport,
             limits=httpx.Limits(
                 max_connections=self._cfg.httpx_max_connections,
-                max_keepalive_connections=self._cfg.httpx_max_keepalive_connections,
+                max_keepalive_connections=self._cfg.httpx_max_keepalive,
                 keepalive_expiry=self._cfg.httpx_keepalive_sec,
             ),
             timeout=httpx.Timeout(
@@ -111,6 +111,10 @@ class PersistService:
                 read=self._cfg.persist_timeout_image_sec,  # 占位；每次请求覆盖 read
             ),
         )
+
+    def reconfigure(self, cfg) -> None:
+        """热更新：下载超时 / 连接参数改用新的 Config（已建连接下次请求覆盖）。"""
+        self._cfg = cfg
 
     async def aclose(self) -> None:
         if self._client is not None:

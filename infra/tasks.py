@@ -84,6 +84,10 @@ class JobEntry(TaskEntry):
     first_frame: Optional[str] = None
     last_frame: Optional[str] = None
     reference_images: Optional[tuple] = None
+    # V5：发起方令牌绑定的服务提供方。后台 worker 脱离请求上下文（读不到
+    # ContextVar），异步续查必须靠它回到同一个提供方，否则会打到别处去
+    # （跨provider 的任务号互不通用，那里必然 404）。
+    provider_hint: Optional[str] = None
 
 
 class TaskTable:
@@ -223,11 +227,13 @@ class JobTable(TaskTable):
         first_frame: Optional[str] = None,
         last_frame: Optional[str] = None,
         reference_images: Optional[tuple] = None,
+        provider_hint: Optional[str] = None,
     ) -> JobEntry:
         """登记作业并建完成通知 future；超限逐出同父类契约。
 
         V4：status 可为 STATUS_QUEUED（本端排队中，尚未提交成功）；
         提交所需参数随作业携带，供后台 worker 排队重试复用。
+        V5：provider_hint 记录发起方绑定的服务提供方（后台异步续查要用）。
         """
         entry = JobEntry(
             task_id=task_id,
@@ -245,6 +251,7 @@ class JobTable(TaskTable):
             first_frame=first_frame,
             last_frame=last_frame,
             reference_images=reference_images,
+            provider_hint=provider_hint,
         )
         loop = asyncio.get_event_loop()
         entry.future = loop.create_future()

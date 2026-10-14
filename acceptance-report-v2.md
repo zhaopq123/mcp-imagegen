@@ -1,13 +1,14 @@
-# MCP 图片/视频生成 Server · V2 验收报告（纯 Agnes 双工具版）
+# MCP 图片/视频生成 Server · V2 验收报告（纯 上游服务提供方 双工具版）
 
+> **历史存档**：本文是 V2 阶段的设计/验收记录。V5 起上游已改为「服务提供方」可由用户自行配置，代码与文档不再绑定任何厂商；以 [README](README.md) 为准。
 | 项 | 内容 |
 |---|---|
-| 验收对象 | mcp-imagegen V2（单 Provider Agnes · 三工具：generate_image / generate_video / query_video） |
+| 验收对象 | mcp-imagegen V2（单 Provider 上游服务提供方 · 三工具：generate_image / generate_video / query_video） |
 | 验收轮次 | V2 第八轮（最终验收） |
 | 验收日期 | 2026-10-10 |
 | 验收人 | 芳（产品验收人，管理员 15:39 派发） |
-| 上位依据 | 《技术规格书》最终交付版 → 《增量设计方案 V2》（需求变更：删硅基）→ 《官方文档对齐 Delta 定案》（D1–D8） |
-| 执行环境 | 本机沙箱：真实 uvicorn + 真实 MCP streamable-http 协议（initialize → tools/list → tools/call）；e2e 上游为注入式 mock；真机阶段打真实 api.agnes-ai.cn |
+| 上位依据 | 《技术规格书》最终交付版 → 《增量设计方案 V2》（需求变更：删另一家上游）→ 《官方文档对齐 Delta 定案》（D1–D8） |
+| 执行环境 | 本机沙箱：真实 uvicorn + 真实 MCP streamable-http 协议（initialize → tools/list → tools/call）；e2e 上游为注入式 mock；真机阶段打真实 api.example.com |
 | 总体结论 | **可交付**。31 项处置后：23 项 PASS（单测/e2e/真机证据齐，含 A-8 视频全流程真机闭环）＋1 项待用户侧（⑦ 真实 Agent 接入）＋7 项待部署真机（需 systemd/Caddy 环境，与 V1 同口径遗留）＋3 项 N/A（Q1=A 删参）。发现 1 项非阻塞缺陷（e2e 断言过时），验收轮当场修复并复跑 PASS。 |
 
 **复跑命令**：
@@ -27,11 +28,11 @@ python scripts/live_check.py --only svc_video   # 真机视频（上游队列满
 
 | 验证项 | 结果 | 备注 |
 |---|---|---|
-| 全量单测 | **424 passed, 0 failed**（7.1s） | 分文件：agnes 60 / normalizer 58 / config 54 / tool 41 / video_pipeline 38 / files_video 29 / tasks 27 / pipeline 27 / errors 25 / circuit 22 / router 15 / budget 14 / video_persist 12 / no_threads 2 |
+| 全量单测 | **424 passed, 0 failed**（7.1s） | 分文件：上游 60 / normalizer 58 / config 54 / tool 41 / video_pipeline 38 / files_video 29 / tasks 27 / pipeline 27 / errors 25 / circuit 22 / router 15 / budget 14 / video_persist 12 / no_threads 2 |
 | `server.py --check` | **exit=0** | 嵌套不等式全链 ✓（read ≤ 60s 档 ≤ 200s deadline < 210 < 220）；轮询 2s；任务表 TTL 7200s/容量 100 |
 | e2e 快速档 | **25/25 PASS** | 第七轮记录 + 本轮现场复核 |
 | e2e 全量档 | **26/27 → 修复后 27/27** | ㉑ 场景断言未随 D5（30s→60s）同步，判定为测试缺陷（见四节 D-01），验收轮修复后单独复跑 PASS（20.8s / calls=2 / read=20s 先响→重试 1 次成功） |
-| 真机生图 | **2 次成功** | 第六轮 svc_image（8s）+ 本轮 ratio 抽测：size="2K"+ratio="16:9" 11.7s，meta 完整 `model=agnes-image size=2K ratio=16:9 url_expires=1h` |
+| 真机生图 | **2 次成功** | 第六轮 svc_image（8s）+ 本轮 ratio 抽测：size="2K"+ratio="16:9" 11.7s，meta 完整 `model=image size=2K ratio=16:9 url_expires=1h` |
 | 真机视频 | **全流程闭环（A-8）** | seed=42 + aspect_ratio=21:9 提交 200（6.1s）→ queued → in_progress(10) → completed(100) → URL HEAD 200/video/mp4/1.87MB（见三节） |
 | 真机错误路径 | **503/429 契约已录** | 6 次提交尝试：503 video_queue_full → `upstream_error retry=yes`；429 → `rate_limit retry=yes`；message 与 request id 完整透传（run 940f34fed195） |
 
@@ -39,7 +40,7 @@ python scripts/live_check.py --only svc_video   # 真机视频（上游队列满
 
 ## 二、31 项验收清单逐项结论
 
-处置口径：37 项 → 删 6 项（②③⑤⑧㉚㊲ 硅基专属）→ 31 项；其中 ④⑤㉘ 因 Q1=A（参数瘦身）再归 N/A，实际判定 28 项。
+处置口径：37 项 → 删 6 项（②③⑤⑧㉚㊲ 另一家上游专属）→ 31 项；其中 ④⑤㉘ 因 Q1=A（参数瘦身）再归 N/A，实际判定 28 项。
 
 **图例**：🟢=PASS（证据齐）｜🟡=部分闭环/待条件｜⚪=待部署真机｜⚫=N/A
 
@@ -48,12 +49,12 @@ python scripts/live_check.py --only svc_video   # 真机视频（上游队列满
 | # | 验收项 | 结论 | 证据指针 |
 |---|---|---|---|
 | ① | Inspector 连接/三工具 + description 全等 | 🟢 | e2e ①（tools/list 三工具；A1″ 冻结断言 test_tool.py 41 用例） |
-| ④ | 显式 model 覆盖路由 | ⚫ | Q1=A：model 参数已删，无路由语义（唯一模型直通，单测：任何 prompt 落 agnes-image） |
+| ④ | 显式 model 覆盖路由 | ⚫ | Q1=A：model 参数已删，无路由语义（唯一模型直通，单测：任何 prompt 落 image） |
 | ⑤ | quality=high 强制 | ⚫ | Q1=A：quality 参数已删 |
 | ⑥ | batch=4 拆分串行返 4 URL | 🟢 | e2e ⑥（4 次调用、requested=4 delivered=4） |
 | ⑦ | 真实 Agent 端到端 | 🟡 | 真实 MCP 协议全链已验（live_check 三轮）；真实 Agent 客户端接入待用户侧（agent-config.md 已交付） |
 | ⑫ | 错 MCP Token 401 | 🟢 | e2e ⑫（HTTP 401 + mcp_auth 契约行） |
-| ⑬ | 错上游 Token 401 | 🟢 | e2e ⑬（provider=Agnes 注明）+ 真机 401 错误体格式实锤（Delta 定案 F3） |
+| ⑬ | 错上游 Token 401 | 🟢 | e2e ⑬（provider=上游服务提供方 注明）+ 真机 401 错误体格式实锤（Delta 定案 F3） |
 | ⑲ | /healthz 200 | 🟢 | e2e ⑲ |
 
 ### B. 错误处理与自愈
@@ -75,16 +76,16 @@ python scripts/live_check.py --only svc_video   # 真机视频（上游队列满
 | ㉔ | /files URL 24h 有效 | ⚪ | 文件落盘长期保留设计（规格书：不自动删除）；24h 时间维度验证待部署后（V1 同口径遗留） |
 | ㉕ | 不 persist → url_expires=1h 警示 | 🟢 | e2e ㉕ + 真机 meta 实证（本轮 ratio 抽测返回行） |
 
-### D. Agnes 生图（V2 新增）
+### D. 上游服务提供方 生图（V2 新增）
 
 | # | 验收项 | 结论 | 证据指针 |
 |---|---|---|---|
-| ㉖ | agnes-image 生成成功 | 🟢 | e2e ㉖（E25 三键请求体断言）+ 真机 2 次（8s / 11.7s） |
+| ㉖ | image 生成成功 | 🟢 | e2e ㉖（E25 三键请求体断言）+ 真机 2 次（8s / 11.7s） |
 | ㉗ | size 直传 + 非法 400 透传 | 🟢 | e2e ㉗ + 真机 svc_image_bad（"99999x99999" → 400 message 透传） |
 | ㉘ | quality → not_applied | ⚫ | Q1=A：quality 参数已删（meta 不再出现该字段） |
 | ㉙ | batch 部分成功（requested/delivered） | 🟢 | e2e ㉙（1 成 1 败 → 1 URL + delivered=1/4 拆分调用数） |
 
-### E. Agnes 视频（V2 新增）
+### E. 上游服务提供方 视频（V2 新增）
 
 | # | 验收项 | 结论 | 证据指针 |
 |---|---|---|---|
@@ -115,7 +116,7 @@ python scripts/live_check.py --only svc_video   # 真机视频（上游队列满
 
 | 案例 | 结果 | 证据 |
 |---|---|---|
-| A · D2 ratio 生图：generate_image(size="2K", ratio="16:9") | ✅ 11.7s | URL 真实生成；meta：`model=agnes-image size=2K ratio=16:9 url_expires=1h`（A_ratio_image, run 15:43） |
+| A · D2 ratio 生图：generate_image(size="2K", ratio="16:9") | ✅ 11.7s | URL 真实生成；meta：`model=image size=2K ratio=16:9 url_expires=1h`（A_ratio_image, run 15:43） |
 | B · D3+D4 seed+21:9 视频：generate_video(seed=42, aspect_ratio="21:9", seconds=4) | ✅ 上游接受 | 直连提交 200（6.1s）：请求体 seed=42 + aspect_ratio=21:9 + seconds="4" 无 400；task_id 返回。**上游成功出片闭环见 3.2** |
 | C · D4 边界：aspect_ratio="5:4"（非六档） | ✅ | `[error] invalid_params retry=fixthenretry` + 六档提示文案（零配额消耗） |
 
@@ -125,8 +126,8 @@ python scripts/live_check.py --only svc_video   # 真机视频（上游队列满
 |---|---|---|
 | 提交 POST /v1/videos | ✅ | 200（6.1s），响应含 id/video_id/task_id **三字段同值**（字段名疑云定案：任取其一皆可，实现取 task_id） |
 | 状态机 | ✅ | queued → **in_progress**（progress=10）→ …；官方枚举外加中间态 in_progress 实证，服务端轮询终止条件不变（completed/failed） |
-| 查询 GET /agnesapi?video_id&model_name | ✅ | 200，顶层任务对象（无 data 容器），与实现"顶层优先"解析匹配 |
-| completed + url 下载 | ✅ **完整闭环** | 15:56 completed（progress=100）→ URL `…/videos/agnes-video-2.5/task_….mp4` HEAD 实测 **HTTP 200 · video/mp4 · 1,871,079 B**；全程：提交 6.1s → queued → in_progress(10) → completed，总耗时约 8 分钟（免费队列渲染慢，非服务端问题） |
+| 查询 GET /v1/videos/query?video_id&model_name | ✅ | 200，顶层任务对象（无 data 容器），与实现"顶层优先"解析匹配 |
+| completed + url 下载 | ✅ **完整闭环** | 15:56 completed（progress=100）→ URL `…/videos/video-2.5/task_….mp4` HEAD 实测 **HTTP 200 · video/mp4 · 1,871,079 B**；全程：提交 6.1s → queued → in_progress(10) → completed，总耗时约 8 分钟（免费队列渲染慢，非服务端问题） |
 
 ### 3.3 503/429 真机契约（run 940f34fed195，6 次提交尝试）
 
@@ -140,7 +141,7 @@ python scripts/live_check.py --only svc_video   # 真机视频（上游队列满
 
 | # | 级别 | 缺陷 | 处置 |
 |---|---|---|---|
-| D-01 | **非阻塞**（测试断言过时，行为无 bug） | e2e ㉑ 场景仍按默认 30s 档设计（挂 31s 期望 read 先响）；D5 已将 TIMEOUT_AGNES_IMAGE_SEC 调至 60，31s 挂起在窗口内首次即成功（calls=1），断言 calls==2 失败 | **验收轮当场修复**：场景显式注入 `TIMEOUT_AGNES_IMAGE_SEC=20` + 挂 21s，回归"read 档先响 + 重试 1 次"语义，不耦合全局默认值；单独复跑 PASS（20.8s / calls=2）。修复仅动 e2e 场景参数，零实现代码改动，424 单测复跑全绿 |
+| D-01 | **非阻塞**（测试断言过时，行为无 bug） | e2e ㉑ 场景仍按默认 30s 档设计（挂 31s 期望 read 先响）；D5 已将 TIMEOUT_UPSTREAM_IMAGE_SEC 调至 60，31s 挂起在窗口内首次即成功（calls=1），断言 calls==2 失败 | **验收轮当场修复**：场景显式注入 `TIMEOUT_UPSTREAM_IMAGE_SEC=20` + 挂 21s，回归"read 档先响 + 重试 1 次"语义，不耦合全局默认值；单独复跑 PASS（20.8s / calls=2）。修复仅动 e2e 场景参数，零实现代码改动，424 单测复跑全绿 |
 
 **阻塞级缺陷：0。**
 
@@ -151,8 +152,8 @@ python scripts/live_check.py --only svc_video   # 真机视频（上游队列满
 | # | 交付物 | 存在 | V2 最终口径同步 |
 |---|---|---|---|
 | 1 | 源码（app/engine/infra/ops 四层） | ✅ | 12 模块 + 424 单测；tool.py 五参数生图（prompt/size/ratio/batch_size/persist）+ 五参数视频（prompt/seconds/aspect_ratio/seed/persist）+ 单参 query_video |
-| 2 | .env（Key 唯一替换点） | ✅ | AGNES_TOKEN/MCPACCESS_TOKEN 双令牌 + "唯一替换点"注释（用户 14:46 指示落地）；600 权限待部署侧确认 |
-| 3 | config.example.env | ✅ | 占位符无密钥；TIMEOUT_AGNES_IMAGE_SEC=60（D5）、VIDEO_POLL_INTERVAL_SEC=2（D7）已同步 |
+| 2 | .env（Key 唯一替换点） | ✅ | UPSTREAM_TOKEN/MCPACCESS_TOKEN 双令牌 + "唯一替换点"注释（用户 14:46 指示落地）；600 权限待部署侧确认 |
+| 3 | config.example.env | ✅ | 占位符无密钥；TIMEOUT_UPSTREAM_IMAGE_SEC=60（D5）、VIDEO_POLL_INTERVAL_SEC=2（D7）已同步 |
 | 4 | systemd 单元（mcp-imagegen.service） | ✅ | EnvironmentFile + ExecStartPre --check 门禁；TimeoutStopSec 220 |
 | 5 | 安装说明（install.md） | ✅ | D5/D7 调整注明来源；变量表全量同步 |
 | 6 | Agent 配置片段（agent-config.md） | ✅ | 三工具参数表（ratio 八档/aspect_ratio 六档/seed）+ meta 契约 + 视频 running 续查语义完整 |

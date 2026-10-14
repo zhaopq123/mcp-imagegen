@@ -6,7 +6,7 @@
 - 在途排空：uvicorn 等待既有连接完成（timeout_graceful_shutdown=
   TimeoutStopSec=220 强制上限）；本协调器维护在途计数，停机开始时发
   sd_notify STOPPING=1 并打点日志，供排空对账；
-- 资源收尾（lifespan shutdown 阶段执行）：AgnesClient.aclose()
+- 资源收尾（lifespan shutdown 阶段执行）：服务提供方网关 aclose()
   （排空每日重建遗留）+ PersistService.aclose()。
 
 不做：强杀（systemd TimeoutStopSec 之后 SIGKILL 的事）。

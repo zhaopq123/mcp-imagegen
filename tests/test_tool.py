@@ -30,31 +30,36 @@ from fastmcp import FastMCP  # noqa: E402
 
 # A1″ 重新冻结快照（D2 定案：A1′ 原文 + size/ratio 语义句；冻结基准）
 SPEC_TOOL_DESCRIPTION = (
-    "Generate images from a text prompt using agnes-image-2.5-flash. "
-    "Supports batch generation (split into sequential calls server-side). "
-    "size accepts a tier (1K/2K/3K/4K) or a WxH value like 1024x768; "
-    "ratio (e.g. 16:9) may only be set alongside a tiered size, never "
-    "with WxH. image: optional reference image(s) for image-to-image "
-    "editing or multi-image composition — accept a public URL, a data "
-    "URI/base64, or this server's own artifact name or /files/<name> "
-    "URL. NOTE: upstream image URLs are short-lived; set persist=true "
-    "to get a durable self-hosted URL."
+    "Generate images from a text prompt using the configured image "
+    "provider. Supports batch generation (split into sequential calls"
+    " server-side). size accepts a tier (1K/2K/3K/4K) or a WxH value "
+    "like 1024x768; ratio (e.g. 16:9) may only be set alongside a "
+    "tiered size, never with WxH. provider: optional id of a "
+    "configured upstream service to use for this call (omit it to let"
+    " the server route by priority). image: optional reference "
+    "image(s) for image-to-image editing or multi-image composition —"
+    " accepts a public URL, a data URI/base64, or this server's own "
+    "artifact name or /files/<name> URL. NOTE: upstream image URLs "
+    "are short-lived; set persist=true to get a durable self-hosted "
+    "URL."
 )
 
 # 规格书 2.2 原文快照（A2′；V2 六节明文沿用零改动；en-dash = U+2013）
 SPEC_TOOL_DESCRIPTION_VIDEO = (
-    "Generate a short video (4\u201312 seconds) from a text prompt using "
-    "agnes-video-2.5-flash. Waits synchronously within the time budget; "
-    "if the task is still running at deadline, returns a task_id which "
-    "can be polled via the query_video tool. Returns video URL on "
-    "success. first_frame/last_frame: optional keyframe images (use "
-    "first_frame to animate this image as the real first frame); "
-    "reference_images: optional style/content references (re-composes). "
-    "Each accepts a public URL, data URI/base64, or this server's own "
-    "artifact name or /files/<name> URL. When the upstream queue is "
-    "full the server queues the submission and returns a task_id with "
-    "status=queued. NOTE: set persist=true for a durable URL (upstream "
-    "URLs are short-lived)."
+    "Generate a short video (4–12 seconds) from a text prompt using "
+    "the configured video provider. Waits synchronously within the "
+    "time budget; if the task is still running at deadline, returns a"
+    " task_id which can be polled via the query_video tool. Returns "
+    "video URL on success. provider: optional id of a configured "
+    "upstream service to use for this call (omit it to let the server"
+    " route by priority). first_frame/last_frame: optional keyframe "
+    "images (use first_frame to animate this image as the real first "
+    "frame); reference_images: optional style/content references "
+    "(re-composes). Each accepts a public URL, data URI/base64, or "
+    "this server's own artifact name or /files/<name> URL. When the "
+    "upstream queue is full the server queues the submission and "
+    "returns a task_id with status=queued. NOTE: set persist=true for"
+    " a durable URL (upstream URLs are short-lived)."
 )
 
 # 规格书 2.3 原文快照（A3′；该段单下划线未经吞蚀，逐字符照录）
@@ -131,8 +136,9 @@ def test_tool_description_constant_is_source():
 def test_a1_double_prime_inherits_a1_prime_prefix():
     """A1″ 血统断言：A1′ 原文三句逐字保留（只在 NOTE 前插入 D2 句）。"""
     assert SPEC_TOOL_DESCRIPTION.startswith(
-        "Generate images from a text prompt using agnes-image-2.5-flash. "
-        "Supports batch generation (split into sequential calls server-side). "
+        "Generate images from a text prompt using the configured image "
+        "provider. Supports batch generation (split into sequential calls "
+        "server-side). "
     )
     assert SPEC_TOOL_DESCRIPTION.endswith(
         "NOTE: upstream image URLs are short-lived; set persist=true to "
@@ -163,13 +169,13 @@ def test_tool_names_unchanged():
 
 
 def test_tool_params_exact():
-    """V4：工具参数面包含生图参考图、视频首尾帧与参考图。"""
+    """V4/V5：工具参数面包含生图参考图、视频首尾帧与参考图、显式 provider。"""
     assert tool.TOOL_PARAMS == (
-        "prompt", "size", "ratio", "batch_size", "persist", "image",
+        "prompt", "size", "ratio", "batch_size", "persist", "image", "provider",
     )
     assert tool.TOOL_PARAMS_VIDEO == (
         "prompt", "seconds", "aspect_ratio", "seed", "persist",
-        "first_frame", "last_frame", "reference_images",
+        "first_frame", "last_frame", "reference_images", "provider",
     )
     assert tool.TOOL_PARAMS_QUERY == ("task_id",)
     assert tool.TOOL_PARAMS_LIST == ("limit",)
@@ -304,10 +310,12 @@ def test_generate_video_params_passthrough():
     assert set(call.keys()) == {
         "prompt", "seconds", "aspect_ratio", "seed", "persist_flag",
         "first_frame", "last_frame", "reference_images", "http_headers",
+        "provider",
     }
     assert call["first_frame"] is None
     assert call["last_frame"] is None
     assert call["reference_images"] is None
+    assert call["provider"] is None          # V5：不传 = 走服务端路由
     assert call["http_headers"] is None     # 测试无 HTTP 上下文 → None
 
 

@@ -1,5 +1,6 @@
 # MCP 图片生成 Server · 开发设计方案
 
+> **历史存档**：本文是 V2 阶段的设计/验收记录。V5 起上游已改为「服务提供方」可由用户自行配置，代码与文档不再绑定任何厂商；以 [README](README.md) 为准。
 | 项 | 内容 |
 |---|---|
 | 文档版本 | V1.0 |
@@ -15,7 +16,7 @@
 
 ### 1.1 目标与场景（一段话）
 
-单 Agent 调用方（自用）通过 MCP 协议调用 `generate_image(prompt, …)` 一个工具，Server 背后接硅基流动两个免费模型（Kolors + FLUX.1-schnell），自动完成模型选择、参数归一、故障兜底、超时预算、僵死自愈。最坏情况是"几张图没生成，重试即可"——一切设计投入与该故障代价成正比（规格书十二节）。
+单 Agent 调用方（自用）通过 MCP 协议调用 `generate_image(prompt, …)` 一个工具，Server 背后接另一家上游两个免费模型（Kolors + FLUX.1-schnell），自动完成模型选择、参数归一、故障兜底、超时预算、僵死自愈。最坏情况是"几张图没生成，重试即可"——一切设计投入与该故障代价成正比（规格书十二节）。
 
 ### 1.2 五大支柱 → 模块承接映射
 
@@ -24,7 +25,7 @@
 | 归一 | Agent 永不见模型专属参数（steps/guidance 被翻译掉） | `engine/normalizer.py` |
 | 路由 | 显式指定 > 熔断绕开 > quality 强制 > 语言检测 > 默认 | `engine/router.py` + `infra/circuit.py` |
 | 兜底 | "切模型会好吗？"会→切，不会→不切；降级出图优于报错 | `engine/fallback.py` + `engine/errors.py` |
-| 预算 | 200s deadline 贯穿传递，快慢分道，余额不足不兜底 | `infra/budget.py` + `infra/siliconflow.py` |
+| 预算 | 200s deadline 贯穿传递，快慢分道，余额不足不兜底 | `infra/budget.py` + `infra/upstream_b.py` |
 | 自愈 | watchdog 心跳防僵死 + 熔断三态防撞墙 + 优雅停机防误杀 | `ops/liveness.py` + `ops/shutdown.py` + `infra/circuit.py` |
 
 ### 1.3 一条请求的生命周期（主时序，对应规格书 3.3）
@@ -67,7 +68,7 @@ mcp-imagegen/
 │   ├── fallback.py        # 兜底决策：切不切、切换标记、仅 1 次约束
 │   └── errors.py          # 九类错误分类 + 切换/retry 矩阵（纯查表，无副作用）
 ├── infra/                 # ── 基础设施（碰网络/状态）──
-│   ├── siliconflow.py     # httpx 客户端：Limits 10/4、四段超时、动态 read、每日重建热切换
+│   ├── upstream_b.py     # httpx 客户端：Limits 10/4、四段超时、动态 read、每日重建热切换
 │   ├── circuit.py         # 熔断三态：硬 10min / 软 5min / 半开探针；内存态不落盘
 │   ├── budget.py          # Deadline 对象 + 并发槽封装（finally 归还纪律的唯一实现点）
 │   └── persist.py         # 图片下载转存（30s，永不报错）+ 磁盘水位检查
@@ -91,9 +92,9 @@ mcp-imagegen/
 | `app/pipeline.py` | 按序编排、阶段耗时打点、整体 asyncio 超时 | 单步实现细节 | 3.3 |
 | `engine/router.py` | 5 步路由链决策，输出模型+决策来源（供日志） | 熔断状态维护、API 调用 | 3.1 |
 | `engine/normalizer.py` | quality→steps/guidance 映射、size 吸附、CJK 比例计算 | 模型选择 | 3.2 |
-| `engine/fallback.py` | 收到错误后"切不切"的裁决与切换计数 | 重试（重试在 siliconflow 层） | 3.3、4.1 |
+| `engine/fallback.py` | 收到错误后"切不切"的裁决与切换计数 | 重试（重试在 另一家上游 层） | 3.3、4.1 |
 | `engine/errors.py` | HTTP 状态/异常 → 九类之一 + retry 字段 | 任何处理动作 | 4.1 |
-| `infra/siliconflow.py` | API 调用、连接池纪律、动态超时、退避重试 1 次、每日重建 | 错误分类（交 errors.py） | 三、五、6.2 |
+| `infra/upstream_b.py` | API 调用、连接池纪律、动态超时、退避重试 1 次、每日重建 | 错误分类（交 errors.py） | 三、五、6.2 |
 | `infra/circuit.py` | 三态流转、硬/软计时、半开探针标记 | 路由决策（只被查询/写入） | 4.2 |
 | `infra/budget.py` | Deadline 剩余计算、信号量 acquire/finally-release | 分档上限数值（来自 config） | 3.3、五 |
 | `infra/persist.py` | 下载落盘、/files URL、水位检查 | **报错（永不）**、自动删图 | 3.3、6.2 |
@@ -111,7 +112,7 @@ app/tool.py → app/pipeline.py → engine/router.py   → infra/circuit.py（�
                             → engine/normalizer.py
                             → engine/fallback.py   → infra/circuit.py（写入）
                             → engine/errors.py
-                            → infra/siliconflow.py → infra/budget.py（读剩余）
+                            → infra/upstream_b.py → infra/budget.py（读剩余）
                             → infra/persist.py
                             → infra/budget.py（acquire/release）
           → app/contract.py（被 pipeline 调用做格式化）
@@ -146,7 +147,7 @@ ops/liveness.py、ops/shutdown.py → server.py 事件循环注册（心跳协�
 | 阶段 | 内容 | 负责人 | 建议工期 | 里程碑出口 |
 |---|---|---|---|---|
 | S1 | 项目骨架 + 依赖清单 | Ethan | 0.5d | 空服务可启动，配置自检通过 |
-| S2 | 硅基客户端内核 | Ethan | 2d | 内核单测全绿（mock 上游） |
+| S2 | 另一家上游客户端内核 | Ethan | 2d | 内核单测全绿（mock 上游） |
 | S3 | MCP 层 | Ethan | 1.5d | Inspector 可连通调通 |
 | S4 | 部署交付物 | Ethan(单元/env) + Leo(文档) | 0.5d | 五件套齐备 |
 | S5 | 22 项验收 | Ethan 执行 + 芳复核 | 1d | 验收报告（22/22） |
@@ -160,12 +161,12 @@ ops/liveness.py、ops/shutdown.py → server.py 事件循环注册（心跳协�
 | S1.1 | 仓库结构（2.1 节）、依赖清单（fastmcp / httpx / sdnotify 或等价 / pytest / py-spy 列入部署文档预装） | 可 git 管理的项目骨架 | 基础（支撑全部） |
 | S1.2 | `config.py`：第七节全部变量（名与默认值**原样**）、必填缺失 fail-fast、启动打印嵌套不等式自检（read ≤ 分档 ≤ 200 < 210 建议 < 220，违例拒绝启动） | 配置模块 + config.example.env 雏形 | 支撑⑳⑲ |
 
-### 3.2 阶段 S2：硅基客户端内核（Ethan，对应规格书实施顺序第 2 步）
+### 3.2 阶段 S2：另一家上游客户端内核（Ethan，对应规格书实施顺序第 2 步）
 
 | 任务 | 内容 | 产出物 | 验收映射 |
 |---|---|---|---|
 | S2.1 | `budget.py`：Deadline 对象 + 并发槽 context manager（finally 归还、等待 30s 计入预算、到点返 busy） | 模块 + 单测 | ⑲㉑ E4 E5 |
-| S2.2 | `siliconflow.py`：httpx 客户端（Limits 10/4；connect/write/pool=5s；read=动态 min(分档, 剩余)；keep-alive 25s）；5xx/网络退避重试 1 次（0.25–1s 指数+全抖动，尊重 Retry-After）；每日重建指针热切换 | 模块 + 单测 | ⑳⑯ E6 |
+| S2.2 | `upstream_b.py`：httpx 客户端（Limits 10/4；connect/write/pool=5s；read=动态 min(分档, 剩余)；keep-alive 25s）；5xx/网络退避重试 1 次（0.25–1s 指数+全抖动，尊重 Retry-After）；每日重建指针热切换 | 模块 + 单测 | ⑳⑯ E6 |
 | S2.3 | `normalizer.py`：quality 归一表（draft 15步 / standard 20步+guidance7.5 / high 25步+guidance7.5；schnell 恒 4 步）；size 就近吸附档位表；CJK≥30% 检测；schnell 静默丢 guidance | 模块 + 单测（表驱动） | ②③⑤ 间接 |
 | S2.4 | `circuit.py`：三态流转（硬 600s/软 300s 可配）；半开仅放行第一个请求带探针标记；软熔断连败 2 次、成功清零；纯内存态 | 模块 + 单测（状态机全路径） | ⑨⑪ E8 4.2 |
 | S2.5 | `router.py`：路由链①显式→②熔断→③high→④CJK→⑤默认（含 E1：熔断优先于 quality；E2：显式绕过熔断、失败刷新熔断；draft+中文按第六节 Q1 确认结果实现） | 模块 + 单测（路由链真值表） | ②③④⑤ E1 E2 |
@@ -253,7 +254,7 @@ ops/liveness.py、ops/shutdown.py → server.py 事件循环注册（心跳协�
 
 - **走样后果**：图已生成、额度已花，persist 内部异常（磁盘满/网络/权限）若冒泡到顶层 → 整个请求变 [error]，白花钱且违背"降级出图优于报错"。
 - **防错手段**：
-  1. persist 整体 try/except Exception，就地转：WARN 日志 + 硅基原始 URL + meta 加 `persist_failed`；
+  1. persist 整体 try/except Exception，就地转：WARN 日志 + 另一家上游原始 URL + meta 加 `persist_failed`；
   2. 下载超时独立 30s 且取 min(30s, deadline 剩余)（E7）；
   3. 注意停机交互：优雅停机排空窗口内，在途请求的 persist 应被允许完成（排空 ≤220s 覆盖）；
   4. 磁盘水位超线 → WARN 日志 + meta 提示（**不自动删图**，删图是危险动作）。
@@ -290,7 +291,7 @@ ops/liveness.py、ops/shutdown.py → server.py 事件循环注册（心跳协�
 
 - **走样后果**：Agent 读 retry 字段决定动作——分类错一个，Agent 行为就错一个（如把上游 401 当可重试 → 无限撞墙）。
 - **防错手段**：
-  1. **双层鉴权严格区分**：MCP 层 401（MCPACCESS_TOKEN，找管理员）≠ 上游 401/403（SILICONFLOWTOKEN，服务器配置错）——两者都 retry=no，但 category 与 suggestion 不同；
+  1. **双层鉴权严格区分**：MCP 层 401（MCPACCESS_TOKEN，找管理员）≠ 上游 401/403（UPSTREAM_B_TOKEN，服务器配置错）——两者都 retry=no，但 category 与 suggestion 不同；
   2. 422 = 归一层 bug 的信号通道（报错码反馈给开发者，不切换不重试）；
   3. errors.py 做成纯查表 + 参数化单测逐行对照 4.1 矩阵（9 类 × 切换 × retry 全断言）。
 
@@ -336,7 +337,7 @@ ops/liveness.py、ops/shutdown.py → server.py 事件循环注册（心跳协�
 | B2 | API 分档：schnell 30s（任意 batch）/ Kolors 60s（batch 1–2）/ Kolors 120s（batch 3–4） |
 | B3 | httpx 四段：connect/write/pool 5s、read 动态、keep-alive 25s、Limits 10/4 |
 | B4 | persist 下载 30s、心跳 15s、watchdog 30s、TimeoutStop 220s、硬熔断 600s、软熔断 300s |
-| B5 | 配置变量名与默认值 = 第七节总表原样（SILICONFLOWTOKEN / MCPACCESS_TOKEN / PORT 8000 / IMAGE_DIR / MAXCONCURRENCY / QUEUEWAIT_SEC / TOTALBUDGETSEC / TIMEOUTSCHNELL / TIMEOUTKOLORSSMALL / TIMEOUTKOLORS_LARGE / PERSISTTIMEOUTSEC / CIRCUITHARDSEC / CIRCUITSOFTSEC / HTTPXKEEPALIVESEC） |
+| B5 | 配置变量名与默认值 = 第七节总表原样（UPSTREAM_B_TOKEN / MCPACCESS_TOKEN / PORT 8000 / IMAGE_DIR / MAXCONCURRENCY / QUEUEWAIT_SEC / TOTALBUDGETSEC / TIMEOUTSCHNELL / TIMEOUTKOLORSSMALL / TIMEOUTKOLORS_LARGE / PERSISTTIMEOUTSEC / CIRCUITHARDSEC / CIRCUITSOFTSEC / HTTPXKEEPALIVESEC） |
 | B6 | 嵌套不等式：read ≤ 档 ≤ 200 < Agent 建议 210 < TimeoutStop 220 |
 
 ### C. 行为语义类

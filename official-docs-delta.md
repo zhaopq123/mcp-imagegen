@@ -1,5 +1,6 @@
 # MCP 图片/视频生成 Server · 官方文档对齐 Delta 定案
 
+> **历史存档**：本文是 V2 阶段的设计/验收记录。V5 起上游已改为「服务提供方」可由用户自行配置，代码与文档不再绑定任何厂商；以 [README](README.md) 为准。
 | 项 | 内容 |
 |---|---|
 | 文档版本 | V2.1（Delta，快速收敛文档） |
@@ -13,12 +14,12 @@
 ## 〇、事实底座（定案依据，编号引用）
 
 **官方文档事实**：
-- F1 生图端点 `https://api.agnes-ai.cn/v1/images/generations`（检查清单 + 全部示例双确认）；**两份文档通篇无任何 .com / 国际站表述**。
+- F1 生图端点 `https://api.example.com/v1/images/generations`（检查清单 + 全部示例双确认）；**两份文档通篇无任何 .com / 国际站表述**。
 - F2 生图 `size`：必填；推荐档位 `1K/2K/3K/4K`；兼容 `1024x768` 历史写法，但不受支持的精确尺寸"可能会被标准化"（自动映射最近档位+比例）。
 - F3 生图 `ratio`：可选，仅与档位式 size 配合；8 档 `1:1/3:4/4:3/16:9/9:16/2:3/3:2/21:9`，默认 `1:1`。
 - F4 生图参数表**无 `n`/batch 参数**；`response_format` 不得放顶层（需走 `extra_body`），我方用 url 输出无需传。
 - F5 视频提交 `POST /v1/videos`：`mode` 必填（text/keyframe/reference）；`seconds` 字符串 `"4"`–`"12"` 默认 `"5"`；`size` Flash 固定 `"720P"`（其他值 400）；`seed` integer 可选；`n` 仅支持 1。
-- F6 视频查询 `GET /agnesapi?video_id=<id>&model_name=agnes-video-2.5-flash`（不带 model_name 仅适用于 text 模式）；**官方建议 1–2s 轮询**；completed 时从顶层 `url` 取地址，`status/progress` 为准、`internal_*` 忽略。
+- F6 视频查询 `GET /v1/videos/query?video_id=<id>&model_name=example-video-1`（不带 model_name 仅适用于 text 模式）；**官方建议 1–2s 轮询**；completed 时从顶层 `url` 取地址，`status/progress` 为准、`internal_*` 忽略。
 - F7 视频仅 720P；当前限时免费（图/视频均 ¥0）。
 
 **芳本轮真机实测（2026-10-10 14:31–14:38，Key 为用户 14:46 所供）**：
@@ -27,14 +28,14 @@
 - F10 视频提交 → HTTP 503，0.24s，错误体 `{"code":"video_queue_full","message":"视频队列已满，请稍后重试 (request id: …)","data":null}`（**顶层三段格式**，与 401 的 `{"error":{…}}` 嵌套格式并存）。
 - F11 生图响应顶层含 `task_id`（`task_…` 格式），URL 路径亦内嵌——生图也有上游任务号（logline 新字段的意外来源）。
 
-**当前实现状态**（核对于 366 单测全绿基线）：BASE_URL 已是 api.agnes-ai.cn ✓；视频提交已传 mode/size ✓；seconds int→str ✓；查询路径 /agnesapi + model_name ✓。
+**当前实现状态**（核对于 366 单测全绿基线）：BASE_URL 已是 api.example.com ✓；视频提交已传 mode/size ✓；seconds int→str ✓；查询路径 /v1/videos/query + model_name ✓。
 
 ---
 
 ## 一、八项定案（每项：结论 → 依据 → 落点）
 
 ### D1 · 端点与国际站
-**结论**：`AGNES_BASE_URL` 默认值定案 `https://api.agnes-ai.cn`（已落地 ✓）；规格书中"国际站 apihub.agnes-ai.com / Key 不互通 / 可切换"（E22 相关表述）**整体删除**；`AGNES_BASE_URL` 保留为可配置项（官方若换域名只改环境变量），不做双端点自动容灾（规格书十二节本就明确不做）。
+**结论**：`UPSTREAM_BASE_URL` 默认值定案 `https://api.example.com`（已落地 ✓）；规格书中"国际站 apihub.上游-ai.com / Key 不互通 / 可切换"（E22 相关表述）**整体删除**；`UPSTREAM_BASE_URL` 保留为可配置项（官方若换域名只改环境变量），不做双端点自动容灾（规格书十二节本就明确不做）。
 **依据**：F1（文档通篇仅 .cn）；规格书"明确不做"清单。
 **落点**：config.py 已改；文档侧删 E22 表述；config.example.env 注释同步。
 
@@ -45,12 +46,12 @@
 - **冲突裁决**：`ratio` 与 WxH 式 `size` 同时出现 → `invalid_params`（官方语义"ratio 仅与档位式 size 配合"，显式冲突必须让 Agent 知道，静默忽略违反可预期原则）；
 - `batch_size` 保留：官方生图**无 n 参数**（F4），服务端拆分串行的设计正当性成立。
 **依据**：F2/F3/F4/F8/F9。
-**落点**：app/tool.py schema（description 随之更新并重新冻结——A1″）；pipeline 校验（size 格式 ∪ 档位 ∪ ratio 冲突）；agnes.py 请求体按"档位+ratio / 纯 WxH"两形态构造；normalizer/contract 的 size 语义同步。
+**落点**：app/tool.py schema（description 随之更新并重新冻结——A1″）；pipeline 校验（size 格式 ∪ 档位 ∪ ratio 冲突）；upstream.py 请求体按"档位+ratio / 纯 WxH"两形态构造；normalizer/contract 的 size 语义同步。
 
 ### D3 · 视频 seed：恢复
 **结论**：`generate_video` 恢复 `seed` 可选参数（integer，默认 None=随机，透传上游）。
 **依据**：官方公共参数表明列 `seed integer 否`（F5）——此前删除依据"上游请求体无 seed 字段"**被官方文档证伪**，按"与文档冲突以实测/文档为准"原则回滚。范围沿用规格书 0–2³¹-1（上游未标注范围，超界由上游 400 兜底并透传）。
-**落点**：tool.py schema、pipeline 校验、agnes.py payload（None 不注入）。
+**落点**：tool.py schema、pipeline 校验、upstream.py payload（None 不注入）。
 
 ### D4 · aspect_ratio：扩至 6 档
 **结论**：`16:9 / 9:16 / 1:1 / 4:3 / 3:4 / 21:9` 全量暴露（当前 3 档 → 6 档）。
@@ -58,7 +59,7 @@
 **落点**：tool.py 枚举 + description 更新（重新冻结）；pipeline 校验枚举集。
 
 ### D5 · 生图超时档：30s → 60s
-**结论**：`TIMEOUT_AGNES_IMAGE_SEC` 默认值 **60**。
+**结论**：`TIMEOUT_UPSTREAM_IMAGE_SEC` 默认值 **60**。
 **依据**：官方建议客户端超时 60–360s；真机 1K≈8s、2K≈9.2s（F8/F9），60s 给 4K 留 ~7x 余量；**不可取 360**——分档 ≤ deadline 200s 是 B6 嵌套不等式红线。
 **落点**：config.py 默认值 + 自检不等式仍满足（60 ≤ 200 ✓）；config.example.env。
 
@@ -76,13 +77,13 @@
 ### D8 · 附录 A 逐项销号/回填
 | 项 | 原内容 | 处置 |
 |---|---|---|
-| A-1 | Kolors 模型 ID 核对 | **作废**（硅基已删，随 V2 变更） |
+| A-1 | Kolors 模型 ID 核对 | **作废**（另一家上游已删，随 V2 变更） |
 | A-2 | 响应顶层 images vs data | **销号**：实锤 `data[0].url`（F8/F9 + 管理员真机）；双兼容解析保留（防御性，零成本） |
 | A-3 | 2K/4K 耗时校 30s 档 | **部分销号**：1K≈8s、2K≈9.2s（F8/F9）；**新增待测**：4K 档计时（D5 改 60s 后预计充裕） |
 | A-4 | size 值域 | **销号**：双格式直传均 200（F8/F9）；档位+ratio 定案（D2） |
 | A-5 | 轮询间隔 5s 是否下调 | **销号**：定案 2s（D7） |
-| A-6 | Agnes 国际端点 .com | **销号**：官方文档无 .com，E22 表述删除（D1） |
-| A-7 | schnell 步数上限 | **作废**（硅基已删） |
+| A-6 | 上游服务提供方 国际端点 .com | **销号**：官方文档无 .com，E22 表述删除（D1） |
+| A-7 | schnell 步数上限 | **作废**（另一家上游已删） |
 | **新增 A-8** | 视频全流程真机 | **待测**：503 队列满缓解后跑通 提交→轮询→completed→url 可访问（含 status 枚举实测、url 有效期观察） |
 
 ---
@@ -93,7 +94,7 @@
 
 **已落地**（芳执行，跨配置边界操作特此披露）：
 1. **唯一替换点 = `mcp-imagegen/.env` 文件**：
-   - `AGNES_TOKEN=` ← 换 Agnes Key 只改这一行；
+   - `UPSTREAM_TOKEN=` ← 换 上游服务提供方 Key 只改这一行；
    - `MCPACCESS_TOKEN=` ← MCP 层访问令牌（芳随机生成，可自行改掉）；
 2. `config.py` 新增 `_load_dotenv()`（纯标准库 15 行，零新依赖）：项目根存在 `.env` 则自动加载；已 export 的环境变量优先（不覆盖）；文件不存在零副作用；
 3. **本地运行**：无需 export，直接 `python server.py`；**服务器部署**：systemd 单元 `EnvironmentFile=` 直接指向同一 `.env` 文件（install.md 同步说明）——真正只换一处；
@@ -110,4 +111,4 @@
 
 ---
 
-下一步建议：Ethan 按 D2/D3/D4 改 tool/pipeline/agnes（schema 变更后 description 重新冻结并更新全等断言），D5/D6/D7 改 config 与 errors（各为小 diff）；芳在视频队列缓解后补 A-8 全流程实测并出验收结论。
+下一步建议：Ethan 按 D2/D3/D4 改 tool/pipeline/上游（schema 变更后 description 重新冻结并更新全等断言），D5/D6/D7 改 config 与 errors（各为小 diff）；芳在视频队列缓解后补 A-8 全流程实测并出验收结论。

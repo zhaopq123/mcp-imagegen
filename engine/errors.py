@@ -4,11 +4,10 @@
 任何处理动作（重试/熔断）都不在本模块。
 
 V2 变更（增量设计方案一节/三节）：
-- 删 402 分支：Agnes 无限期间免费，402 不可能出现（规格书 4.1"仅硅基侧"）；
+- 删 402 分支：该上游无限期间免费，402 不可能出现（规格书 4.1"仅另一家上游侧"）；
 - 加 task_not_found（fixthenretry）：视频任务表过期/逐出/不存在（R16）；
 - 视频失败按原因映射：video_failed_error（E19 唯一模型无切换，
   失败分类与生图共用本矩阵，retry 语义不变）；
-- 上游 401/403 注明 provider=Agnes（Agnes 侧配置错误，指向 AGNES_TOKEN）；
 - switchable 列随单 Provider 失去消费者，矩阵保留列但恒无意义
   （唯一模型无切换，E19）——列值统一 False，防旧语义残留。
 
@@ -20,8 +19,9 @@ upstream_error_message（顶层 {code,message,data} 优先、嵌套
 | 类别              | retry         | 说明                                   |
 |-------------------|---------------|----------------------------------------|
 | 参数错            | fixthenretry  | 指明哪个参数                           |
-| MCP 鉴权 401      | no            | 找管理员（MCPACCESS_TOKEN）            |
-| 上游鉴权 401/403  | no            | 服务器配置错（AGNES_TOKEN，provider=Agnes） |
+| MCP 鉴权 401      | no            | 找管理员（访问令牌）                   |
+| 上游鉴权 401/403  | no            | 服务器端配置错（服务提供方的密钥）     |
+| 未配置服务提供方  | no            | 面板里添加并启用一个提供方             |
 | 任务不存在        | fixthenretry  | 视频任务表未命中（TTL/逐出/未知）     |
 | 限流 429          | yes           | 硬熔断 10min                           |
 | 上游 5xx/超时/网络| yes           | 重试 1 次；连败 2 次软熔断 5min        |
@@ -40,8 +40,9 @@ from typing import Optional
 # --------------------------------------------------------------------------
 INVALID_PARAMS = "invalid_params"      # 参数错
 MCP_AUTH = "mcp_auth"                  # MCP 层鉴权 401（MCPACCESS_TOKEN，找管理员）
-UPSTREAM_AUTH = "upstream_auth"        # 上游鉴权 401/403（AGNES_TOKEN，provider=Agnes）
-RATE_LIMIT = "rate_limit"              # 限流 429（402 已删：Agnes 无限期间免费）
+UPSTREAM_AUTH = "upstream_auth"        # 上游鉴权 401/403（服务提供方的密钥配错了）
+NOT_CONFIGURED = "not_configured"      # 无可用服务提供方（面板里没配/全禁用）
+RATE_LIMIT = "rate_limit"              # 限流 429（402 已删：该计费模型不适用）
 UPSTREAM_ERROR = "upstream_error"       # 上游 5xx/超时/网络
 CONTENT_POLICY = "content_policy"      # 内容审核 400
 UPSTREAM_422 = "upstream_422"          # 上游 422（归一层 bug）
@@ -67,6 +68,7 @@ MATRIX: dict[str, tuple[Optional[bool], Optional[str]]] = {
     PERSIST_FAILED: (None, None),
     BUSY: (False, RETRY_YES),
     TASK_NOT_FOUND: (False, RETRY_FIX_THEN_RETRY),
+    NOT_CONFIGURED: (False, RETRY_NO),
 }
 
 
@@ -103,8 +105,8 @@ def classify_http_status(status_code: int, detail: str = "") -> ErrorInfo:
     if status_code in (401, 403):
         return _build(
             UPSTREAM_AUTH,
-            f"上游鉴权失败({status_code}, provider=Agnes)",
-            "服务器配置错误，请检查 AGNES_TOKEN",
+            f"上游鉴权失败({status_code})",
+            "服务提供方的密钥有误或已失效，请在管理面板核对",
             detail,
         )
     if status_code == 429:
@@ -186,8 +188,25 @@ def invalid_params(param: str, detail: str) -> ErrorInfo:
 
 
 def mcp_auth_error() -> ErrorInfo:
-    """MCP 层鉴权 401（Bearer MCPACCESS_TOKEN，找管理员；与上游 401 严格区分）。"""
-    return _build(MCP_AUTH, "MCP 层鉴权失败(401)", "请联系管理员检查 MCPACCESS_TOKEN")
+    """MCP 层鉴权 401（Bearer 访问令牌，找管理员；与上游 401 严格区分）。"""
+    return _build(
+        MCP_AUTH, "MCP 层鉴权失败(401)",
+        "请联系管理员确认你的访问令牌（管理面板 → 访问令牌）")
+
+
+def not_configured_error(what: str = "", detail: str = "") -> ErrorInfo:
+    """没有任何可用的服务提供方（配置缺失，retry=no）。
+
+    retry=no 是刻意的：没配好之前重试一万次也是同一个结果，让 Agent
+    拿到明确的「去配置」指引，比让它白转一圈更有用。
+    """
+    target = what or "该能力"
+    return _build(
+        NOT_CONFIGURED,
+        f"没有可用的{target}服务提供方（未配置或全部禁用）",
+        "请在管理面板 → 服务提供方 里新增一个并启用",
+        detail,
+    )
 
 
 def busy_error(waited_sec: float) -> ErrorInfo:
@@ -239,7 +258,7 @@ def circuit_open_error(retry_after_sec: float) -> ErrorInfo:
     """E24：唯一生图模型熔断 OPEN 期，auto 请求快失败（rate_limit, retry=yes）。"""
     return _build(
         RATE_LIMIT,
-        f"熔断中（provider=Agnes），约 {retry_after_sec:.0f} 秒后重试",
+        f"熔断中（目标服务提供方不可用），约 {retry_after_sec:.0f} 秒后重试",
         "稍后重试（Agent 侧 retry=yes）",
     )
 

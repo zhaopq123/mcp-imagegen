@@ -1,7 +1,7 @@
 """T6 门禁：生图流水线（单模型直调 + 拆分串行 + 部分成功契约；V2 第二轮收尾版）。
 
 覆盖（增量设计方案 V2 三节 pipeline 行 / R17 / R20 / E13 / E24 / E8）：
-- 单模型直调：auto 路由 → agnes-image，一次调用定生死（无切换）；
+- 单路由直达：auto 路由 → 当前可用的服务提供方，一次调用定生死（无切换）；
 - batch 拆分串行：batch=N → N 次顺序调用，URL 数 = M；
 - R20：每次调用前剩余 ≥ 单次档才发；不足即止 = 部分成功（非错误）；
   边界：剩余 29s 停 / 31s 发；
@@ -22,19 +22,19 @@ from conftest import FakeClock, make_config
 
 from app import pipeline as pipeline_mod
 from app.pipeline import GeneratePipeline, validate_params
-from infra import agnes as agnes_mod
+from providers import gateway as gateway_mod
 from infra import budget, circuit
 
 
 def ok_api(urls=("https://img.example/a.png",)):
-    return agnes_mod.ApiCallResult(
-        ok=True, status_code=200, model_id="agnes-image-2.5-flash", urls=urls
+    return gateway_mod.ApiCallResult(
+        ok=True, status_code=200, provider_id="image", model_id="image", urls=urls
     )
 
 
 def err_api(status=429, detail="rate limited"):
-    return agnes_mod.ApiCallResult(
-        ok=False, status_code=status, model_id="agnes-image-2.5-flash",
+    return gateway_mod.ApiCallResult(
+        ok=False, status_code=status, provider_id="image", model_id="image",
         error_detail=detail,
     )
 
@@ -47,8 +47,8 @@ class FakeApi:
         self.calls: list[dict] = []
         self.on_call = on_call
 
-    async def generate_image(self, *, model, prompt, size, deadline, ratio=None,
-                             images=None):
+    async def generate_image(self, *, model=None, prompt, size, deadline, ratio=None,
+                             images=None, provider=None):
         self.calls.append(
             {"model": model, "prompt": prompt, "size": size, "ratio": ratio,
              "images": images})
@@ -103,14 +103,14 @@ async def test_single_call_success_contract():
     lines = out.splitlines()
     assert lines[0] == "https://img/1.png"
     assert lines[1].startswith("[meta] ")
-    assert "model=agnes-image" in lines[1]
+    assert "model=image" in lines[1]
     assert "size=1024x1024" in lines[1]
     assert "url_expires=1h" in lines[1]  # E13：不 persist 短效警示
     assert "requested" not in lines[1]   # M==N：无部分成功标记
 
 
 async def test_batch_split_sequential_calls():
-    """batch=4 → 恰 4 次顺序调用（agnes-image 无原生 batch）。"""
+    """batch=4 → 恰 4 次顺序调用（image 无原生 batch）。"""
     api = FakeApi([
         ok_api((f"https://img/{i}.png",)) for i in range(4)
     ])
@@ -124,12 +124,17 @@ async def test_batch_split_sequential_calls():
     assert "requested" not in out.splitlines()[-1]  # 全成功无计数
 
 
-async def test_calls_use_alias_model_and_normalized_size():
+async def test_calls_carry_no_model_and_normalized_size():
+    """V5：模型归服务提供方配置，管道不再往上游塞 model。
+
+    旧版管道写死厂商别名（等于把"换一家 API"变成改代码），现在只把
+    prompt / size / ratio / images 交给网关，模型由面板里的 provider 决定。
+    """
     api = FakeApi([ok_api()])
     pipe, _, _ = make_pipeline(api=api)
     await pipe.run(prompt="cat", size=" 1024X1024 ", batch_size=1, persist_flag=False)
-    assert api.calls[0]["model"] == "agnes-image"
-    assert api.calls[0]["size"] == "1024x1024"  # E12：规范形式直传
+    assert api.calls[0]["model"] is None          # 管道不指定模型
+    assert api.calls[0]["size"] == "1024x1024"    # E12：规范形式直传
 
 
 # ---------------------------------------------------------------------------
@@ -258,14 +263,15 @@ async def test_circuit_open_fails_fast_with_retry_eta():
     cclock = FakeClock()
     api = FakeApi()
     pipe, cb, _ = make_pipeline(api=api, circuit_clock=cclock)
-    cb.record_failure("agnes-image", circuit.FailureKind.HARD)  # 429 → OPEN_HARD 600s
+    cb.record_failure("image", circuit.FailureKind.HARD)  # 429 → OPEN_HARD 600s
     out = await pipe.run(prompt="a cat", size="1024x1024",
                          batch_size=1, persist_flag=False)
     assert out.startswith("[error] ")
     assert "category=rate_limit" in out
     assert "retry=yes" in out
     assert "约 600" in out  # ETA 注明
-    assert "Agnes" in out
+    # V5：错误文案厂商中立（提供方由用户自己配置）
+    assert "provider=" not in out        # 厂商中立：不归属到任何一家
     assert api.calls == []  # 快失败：零 IO
 
 
@@ -274,14 +280,14 @@ async def test_circuit_open_after_expiry_half_open_probe_routes_through():
     cclock = FakeClock()
     api = FakeApi([ok_api()])
     pipe, cb, _ = make_pipeline(api=api, circuit_clock=cclock)
-    cb.record_failure("agnes-image", circuit.FailureKind.SOFT)
-    cb.record_failure("agnes-image", circuit.FailureKind.SOFT)
+    cb.record_failure("image", circuit.FailureKind.SOFT)
+    cb.record_failure("image", circuit.FailureKind.SOFT)
     cclock.advance(301)  # 软 300s 到期 → HALF_OPEN
     out = await pipe.run(prompt="a cat", size="1024x1024",
                          batch_size=1, persist_flag=False)
     assert "https://img.example/a.png" in out
     assert len(api.calls) == 1
-    assert cb.snapshot()["agnes-image"] == "CLOSED"  # 探针成功复位
+    assert cb.snapshot()["image"] == "CLOSED"  # 探针成功复位
 
 
 async def test_probe_not_sent_returns_grant():
@@ -299,8 +305,8 @@ async def test_probe_not_sent_returns_grant():
         api=api, circuit_clock=cclock, clock=dclock,
         cfg=make_config(MAXCONCURRENCY=1),
     )
-    cb.record_failure("agnes-image", circuit.FailureKind.SOFT)
-    cb.record_failure("agnes-image", circuit.FailureKind.SOFT)
+    cb.record_failure("image", circuit.FailureKind.SOFT)
+    cb.record_failure("image", circuit.FailureKind.SOFT)
     cclock.advance(301)  # HALF_OPEN → route() probe=True
 
     hold = budget.Deadline(50.0)
@@ -316,7 +322,7 @@ async def test_probe_not_sent_returns_grant():
     assert out.startswith("[error] ")           # M=0 → 错误路径（R17）
     assert "category=upstream_error" in out     # deadline 耗尽类
     assert api.calls == []                       # 从未发出调用（R20 即止）
-    assert cb.snapshot()["agnes-image"] == "HALF_OPEN"  # 状态未终结
+    assert cb.snapshot()["image"] == "HALF_OPEN"  # 状态未终结
 
     # 归还后：下一请求（复用同一熔断表）仍可获探针资格 → 成功解除熔断
     d2 = FakeClock()
@@ -327,7 +333,7 @@ async def test_probe_not_sent_returns_grant():
     out2 = await pipe2.run(prompt="a cat", size="1024x1024",
                            batch_size=1, persist_flag=False)
     assert out2.startswith("https://img")              # 探针成功
-    assert cb.snapshot()["agnes-image"] == "CLOSED"    # 成功 → 熔断解除
+    assert cb.snapshot()["image"] == "CLOSED"    # 成功 → 熔断解除
 
 
 # ---------------------------------------------------------------------------
@@ -338,7 +344,7 @@ async def test_429_writes_hard_circuit():
     pipe, cb, _ = make_pipeline(api=api)
     await pipe.run(prompt="a cat", size="1024x1024",
                    batch_size=1, persist_flag=False)
-    assert cb.snapshot().get("agnes-image") == "OPEN_HARD"
+    assert cb.snapshot().get("image") == "OPEN_HARD"
 
 
 async def test_5xx_writes_soft_failure():
@@ -346,7 +352,7 @@ async def test_5xx_writes_soft_failure():
     pipe, cb, _ = make_pipeline(api=api)
     await pipe.run(prompt="a cat", size="1024x1024",
                    batch_size=1, persist_flag=False)
-    assert cb.snapshot().get("agnes-image") == "CLOSED"  # 1 次未达连败 2
+    assert cb.snapshot().get("image") == "CLOSED"  # 1 次未达连败 2
 
 
 async def test_content_policy_400_does_not_write_circuit():
@@ -363,7 +369,7 @@ async def test_success_resets_consecutive_failures():
     out = await pipe.run(prompt="a cat", size="1024x1024",
                          batch_size=2, persist_flag=False)
     assert "requested=2" in out and "delivered=1" in out
-    assert cb.snapshot().get("agnes-image") == "CLOSED"
+    assert cb.snapshot().get("image") == "CLOSED"
 
 
 # ---------------------------------------------------------------------------
@@ -484,7 +490,7 @@ async def test_logline_emitted_once_with_fields(caplog):
     access = [r for r in caplog.records if r.name == "mcp_imagegen.access"]
     assert len(access) == 1
     rendered = access[0].getMessage()
-    for field in ("req_id=", "prompt_hash=", "route=auto", "model=agnes-image",
+    for field in ("req_id=", "prompt_hash=", "route=auto", "model=image",
                   "result=ok", "total="):
         assert field in rendered, rendered
     assert "quality=" not in rendered  # V2：参数摘要不含已删参数

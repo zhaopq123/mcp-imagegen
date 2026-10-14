@@ -20,7 +20,7 @@ from conftest import FakeClock, make_config
 
 import app.video_pipeline as vp_mod
 from app.video_pipeline import VideoPipeline
-from infra import agnes as agnes_mod
+from providers import gateway as gateway_mod
 from infra import budget as budget_mod
 from infra import tasks as tasks_mod
 
@@ -28,27 +28,27 @@ ERROR_PREFIX = chr(91) + "error] "
 META_PREFIX = chr(91) + "meta] "
 
 
-def submit_ok(video_id: str = "vid-ok") -> agnes_mod.ApiCallResult:
-    return agnes_mod.ApiCallResult(
-        ok=True, status_code=200, model_id="agnes-video-2.5-flash",
+def submit_ok(video_id: str = "vid-ok") -> gateway_mod.ApiCallResult:
+    return gateway_mod.ApiCallResult(
+        ok=True, status_code=200, provider_id="video", model_id="video",
         video_id=video_id)
 
 
-def rate_limited(retry_after: float | None = 30.0) -> agnes_mod.ApiCallResult:
-    return agnes_mod.ApiCallResult(
-        ok=False, status_code=429, model_id="agnes-video-2.5-flash",
+def rate_limited(retry_after: float | None = 30.0) -> gateway_mod.ApiCallResult:
+    return gateway_mod.ApiCallResult(
+        ok=False, status_code=429, provider_id="video", model_id="video",
         retry_after=retry_after, error_detail="rate limit exceeded")
 
 
-def queue_full() -> agnes_mod.ApiCallResult:
-    return agnes_mod.ApiCallResult(
-        ok=False, status_code=503, model_id="agnes-video-2.5-flash",
+def queue_full() -> gateway_mod.ApiCallResult:
+    return gateway_mod.ApiCallResult(
+        ok=False, status_code=503, provider_id="video", model_id="video",
         error_detail="video_queue_full: 队列已满")
 
 
-def auth_denied() -> agnes_mod.ApiCallResult:
-    return agnes_mod.ApiCallResult(
-        ok=False, status_code=401, model_id="agnes-video-2.5-flash",
+def auth_denied() -> gateway_mod.ApiCallResult:
+    return gateway_mod.ApiCallResult(
+        ok=False, status_code=401, provider_id="video", model_id="video",
         error_detail="invalid token")
 
 
@@ -61,9 +61,9 @@ class ScriptedSubmitApi:
         self.query_calls: list[dict] = []
         self.query_result = query_result
 
-    async def submit_video(self, *, model, prompt, seconds, aspect_ratio,
+    async def submit_video(self, *, model=None, prompt, seconds, aspect_ratio,
                            deadline, seed=None, mode="text", first_frame=None,
-                           last_frame=None, reference_images=None):
+                           last_frame=None, reference_images=None, provider=None):
         self.submit_calls.append({"mode": mode, "first_frame": first_frame})
         if len(self.submit_script) > 1:
             item = self.submit_script.pop(0)
@@ -73,10 +73,10 @@ class ScriptedSubmitApi:
             raise item
         return item
 
-    async def query_video(self, *, video_id, model, deadline):
+    async def query_video(self, *, video_id, model=None, deadline, provider=None):
         self.query_calls.append({"video_id": video_id})
         if self.query_result is None:
-            return agnes_mod.ApiCallResult(
+            return gateway_mod.ApiCallResult(
                 ok=True, status_code=200, model_id=model,
                 video_status="completed", video_url="http://x/v.mp4")
         return self.query_result
@@ -135,7 +135,7 @@ async def test_worker_retries_429_then_submit_succeeds():
     """429 → 按 Retry-After 退避 → 重试 → 第三次提交成功 → 转轮询到 completed。"""
     ns = make_ns([rate_limited(retry_after=30.0), rate_limited(retry_after=30.0),
                   submit_ok("vid-after-429")],
-                 query_result=agnes_mod.ApiCallResult(
+                 query_result=gateway_mod.ApiCallResult(
                      ok=True, status_code=200, model_id="m",
                      video_status="completed", video_url="http://x/v.mp4"))
     out = await run_default(ns)
@@ -257,17 +257,17 @@ def test_is_retryable_submit_covers_429_and_queue_full_only():
     assert f(rate_limited(retry_after=None)) is True
     assert f(queue_full()) is True
     assert f(auth_denied()) is False
-    assert f(agnes_mod.ApiCallResult(
+    assert f(gateway_mod.ApiCallResult(
         ok=False, status_code=500, error_detail="internal")) is False
     # 503 但不是队列满（如网关维护）→ 不拖进排队
-    assert f(agnes_mod.ApiCallResult(
+    assert f(gateway_mod.ApiCallResult(
         ok=False, status_code=503, error_detail="gateway maintenance")) is False
 
 
 def test_is_queue_full_requires_503_with_queue_marker():
     f = VideoPipeline._is_queue_full
     assert f(queue_full()) is True
-    assert f(agnes_mod.ApiCallResult(
+    assert f(gateway_mod.ApiCallResult(
         ok=False, status_code=503, error_detail="busy")) is False
-    assert f(agnes_mod.ApiCallResult(
+    assert f(gateway_mod.ApiCallResult(
         ok=False, status_code=429, error_detail="video_queue_full")) is False

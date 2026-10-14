@@ -26,12 +26,12 @@ from app import pipeline as pipeline_mod  # noqa: E402
 from app import video_pipeline as video_mod  # noqa: E402
 from config import load_config  # noqa: E402
 from engine import errors as errors_mod  # noqa: E402
-from infra import agnes as agnes_mod  # noqa: E402
+from providers import gateway as gateway_mod  # noqa: E402
 from infra import budget as budget_mod  # noqa: E402
 from infra import circuit as circuit_mod  # noqa: E402
 from infra import tasks as tasks_mod  # noqa: E402
 
-BASE_ENV = {"MCPACCESS_TOKEN": "t", "AGNES_TOKEN": "a"}
+BASE_ENV = {"MCPACCESS_TOKEN": "t", "UPSTREAM_TOKEN": "a"}
 
 
 def cfg_of(**over):
@@ -119,8 +119,8 @@ class ConcurrencyRecordingApi:
         self.calls: list[int] = []
         self._seq = 0
 
-    async def generate_image(self, *, model, prompt, size, deadline, ratio=None,
-                             images=None):
+    async def generate_image(self, *, model=None, prompt, size, deadline, ratio=None,
+                             images=None, provider=None):
         idx = self._seq
         self._seq += 1
         self.now += 1
@@ -129,10 +129,10 @@ class ConcurrencyRecordingApi:
         await asyncio.sleep(self.delay)
         self.now -= 1
         if idx in self.fail_index:
-            return agnes_mod.ApiCallResult(
+            return gateway_mod.ApiCallResult(
                 ok=False, status_code=500, model_id="m",
                 error_detail="boom")
-        return agnes_mod.ApiCallResult(
+        return gateway_mod.ApiCallResult(
             ok=True, status_code=200, model_id="m",
             urls=(f"https://img/{idx}.png",))
 
@@ -206,22 +206,22 @@ class ScriptedVideoApi:
         self.query_calls: list[str] = []
         self.submit_calls: list[dict] = []
 
-    async def submit_video(self, *, model, prompt, seconds, aspect_ratio,
+    async def submit_video(self, *, model=None, prompt, seconds, aspect_ratio,
                            deadline, seed=None, mode="text", first_frame=None,
-                           last_frame=None, reference_images=None):
+                           last_frame=None, reference_images=None, provider=None):
         self.submit_calls.append({"prompt": prompt, "seconds": seconds})
-        return agnes_mod.ApiCallResult(
+        return gateway_mod.ApiCallResult(
             ok=True, status_code=200, model_id="m", video_id="vid-async")
 
-    async def query_video(self, *, video_id, model, deadline):
+    async def query_video(self, *, video_id, model=None, deadline, provider=None):
         self.query_calls.append(video_id)
         item = self.script.pop(0) if self.script else {
             "status": "running"}
         if item["status"] == "completed":
-            return agnes_mod.ApiCallResult(
+            return gateway_mod.ApiCallResult(
                 ok=True, status_code=200, model_id="m",
                 video_status="completed", video_url=item.get("url"))
-        return agnes_mod.ApiCallResult(
+        return gateway_mod.ApiCallResult(
             ok=True, status_code=200, model_id="m",
             video_status=item["status"])
 
@@ -335,9 +335,10 @@ def test_video_error_category_preserved_from_worker():
     cfg = cfg_of()
 
     class RateLimitedApi(ScriptedVideoApi):
-        async def query_video(self, *, video_id, model, deadline):
+        async def query_video(self, *, video_id, model=None, deadline,
+                              provider=None):
             await asyncio.sleep(0)
-            return agnes_mod.ApiCallResult(
+            return gateway_mod.ApiCallResult(
                 ok=False, status_code=429, model_id="m",
                 error_detail="rate limited")
 

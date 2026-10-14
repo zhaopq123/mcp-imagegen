@@ -1,14 +1,14 @@
 """生图请求管道（V2 重写版；红线 E3/E4/E8/E9/E13/E24、R3/R5/R17/R20）。
 
-串联：参数校验 → 熔断门路由 → 并发槽 → Agnes 生图（拆分串行）→
+串联：参数校验 → 熔断门路由 → 并发槽 → 服务提供方生图（拆分并发）→
 persist（永不报错）→ contract 格式化 → logline 一行收尾。
 
 V2 变更（增量设计方案三节 pipeline 行）：
-- 单模型直调 agnes-image：删路由循环/切换/探针归还分支（唯一模型
-  一次调用定生死，E19）；fallback.py 删除，finalize_error 语义并入
+- 单路由直达所选服务提供方：删路由循环/切换/探针归还分支（一次调用
+  定生死，E19）；fallback.py 删除，finalize_error 语义并入
   本模块（全失败按错误路径返回最后一个错误）；
-- batch 拆分串行（agnes-image 不原生支持 batch）：n 次顺序调用，
-  **每次前检查 deadline 剩余 ≥ 单次档（TIMEOUT_AGNES_IMAGE_SEC）才发起**，
+- batch 拆分串行（生图接口通常不原生支持 batch）：n 次顺序调用，
+  **每次前检查 deadline 剩余 ≥ 单次档（TIMEOUT_UPSTREAM_IMAGE_SEC）才发起**，
   不足即止 = 部分成功，非错误（R20/E9）；单次失败不中断后续
   （预算耗尽除外）；
 - R17 部分成功契约：M<N 时 meta 必含 requested/delivered；M=0 时不
@@ -35,19 +35,22 @@ import uuid
 from typing import Callable, Mapping, Optional, Sequence, Tuple
 
 from app import contract as contract_mod
+from app import context as context_mod
 from config import BATCH_MAX, DISK_WATERMARK_RATIO, REQUEST_GUARD_SLACK_SEC, Config
 from engine import errors as errors_mod
 from engine import normalizer as normalizer_mod
 from engine import router as router_mod
-from infra import agnes as agnes_mod
 from infra import budget as budget_mod
 from infra import circuit as circuit_mod
 from infra import persist as persist_mod
 from infra import refs as refs_mod
 from ops import logline as logline_mod
 from ops import shutdown as shutdown_mod
+from providers import gateway as gateway_mod
 
 logger = logging.getLogger("mcp_imagegen.pipeline")
+
+LANE_HTTP_CALLS = "http"  # 生图阶段标记（日志 stages 用）
 
 # batch 合法区间 1–4（规格书二；schema 不硬约束，此处校验）
 # V3：常量单一出处迁至 config.BATCH_MAX（自检要用），此处保留同名导出。
@@ -143,7 +146,7 @@ class GeneratePipeline:
         cfg: Config,
         pool: budget_mod.SlotPool,
         circuit: circuit_mod.CircuitBreaker,
-        api_client: agnes_mod.AgnesClient,
+        api_client: gateway_mod.ProviderGateway,
         persist: persist_mod.PersistService,
         tracker: Optional[shutdown_mod.ShutdownCoordinator] = None,
         clock: Optional[Callable[[], float]] = None,
@@ -162,6 +165,15 @@ class GeneratePipeline:
         self._lane_name = LANE_IMAGE
 
     # ------------------------------------------------------------------
+    # 热更新（管理面板改运行参数后由 server 调用，无需重启）
+    # ------------------------------------------------------------------
+    def reconfigure(self, cfg: Config) -> None:
+        self._cfg = cfg
+        self._batch_concurrency = max(
+            1, min(int(getattr(cfg, "image_batch_concurrency", BATCH_MAX)),
+                   BATCH_MAX))
+
+    # ------------------------------------------------------------------
     # 入口
     # ------------------------------------------------------------------
     async def run(
@@ -174,8 +186,12 @@ class GeneratePipeline:
         ratio: Optional[str] = None,
         images: Optional[Sequence[str]] = None,
         http_headers: Optional[Mapping[str, str]] = None,
+        provider: Optional[str] = None,
     ) -> str:
         """单请求入口：永不抛错（CancelledError 除外），返回契约文本。
+
+        V5：provider 可选——显式指定服务提供方（优先于令牌的默认绑定）；
+        不传则按「令牌绑定 → 全局优先级路由」的顺序决定。
 
         D2：ratio 可选（None 不注入请求体；仅档位式 size 时合法）。
         V4：images 可选（参考图 → 图生图 / 多图合成；None 保持纯文生图）。
@@ -189,6 +205,7 @@ class GeneratePipeline:
                     batch_size=batch_size, persist_flag=persist_flag,
                     ratio=ratio, images=images,
                     http_headers=http_headers,
+                    provider=provider,
                 )
         except TimeoutError:
             # 护栏触发（deadline 检查应先到；此为 6.1 防御纵深）
@@ -209,7 +226,8 @@ class GeneratePipeline:
         self, *, req_id: str, prompt: str, size: str, batch_size: int,
         persist_flag: bool, ratio: Optional[str],
         images: Optional[Sequence[str]] = None,
-        http_headers: Optional[Mapping[str, str]],
+        http_headers: Optional[Mapping[str, str]] = None,
+        provider: Optional[str] = None,
     ) -> str:
         # D2：ratio 规范化——校验层宽容首尾空白（validate_ratio），
         # 透传/审计统一用清洗后的枚举原值（与 size 规范化同哲学）
@@ -265,6 +283,7 @@ class GeneratePipeline:
                         persist_flag=persist_flag, ratio=ratio,
                         images=resolved_images, ref_sources=ref_sources,
                         http_headers=http_headers,
+                        provider=provider,
                     )
             except budget_mod.LaneFullError as exc:
                 # V3：泳道排队超限 → busy（快失败，不消耗等待预算）
@@ -313,7 +332,8 @@ class GeneratePipeline:
         batch_size: int, persist_flag: bool, ratio: Optional[str],
         images: Tuple[str, ...] = (),
         ref_sources: Tuple[str, ...] = (),
-        http_headers: Optional[Mapping[str, str]],
+        http_headers: Optional[Mapping[str, str]] = None,
+        provider: Optional[str] = None,
     ) -> str:
         # ---- 3. 熔断门路由（工具层无 model 参数 = 恒 auto；E24）----
         decision = router_mod.route(None, self._circuit)
@@ -333,13 +353,16 @@ class GeneratePipeline:
         rec.model = model
         normalized_size = normalizer_mod.normalize_size(size)
 
-        # ---- 4. 拆分并发（V3：agnes-image 无原生 batch；单次 1 张，
+        # ---- 4. 拆分并发（V3：生图接口无原生 batch；单次 1 张，
         #      拆成的 n 次调用**并发**发出，并发度 = min(batch, 配置值)）----
         urls: list[str] = []
         last_error: Optional[errors_mod.ErrorInfo] = None
-        tier = self._cfg.timeout_agnes_image_sec
+        tier = self._cfg.timeout_upstream_image_sec
         call_count = 0
         probe_sent = False  # 探针是否已实际发出（发出即消费，E8）
+        # 服务提供方选择：显式指定 > 令牌绑定（多工作空间隔离）> 全局路由
+        scope = context_mod.token_scope() or {}
+        provider_hint: Optional[str] = provider or scope.get("provider")
 
         # 并发闸门：限制单次请求内的并发上游调用数（防 batch=4 × 高并发
         # 请求数把上游/连接池打爆）
@@ -361,9 +384,9 @@ class GeneratePipeline:
                 marker["probe"] = True  # 即将发出（含调用中预算耗尽的情形）
                 try:
                     api = await self._api.generate_image(
-                        model=model, prompt=prompt, size=normalized_size,
+                        prompt=prompt, size=normalized_size,
                         deadline=deadline, ratio=ratio,
-                        images=images or None,
+                        images=images or None, provider=provider_hint,
                     )
                 except budget_mod.DeadlineExceededError:
                     # 调用中预算耗尽（退避后 check 抛出）→ 即止，非错误（E9）
@@ -499,7 +522,13 @@ class GeneratePipeline:
             return lane_of(self._lane_name).slot(deadline, req_id)
         return self._pool.slot(deadline, req_id)
 
-    def _classify(self, api: agnes_mod.ApiCallResult) -> errors_mod.ErrorInfo:
+    def _classify(self, api: gateway_mod.ApiCallResult) -> errors_mod.ErrorInfo:
+        # reason 非空 = 本端配置类问题（一个都没配 / 点名的那个没有 /
+        # 没配轮询端点）——全部归 not_configured：不是上游故障，重试无意义。
+        if api.reason:
+            return errors_mod.not_configured_error(
+                "轮询" if api.reason == "poll_undefined" else "生图",
+                api.error_detail)
         if api.status_code is None:  # 网络/超时异常（重试 1 次后仍失败）
             return errors_mod.network_error(api.error_detail)
         return errors_mod.classify_http_status(api.status_code, api.error_detail)
@@ -520,10 +549,11 @@ class GeneratePipeline:
             req_id=req_id,
             prompt_hash=logline_mod.prompt_hash(prompt),
             params=(
-                f"model=agnes-image;size={size};"
+                f"model=image;size={size};"
                 + (f"ratio={ratio};" if ratio is not None else "")
                 + f"batch={batch_size};"
                 + (f"refs={len(images)};" if images else "")
                 + f"persist={'true' if persist_flag else 'false'}"
             ),
+            kind="image",
         )

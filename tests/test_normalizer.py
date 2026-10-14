@@ -7,7 +7,7 @@ D2（官方文档对齐，2026-10-10 定案）：
 - ratio：官方 8 档枚举，仅与档位式 size 配合（冲突拦截在 pipeline 层）。
 
 已删（对应实现删除，此处反向锁定防回归）：
-- quality/steps/guidance 归一表（E25：agnes-image 无模型专属参数）；
+- quality/steps/guidance 归一表（E25：image 无模型专属参数）；
 - 旧上游两套吸附档位表（size 直传）；
 - cjk_ratio / is_cjk（消费者路由④已删）。
 """

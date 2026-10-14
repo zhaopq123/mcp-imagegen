@@ -1,5 +1,6 @@
 # V3 交付说明：多队列并发 + 视频后台异步 + 上游限速
 
+> **历史存档**：本文是 V2 阶段的设计/验收记录。V5 起上游已改为「服务提供方」可由用户自行配置，代码与文档不再绑定任何厂商；以 [README](README.md) 为准。
 日期：2026-10-13　范围：`mcp-imagegen`（vivo 生产 192.168.3.35:8000，已上线）
 提交：`4504e48`（vivo git bare `~/git/mcp-imagegen.git`，分支 main）
 
@@ -64,7 +65,7 @@ video 泳道：并发 3 / 排队等待 25s / 队列深度上限 16
 
 ### 4. 上游限速（`infra/ratelimit.py`，本轮压测逼出来的）
 
-真实链路压测发现：**并发一放开就撞 Agnes 免费额度 429 → 硬熔断 600s**，
+真实链路压测发现：**并发一放开就撞 上游服务提供方 免费额度 429 → 硬熔断 600s**，
 比排队等待糟糕得多（撞一次就废十分钟）。于是加客户端侧令牌桶：
 
 | 参数 | 默认 | 生产值 | 含义 |
@@ -138,12 +139,12 @@ HTTPXMAXCONNECTIONS=24  HTTPXMAXKEEPALIVECONNECTIONS=8   # 随并发上调
 
 压测基础设施（本机 `~/乱七八糟/`）：
 - `stress_mcp.py`：多会话并发压测器（`--base/--token/--sessions/--images/--batch/--videos`）。
-- `mock_agnes.py`：mock 上游（上传到 vivo `~/mock_agnes.py`）。
+- `mock_upstream.py`：mock 上游（上传到 vivo `~/mock_upstream.py`）。
 - vivo `/opt/mcp-imagegen/start-stress.sh`：压测专用实例（8002 端口，
   `CIRCUIT*` 调低以缩短熔断窗口）。跑法：
   ```bash
   tmux new-session -d -s mcp-mock "proot-distro login ubuntu -- bash -c \
-    'cd ~/ && /opt/mcp-imagegen/venv/bin/python -m uvicorn mock_agnes:app --workers 2 --port 8001'"
+    'cd ~/ && /opt/mcp-imagegen/venv/bin/python -m uvicorn mock_upstream:app --workers 2 --port 8001'"
   tmux new-session -d -s mcp-stress "proot-distro login ubuntu -- /opt/mcp-imagegen/start-stress.sh"
   python stress_mcp.py --base http://192.168.3.35:8002/mcp --token stresstoken \
       --sessions 8 --images 3 --batch 2 --videos 3

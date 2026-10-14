@@ -15,7 +15,7 @@
 | 端点 URL | `http://<服务器IP>:8000/mcp`（内网直连）或 `http://<服务器>/mcp`（Caddy 前置，默认 `:80`）或 `https://<你的域名>/mcp`（Caddy 换域名后自动 HTTPS，推荐公网场景） |
 | 鉴权 | 请求头 `Authorization: Bearer <MCPACCESS_TOKEN>`（即服务端 `/etc/mcp-imagegen/env` 中的 `MCPACCESS_TOKEN`） |
 | 传输 | MCP streamable HTTP（fastmcp 实现） |
-| 工具 | 3 个（V2）：`generate_image` / `generate_video` / `query_video`——单一 Agnes 上游双模型（agnes-image-2.5-flash / agnes-video-2.5-flash）；参数归一/校验/视频轮询全部在服务端完成，客户端不感知模型专属参数（参数表见 §3） |
+| 工具 | 3 个（V2）：`generate_image` / `generate_video` / `query_video`——单一 上游服务提供方 上游双模型（example-image-1 / example-video-1）；参数归一/校验/视频轮询全部在服务端完成，客户端不感知模型专属参数（参数表见 §3） |
 | 无鉴权端点 | `/healthz`（探活）、`/files/<name>`（取图/取视频，视频为 .mp4/.webm；persist 落盘文件**长期有效**、服务端不自动清理——V2 核对更正：V1 版"24h 内有效"表述与 `infra/persist.py` 不符，以代码为准） |
 | 客户端超时 | **≥ 210s（硬性建议，见 §4）** |
 
@@ -45,12 +45,12 @@ claude mcp add --transport http mcp-imagegen https://<你的域名>/mcp \
   --header "Authorization: Bearer <MCPACCESS_TOKEN>"
 ```
 
-## 3. 三工具能力与参数（V2：1 个 → 3 个；单一 Agnes 上游双模型）
+## 3. 三工具能力与参数（V2：1 个 → 3 个；单一 上游服务提供方 上游双模型）
 
 | 工具 | 上游模型 | 一句话 |
 |---|---|---|
-| `generate_image` | agnes-image-2.5-flash | 文生图（prompt 中英文皆可） |
-| `generate_video` | agnes-video-2.5-flash | 文生视频（服务端轮询阻塞至完成或预算尽，见 §3.4） |
+| `generate_image` | example-image-1 | 文生图（prompt 中英文皆可） |
+| `generate_video` | example-video-1 | 文生视频（服务端轮询阻塞至完成或预算尽，见 §3.4） |
 | `query_video` | ——（视频任务表 + 上游实时查询） | 凭 task_id 续查视频任务 |
 
 ### 3.1 generate_image
@@ -90,7 +90,7 @@ claude mcp add --transport http mcp-imagegen https://<你的域名>/mcp \
 
 ## 4. 客户端超时必须 ≥ 210s
 
-**原因（数值链，勿破坏）**：服务端请求预算 `TOTALBUDGETSEC=200` < Agent 客户端建议 210 < systemd 排空 220。客户端必须**最后**断开——否则最坏情况是：图/视频已生成、Agnes 额度已花，客户端却因超时报错把"慢成功"误判为"失败"。视频同样受保护：200s 预算内服务端必有返回（完成 URL 或 `task_id` 收条，见 §3.4），210s 客户端超时足够收到收条，不会悬挂。
+**原因（数值链，勿破坏）**：服务端请求预算 `TOTALBUDGETSEC=200` < Agent 客户端建议 210 < systemd 排空 220。客户端必须**最后**断开——否则最坏情况是：图/视频已生成、上游服务提供方 额度已花，客户端却因超时报错把"慢成功"误判为"失败"。视频同样受保护：200s 预算内服务端必有返回（完成 URL 或 `task_id` 收条，见 §3.4），210s 客户端超时足够收到收条，不会悬挂。
 
 - 建议：工具调用超时（含连接）统一设 **≥ 210s**；
 - 各客户端设置位置不同（配置项 / 环境变量 / 客户端默认值），若提供毫秒制环境变量，对应 **210000**（具体变量名以客户端文档为准，常见如 `MCP_TIMEOUT` / `MCP_TOOL_TIMEOUT`）；
@@ -104,7 +104,7 @@ claude mcp add --transport http mcp-imagegen https://<你的域名>/mcp \
 |---|---|---|
 | `invalid_params` | `fixthenretry` | 按 reason 指明的参数修正后重试 |
 | `mcp_auth` | `no` | 客户端 Bearer 与服务端 `MCPACCESS_TOKEN` 不一致，找管理员 |
-| `upstream_auth` | `no` | 服务端 `AGNES_TOKEN` 配错或 Key 无效/过期（provider=Agnes），找管理员，勿重试 |
+| `upstream_auth` | `no` | 服务端 `UPSTREAM_TOKEN` 配错或 Key 无效/过期（provider=上游服务提供方），找管理员，勿重试 |
 | `rate_limit` | `yes` | 上游限流 429 或服务端熔断 OPEN 快失败（硬熔断 600s/10min），稍后重试 |
 | `upstream_error` | `yes` | 上游 5xx/超时/网络/预算耗尽/视频上游 failed，稍后重试 |
 | `content_policy` | `no` | 内容审核未过，改 prompt 再发（等同新请求） |
@@ -149,6 +149,6 @@ curl -s -m 10 -X POST https://<你的域名>/mcp \
 | 版本 | 日期 | 变更 |
 |---|---|---|
 | V1.0 | 2026-10-10 | 初版：mcpServers 条目 / Bearer 鉴权 / 超时 ≥210s / retry 语义 / curl 三连自检 |
-| V2.0 | 2026-10-10 | Agnes 双模型三工具：新增 §3 三工具参数表与返回契约（视频异步语义/task_id 收条/任务表 TTL 与重启清零/persist 建议开启）；错误表增 `task_not_found`、`upstream_auth` 指向 `AGNES_TOKEN`、删 402 语义；`/files` 更正为图/视频且长期有效；原 §3–§6 顺延为 §4–§7 |
+| V2.0 | 2026-10-10 | 上游服务提供方 双模型三工具：新增 §3 三工具参数表与返回契约（视频异步语义/task_id 收条/任务表 TTL 与重启清零/persist 建议开启）；错误表增 `task_not_found`、`upstream_auth` 指向 `UPSTREAM_TOKEN`、删 402 语义；`/files` 更正为图/视频且长期有效；原 §3–§6 顺延为 §4–§7 |
 
 下一步建议：正式 Key 落位后，用 §6 的 ③（initialize 握手）做端到端验收，再在客户端挂载条目跑一次真实 `generate_image`（persist=true）与一次 `generate_video`（顺带验证 ≥210s 超时设置与 task_id 收条语义），并按《增量设计方案V2》九节 9.3 清单回填附录 A 实测项。

@@ -1,14 +1,17 @@
-"""本地 mock Agnes 上游（压测/闭环验证用，不消耗真实额度）。
+"""本地 mock 上游（压测/闭环验证用，不消耗真实额度）。
+
+端点形状刻意做成 OpenAI 兼容风格，但本服务不绑定任何厂商——
+换任何一家 API，只要把面板里的请求模板改成它的形状即可。
 
 行为：
   POST /v1/images/generations → 延迟 IMAGE_DELAY_SEC 后返回 1 张图 URL
   POST /v1/videos             → 返回 video_id
                                 （开启 MOCK_VIDEO_REJECT_N 时前 N 次返回
                                   503 video_queue_full，用于验证服务端代排队）
-  GET  /agnesapi              → 前 POLLS 次 running，之后 completed
+  GET  /v1/videos/query              → 前 POLLS 次 running，之后 completed
   GET  /file.png              → 小 PNG（供 persist 下载）
 
-启动：python mock_agnes.py [port]
+启动：python mock_upstream.py [port]
 """
 from __future__ import annotations
 
@@ -81,7 +84,7 @@ async def stats(request: Request) -> Response:
 app = Starlette(routes=[
     Route("/v1/images/generations", images, methods=["POST"]),
     Route("/v1/videos", videos, methods=["POST"]),
-    Route("/agnesapi", query, methods=["GET"]),
+    Route("/v1/videos/query", query, methods=["GET"]),
     Route("/mock-stats", stats, methods=["GET"]),
     Route("/{name:path}", anyfile, methods=["GET"]),
 ])

@@ -10,7 +10,7 @@ sd_notify：vendored 极简实现（Unix 数据报 → NOTIFY_SOCKET，抽象命
 "@" 前缀兼容），不依赖 sdnotify 包；Type=notify 需启动发 READY=1。
 
 每日重建（E6）：每天 DAILY_REBUILD_HOUR(04:00) 本地时间调
-AgnesClient.rotate()（指针热切换，旧 client 等在途请求完成后
+服务提供方连接池 rotate()（指针热切换，旧连接池等在途请求完成后
 aclose）。
 """
 from __future__ import annotations
@@ -93,6 +93,30 @@ def seconds_until_next(
     if now >= target:
         target += datetime.timedelta(days=1)
     return max(0.0, (target - now).total_seconds())
+
+
+async def interval_rebuild_loop(
+    client,
+    interval_sec: float,
+    sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+) -> None:
+    """按固定间隔热重建连接池（CLIENT_ROTATE_SEC；0 = 关闭）。
+
+    与每日重建的区别：间隔是**配置驱动**的，适合上游保活时长不确定、或
+    跑在长期不重启的容器里的场景。两者都由 server 装配，取其一。
+    """
+    if interval_sec <= 0:
+        return
+    while True:
+        await sleep(interval_sec)
+        logger.info("[rebuild] 定期连接池重建触发（间隔 %.0fs）", interval_sec)
+        try:
+            await client.rotate()
+            logger.info("[rebuild] 定期连接池重建完成")
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 —— 调度循环绝不因单次失败退出
+            logger.exception("[rebuild] 定期连接池重建失败（不影响服务）")
 
 
 async def daily_rebuild_loop(

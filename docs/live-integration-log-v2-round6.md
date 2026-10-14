@@ -1,11 +1,12 @@
 # 真机联调记录（V2 第六轮：端点修正 + 真机联调）
 
+> **历史存档**：本文是 V2 阶段的设计/验收记录。V5 起上游已改为「服务提供方」可由用户自行配置，代码与文档不再绑定任何厂商；以 [README](README.md) 为准。
 | 项 | 内容 |
 |---|---|
 | 日期 | 2026-10-10 14:20–15:10（Asia/Shanghai） |
-| 上游端点 | `https://api.agnes-ai.cn`（本轮已修正，原 `apihub` 子域废弃） |
+| 上游端点 | `https://api.example.com`（本轮已修正，原 `apihub` 子域废弃） |
 | 执行脚本 | `scripts/live_check.py`（可重复执行；结果逐 run 追加 `scripts/live_check_results.json`） |
-| 密钥纪律 | AGNES_TOKEN 仅经 `/home/z/envs/mcp-imagegen.env` 注入进程环境；**零落盘**（不入仓库/git/日志/结果 JSON） |
+| 密钥纪律 | UPSTREAM_TOKEN 仅经 `/home/z/envs/mcp-imagegen.env` 注入进程环境；**零落盘**（不入仓库/git/日志/结果 JSON） |
 | 基线 | 修正后全量单测 366 passed（见 §8） |
 
 > 说明：所有「[meta] / [error]」标记前缀在本文引用时可能被渲染层吞掉首字符（`[m`→``，已知现象，V2 第二轮交付说明已实证）；字符串本身经 ord 码逐位验证完好（`[91,109,101,116,97,93,32]` = `[meta] `）。
@@ -14,15 +15,15 @@
 
 ## 1. 端点修正说明
 
-官方文档（wiki.agnes-ai.cn）检查清单明确：`使用 https://api.agnes-ai.cn/v1/images/generations 作为 API 端点`。原默认值 `apihub.agnes-ai.cn` 为旧子域，本轮全量修正：
+官方文档（wiki.example.com）检查清单明确：`使用 https://api.example.com/v1/images/generations 作为 API 端点`。原默认值 `api.example.com` 为旧子域，本轮全量修正：
 
 | 文件 | 位置 | 修正 |
 |---|---|---|
-| `config.py` | L21–22 变量表注释 + L82 `AGNES_BASE_URL` 默认值 | `https://apihub.agnes-ai.cn` → `https://api.agnes-ai.cn`（附注：官方文档端点，原 apihub 子域已废弃） |
+| `config.py` | L21–22 变量表注释 + L82 `UPSTREAM_BASE_URL` 默认值 | `https://api.example.com` → `https://api.example.com`（附注：官方文档端点，原 apihub 子域已废弃） |
 | `config.example.env` | L41 | 同上 |
-| `tests/test_agnes.py` | L24 `BASE` | 同上（全部 mock 基址跟随） |
+| `tests/test_upstream.py` | L24 `BASE` | 同上（全部 mock 基址跟随） |
 | `tests/test_config.py` | L194 `V2_DEFAULTS` | 同上（默认值断言跟随） |
-| `deploy/install.md` | §0 前提条件 / §5.1 变量表 / §13 检查清单 ② | 4 处 `apihub.agnes-ai.cn` → `api.agnes-ai.cn`（root 只读文件，按临时文件+rename 铁律落盘） |
+| `deploy/install.md` | §0 前提条件 / §5.1 变量表 / §13 检查清单 ② | 4 处 `api.example.com` → `api.example.com`（root 只读文件，按临时文件+rename 铁律落盘） |
 | `deploy/README.md` | 项目简介 | 1 处 |
 
 历史文档（`MCP图片视频生成Server_增量设计方案V2.md`、`docs/V2_T1-T4_交付说明.md`）中的旧端点为当时事实记录，按历史文档纪律不改。修正后 `rg apihub` 在代码/配置/测试层零残留（仅历史文档与修正注释）。
@@ -35,8 +36,8 @@
 
 | 层 | 耗时 | 结果 |
 |---|---|---|
-| 直连 | **7.4s** | 200，顶层键 `["created","data","task_id"]`，1 item（`b64_json`/`revised_prompt`/`url`），URL 域名 `cos-platform-outputs.agnes-ai.cn` |
-| 项目链路 | **10.1s** | 契约行：URL 首行 + `[meta] model=agnes-image size=1024x1024 url_expires=1h`（ord 级验证前缀完好），read 档 `TIMEOUT_AGNES_IMAGE_SEC=30` 内完成 |
+| 直连 | **7.4s** | 200，顶层键 `["created","data","task_id"]`，1 item（`b64_json`/`revised_prompt`/`url`），URL 域名 `cos-platform-outputs.example.com` |
+| 项目链路 | **10.1s** | 契约行：URL 首行 + `[meta] model=image size=1024x1024 url_expires=1h`（ord 级验证前缀完好），read 档 `TIMEOUT_UPSTREAM_IMAGE_SEC=30` 内完成 |
 
 ### 2.2 2K 档（官方推荐 `size:"2K"` + `ratio:"16:9"`）
 
@@ -61,7 +62,7 @@
 
 ### 2.4 耗时 vs 30s 档评估
 
-实测单发生图 7.4–15.2s（多轮观察区间，含并发拥塞时的慢响应）；503 快速拒绝（0.3–0.5s）不占用 read 档。**当前免费队列下 30s 档够用**（最大观察值 15.2s ≈ 档位 51%）。官方建议 60–360s 为保守上限；若正式 Key/付费计划下出现慢响应，`TIMEOUT_AGNES_IMAGE_SEC` 上调建议（→60s）留待参数面定案统一实施。
+实测单发生图 7.4–15.2s（多轮观察区间，含并发拥塞时的慢响应）；503 快速拒绝（0.3–0.5s）不占用 read 档。**当前免费队列下 30s 档够用**（最大观察值 15.2s ≈ 档位 51%）。官方建议 60–360s 为保守上限；若正式 Key/付费计划下出现慢响应，`TIMEOUT_UPSTREAM_IMAGE_SEC` 上调建议（→60s）留待参数面定案统一实施。
 
 ## 3. persist 真机（派单 ②）
 
@@ -70,7 +71,7 @@
 | 检查项 | 结果 |
 |---|---|
 | 总耗时 | 8.4s（生成+下载落盘） |
-| 契约行 | URL 首行 `http://127.0.0.1:{port}/files/a816da9f1ab0-01-89ff700c.png` + `[meta] model=agnes-image size=1024x1024 persisted` |
+| 契约行 | URL 首行 `http://127.0.0.1:{port}/files/a816da9f1ab0-01-89ff700c.png` + `[meta] model=image size=1024x1024 persisted` |
 | GET /files | **200**，`image/png`，**1,290,765 字节** |
 | 字节一致性 | `bytes_match_disk=true`（HTTP GET 响应体 == 磁盘文件逐字节相等） |
 | 磁盘 | `IMAGE_DIR`（临时目录）恰 1 文件，文件名含 req_id+序号+hash 前缀 |
@@ -81,7 +82,7 @@
 
 上游 `POST /v1/videos` 连续返回 **503** `{"code":"video_queue_full","message":"视频队列已满，请稍后重试 (request id: …)"}`：
 
-- 服务内 **C4 纪律真机走通**：`[agnes] POST /v1/videos 第 1 次上游 503 → 退避重试`（日志可见，退避后仍满则放弃，单次调用总耗时 1.24s 含退避）；
+- 服务内 **C4 纪律真机走通**：`[上游] POST /v1/videos 第 1 次上游 503 → 退避重试`（日志可见，退避后仍满则放弃，单次调用总耗时 1.24s 含退避）；
 - 项目契约行：`[error] category=upstream_error retry=yes reason=上游服务错误(503) | {"code":"video_queue_full",…} suggestion=稍后重试`——错误体 message 透传 + retry=yes 引导稍后重试；
 - 外层观察：脚本按 20s 间隔重提 6 轮（102.9s 观察窗），队列持续满未恢复（14:30–14:43 三个观察窗）；**不阻塞其余项**（生图/persist/429 各阶段在该期间全部独立完成）。
 
@@ -98,7 +99,7 @@
 | 触发阈值 | 两轮各 12 并发，第 11、12 发（/ 第 11 发）返回 429——**免费限速 ≈ 10 个并发/短窗**；串行 10 连发（每发 8–15s 节奏）不触发 |
 | 响应速度 | 0.19–0.38s 快速拒绝 |
 | **Retry-After 头** | **无**（两轮 429 响应均未携带；`ratelimit_headers` 亦空——无任何 rate/limit 类响应头） |
-| 错误体 | `{"error":{"message":"您已达到免费用户的 API 速率限制。升级 Token Plan 即可解锁更高限额，继续不间断使用 API。 (request id: …)","type":"AgnesAI_error","param":"","code":"rate_limit_exceeded"}}`（F3 结构，message 含 request id） |
+| 错误体 | `{"error":{"message":"您已达到免费用户的 API 速率限制。升级 Token Plan 即可解锁更高限额，继续不间断使用 API。 (request id: …)","type":"上游服务提供方AI_error","param":"","code":"rate_limit_exceeded"}}`（F3 结构，message 含 request id） |
 | 项目链路真机行为 | 契约行 `[error] category=rate_limit retry=yes reason=上游限流(429) | 您已达到免费用户的 API 速率限制… suggestion=稍后重试`（真机自然触发 2 次：svc_image_bad 重跑、svc_video 第 6 轮提交） |
 | 限流窗口 | 短：同一 Key 约 60–100s 后恢复（429 后 ~90s 的 persist 阶段已恢复正常） |
 
@@ -113,13 +114,13 @@
   "created": …,
   "task_id": "…",
   "data": [
-    {"b64_json": "…", "revised_prompt": "…", "url": "https://cos-platform-outputs.agnes-ai.cn/images/t2i/task_…/output_….png"}
+    {"b64_json": "…", "revised_prompt": "…", "url": "https://cos-platform-outputs.example.com/images/t2i/task_…/output_….png"}
   ]
 }
 ```
 
-- 顶层为 **`data` 数组**（非 `images`）——`infra/agnes.py _extract_urls` 的 E14 双兼容 `images or data` **命中 data 分支**，真机全链走通（§2 各阶段成功返回 URL 即证）；
-- 视频查询响应结构：`GET /agnesapi?video_id=…&model_name=agnes-video-2.5-flash`（顶层 `status`/`url` 字段验证见 §4.2）。
+- 顶层为 **`data` 数组**（非 `images`）——`infra/upstream.py _extract_urls` 的 E14 双兼容 `images or data` **命中 data 分支**，真机全链走通（§2 各阶段成功返回 URL 即证）；
+- 视频查询响应结构：`GET /v1/videos/query?video_id=…&model_name=example-video-1`（顶层 `status`/`url` 字段验证见 §4.2）。
 
 ## 7. 结论与下一轮输入
 
@@ -160,9 +161,9 @@
 
 | 项 | 结果 | 证据 |
 |---|---|---|
-| D2 ratio 生图 | ✅ | `generate_image(size="2K", ratio="16:9")` 走 MCP 全链路 11.7s 成功；meta `model=agnes-image size=2K ratio=16:9 url_expires=1h`；URL 真实落 COS（run v2_accept.case.A） |
+| D2 ratio 生图 | ✅ | `generate_image(size="2K", ratio="16:9")` 走 MCP 全链路 11.7s 成功；meta `model=image size=2K ratio=16:9 url_expires=1h`；URL 真实落 COS（run v2_accept.case.A） |
 | D4 边界拒绝 | ✅ | `aspect_ratio="5:4"` → `[error] category=invalid_params retry=fixthenretry … 限 16:9/9:16/1:1/4:3/3:4/21:9 六档，收到 '5:4'`（零配额消耗） |
-| D3 seed + D4 六档 | ✅ 完整闭环 | `seed=42, aspect_ratio=21:9, seconds="4"` 提交 200 → 全程跑至 completed 出片（见 10.2，上游成功路径实证）；服务端 schema→pipeline→agnes 请求体链路由单测+e2e mock 覆盖（第七轮新增 seed 校验用例）。注：MCP 链路 seed 成功路径当轮撞 503/429 未单跑，透传链路证据以单测+直连互补 |
+| D3 seed + D4 六档 | ✅ 完整闭环 | `seed=42, aspect_ratio=21:9, seconds="4"` 提交 200 → 全程跑至 completed 出片（见 10.2，上游成功路径实证）；服务端 schema→pipeline→上游 请求体链路由单测+e2e mock 覆盖（第七轮新增 seed 校验用例）。注：MCP 链路 seed 成功路径当轮撞 503/429 未单跑，透传链路证据以单测+直连互补 |
 | 503/429 契约 | ✅ | 队列高峰期 6 次提交尝试全返回结构化契约行：503→`upstream_error retry=yes`、429→`rate_limit retry=yes`，官方 message + request id 完整透传（run 940f34fed195） |
 
 ### 10.2 A-8 视频全流程闭环（15:44–15:56）
@@ -171,11 +172,11 @@
 |---|---|
 | 提交 | POST /v1/videos（seed=42, 21:9, "4"s）→ 200（6.1s）；**响应含 id/video_id/task_id 三字段同值**（字段名疑云定案：任取其一皆可） |
 | 状态机 | queued → **in_progress**（progress=10，官方文档未列的中间态实证）→ completed（progress=100）；总耗时约 8 分钟（免费队列渲染慢，非服务端问题） |
-| 查询 | GET /agnesapi?video_id&model_name=agnes-video-2.5-flash → 200 顶层任务对象（无 data 容器，与实现"顶层优先"解析匹配） |
-| 产物 | `https://cos-platform-outputs.agnes-ai.cn/videos/agnes-video-2.5/task_qyGR11scbwDsKmqzo3hy1LyPvlH8yPr5.mp4` HEAD 实测 **HTTP 200 · video/mp4 · 1,871,079 B** |
+| 查询 | GET /v1/videos/query?video_id&model_name=example-video-1 → 200 顶层任务对象（无 data 容器，与实现"顶层优先"解析匹配） |
+| 产物 | `https://cos-platform-outputs.example.com/videos/video-2.5/task_qyGR11scbwDsKmqzo3hy1LyPvlH8yPr5.mp4` HEAD 实测 **HTTP 200 · video/mp4 · 1,871,079 B** |
 
 ### 10.3 e2e 全量档复核（验收轮）
 
 - 全量 27 场景首跑 26/27：㉑ FAIL 定性为**测试断言未随 D5 同步**（场景假设 30s 档，默认已调 60s；上游挂 31s 在 60s read 窗口内首次即成功 calls=1，行为本身正确），非实现 bug；
-- 修复：场景显式注入 `TIMEOUT_AGNES_IMAGE_SEC=20` + 挂 21s，回归"read 档先响 + C4 重试 1 次"语义（不再耦合全局默认）；
+- 修复：场景显式注入 `TIMEOUT_UPSTREAM_IMAGE_SEC=20` + 挂 21s，回归"read 档先响 + C4 重试 1 次"语义（不再耦合全局默认）；
 - 复跑：**PASS**（20.8s / calls=2 / 重试成功）；实现代码零改动。
