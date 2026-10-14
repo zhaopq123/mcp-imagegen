@@ -12,8 +12,8 @@
   key= 前缀解析；
 - prompt 只记 sha256 前 16 位，不记原文（审计够用 + 不泄内容）；
 - 本模块纯格式化，无副作用；由 pipeline 在请求收尾时调用一次 emit；
-- 规格书八节的 provider 字段按方案 V2 三节建议省略（单一 Provider 恒
-  Agnes，零信息量；变更记录已注明）。
+- 规格书八节的 provider 字段按方案 V2 三节建议省略（早期单一提供方恒
+  单一厂商，零信息量；改动记录已注明）。
 """
 from __future__ import annotations
 
@@ -21,7 +21,7 @@ import datetime as _dt
 import hashlib
 import logging
 from dataclasses import dataclass
-from typing import Optional
+from typing import ClassVar, Optional
 
 logger = logging.getLogger("mcp_imagegen.access")
 
@@ -64,6 +64,9 @@ class LogRecord:
     poll_count: Optional[int] = None   # 视频轮询次数（生图 null）
     split_calls: Optional[int] = None  # 生图拆分调用数（原生 batch=1 即 1；视频 null）
     total: str = "null"
+    # V5：不进 15 字段，仅给指标 hook 用（image / video），保持行格式不变
+    kind: str = "image"
+    provider: str = ""
 
     def render(self) -> str:
         """一行 15 字段（顺序与 FIELDS 严格一致；缺失显式 null）。"""
@@ -93,6 +96,26 @@ class LogRecord:
     def _ts(cls) -> str:
         return cls._clock().astimezone().isoformat(timespec="milliseconds")
 
+    # 行内 ejected 之外的旁路：指标收集（V5）
+    #
+    # 为什么走 hook 而不是让 pipeline 直接 import metrics：logline 是
+    # 「每请求恰好一次」的唯一出口，指标挂在这里就天然保证不重不漏，
+    # 也不会把埋点漏在某条分支上（历史上这种漏统计很难查）。
+    _hooks: ClassVar[list] = []
+
+    @classmethod
+    def add_hook(cls, fn) -> None:
+        cls._hooks.append(fn)
+
+    @classmethod
+    def clear_hooks(cls) -> None:
+        cls._hooks.clear()
+
     def emit(self) -> None:
         """输出一行（唯一出口；pipeline 每请求恰好调用一次）。"""
         logger.info("%s", self.render())
+        for hook in self._hooks:
+            try:
+                hook(self)
+            except Exception:  # noqa: BLE001 —— 埋点绝不能反过来影响业务路径
+                pass

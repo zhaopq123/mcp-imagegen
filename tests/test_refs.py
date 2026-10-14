@@ -3,7 +3,7 @@
 为什么专门补这一份单测
 ------------------------------------------------
 refs 是 V4 的入口闸门，也是**唯一的越权读风险点**：一旦它肯读任意本地路径，
-调用方就能把 `/etc/mcp-imagegen/env`（内含真实 Agnes 密钥）当"参考图"送去上游。
+调用方就能把 `/etc/mcp-imagegen/env`（内含真实上游密钥）当"参考图"送去上游。
 这类漏洞在集成测试里几乎抓不到——功能照样跑通，只是凭据悄悄外泄。
 所以这里把「形态识别」和「只读允许目录」两条线各自钉死。
 
@@ -197,7 +197,7 @@ def test_absolute_path_outside_allowed_dirs_rejected(tmp_path, roots):
     """硬约束：绝不能用任意本地路径（否则服务器凭据会随参考图送上游）。"""
     image_dir, _ = roots
     secret = tmp_path / "env"
-    secret.write_text("AGNES_TOKEN=real-secret-value\n")
+    secret.write_text("UPSTREAM_TOKEN=real-secret-value\n")
     with pytest.raises(ReferenceError) as exc:
         resolve(str(secret), image_dir)
     assert "real-secret-value" not in str(exc.value)

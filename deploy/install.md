@@ -8,7 +8,7 @@
 | 依据 | 《技术规格书》第七节环境变量总表、《开发设计方案》S4.3；环境变量名/默认值**逐字取自项目根 `config.py` 与 `config.example.env`**（撰写前已通读）；依赖清单以项目根 `requirements.txt` 为准；关键命令（--check / healthz / 401 / MCP initialize 握手 / py-spy / df 水位脚本）已在干净 venv 实测通过；§7/§11 已与 deploy/ 下 Ethan 交付的 systemd 单元与 Caddyfile 逐字核对一致；**V2 改动依据《MCP图片视频生成Server_增量设计方案V2.md》三节（环境变量）与六节（工具描述）**，变量名/默认值以 `config.py` 为准（`config.example.env` 存在 V1 残留死行，见 §5.1 待确认注），§6 的 V2 自检输出引自 `docs/V2第四轮收尾补测_交付说明.md` 实测记录 |
 | 适用 | Linux + systemd（示例命令为 Debian/Ubuntu 系；RHEL 系把 `apt-get` 换成 `dnf` 即可） |
 
-> **部署形态**：`Agent ──(Bearer)──> [Caddy 可选 HTTPS] ──> systemd 守护的 Python 进程（0.0.0.0:8000）──> Agnes AI API（api.agnes-ai.cn，V2 单一上游双模型：agnes-image-2.5-flash / agnes-video-2.5-flash）`
+> **部署形态**：`Agent ──(Bearer)──> [Caddy 可选 HTTPS] ──> systemd 守护的 Python 进程（0.0.0.0:8000）──> 上游服务提供方 API（api.example.com，V2 单一上游双模型：example-image-1 / example-video-1）`
 > 组件版本对齐链（勿随意改动）：`read ≤ 分档 ≤ TOTALBUDGETSEC(200) < Agent 建议超时(210) < TimeoutStopSec(220)`。
 
 ## 0. 路径与端口总览
@@ -24,7 +24,7 @@
 | `mcp-imagegen.service` | 主服务单元 |
 | `mcp-imagegen-disk-check.service` + `.timer` | 每日磁盘水位巡检（超线只 WARN，不删图） |
 
-**前提条件**：root 或 sudo 权限；Python ≥ 3.10（fastmcp 硬性要求）；服务器可访问 PyPI 与 Agnes AI API（`api.agnes-ai.cn`，V2 唯一上游）。
+**前提条件**：root 或 sudo 权限；Python ≥ 3.10（fastmcp 硬性要求）；服务器可访问 PyPI 与 上游服务提供方 API（`api.example.com`，V2 唯一上游）。
 
 ## 1. 系统依赖安装
 
@@ -85,7 +85,7 @@ sudo chown -R mcp-imagegen:mcp-imagegen /opt/mcp-imagegen/venv
 | 包 | 角色 | 备注 |
 |---|---|---|
 | `fastmcp` | MCP 工具端点（streamable-http）与工具 schema | 会传递安装 `uvicorn`、`starlette` 等，**无需单列** |
-| `httpx` | Agnes API 客户端（生图/生视频/任务查询）+ persist 图片/视频下载（V2） | — |
+| `httpx` | 上游服务提供方 API 客户端（生图/生视频/任务查询）+ persist 图片/视频下载（V2） | — |
 | `py-spy` | 运维三件套③（调用栈 dump，验收⑰） | **不在 requirements.txt 内**，按设计 S1.1 由部署文档预装（即本步） |
 
 > `requirements.txt` 当前未钉版本；其文件头注释建议生产钉死（示例：`fastmcp==2.14.3 httpx==0.28.1`）。需钉版时直接编辑 `requirements.txt`，重跑本节 `pip install -r` 即可。
@@ -110,22 +110,22 @@ sudoedit /etc/mcp-imagegen/env      # 填入两个密钥
 | 变量 | 填写值 |
 |---|---|
 | `MCPACCESS_TOKEN` | Agent 客户端 Bearer Token（自拟强随机串，与 agent-config.md 配套） |
-| `AGNES_TOKEN` | Agnes AI 上游 API Key（`api.agnes-ai.cn` 控制台 → API Keys 生成；**V2 替代原 `SILICONFLOWTOKEN`**，上线前须换正式 Key，见 §13） |
+| `UPSTREAM_TOKEN` | 上游服务提供方 上游 API Key（`api.example.com` 控制台 → API Keys 生成；**V2 替代原 `UPSTREAM_B_TOKEN`**，上线前须换正式 Key，见 §13） |
 
 **其余 23 项（`config.example.env` 已按默认值预填；留空或不写 = 使用默认值）：**
 
 | 变量 | 默认值（config.py） | 分组 |
 |---|---|---|
-| `AGNES_BASE_URL` | `https://api.agnes-ai.cn` | Agnes 上游（V2 增量） |
+| `UPSTREAM_BASE_URL` | `https://api.example.com` | 上游服务提供方 上游（V2 增量） |
 | `PORT` | `8000` | 基础 |
 | `IMAGE_DIR` | `/var/lib/mcp-imagegen/images` | 基础 |
 | `VIDEO_DIR` | `/var/lib/mcp-imagegen/videos` | 基础（V2 增量；须专用低权限用户可写，见 §2） |
 | `MAXCONCURRENCY` | `3` | 并发与排队（等待上限 30s，到点返 busy；生图/生视频共用槽池） |
 | `QUEUEWAIT_SEC` | `30` | 并发与排队 |
 | `TOTALBUDGETSEC` | `200` | 超时预算（请求总预算，图/视频共用） |
-| `TIMEOUT_AGNES_IMAGE_SEC` | `60` | Agnes read 档（V2 增量；生图上游读超时；D5 自 30 调整） |
-| `VIDEO_SUBMIT_TIMEOUT_SEC` | `30` | Agnes read 档（V2 增量；视频提交读超时） |
-| `VIDEO_QUERY_TIMEOUT_SEC` | `10` | Agnes read 档（V2 增量；单次任务查询读超时） |
+| `TIMEOUT_UPSTREAM_IMAGE_SEC` | `60` | 上游服务提供方 read 档（V2 增量；生图上游读超时；D5 自 30 调整） |
+| `VIDEO_SUBMIT_TIMEOUT_SEC` | `30` | 上游服务提供方 read 档（V2 增量；视频提交读超时） |
+| `VIDEO_QUERY_TIMEOUT_SEC` | `10` | 上游服务提供方 read 档（V2 增量；单次任务查询读超时） |
 | `VIDEO_POLL_INTERVAL_SEC` | `2` | 视频轮询间隔（V2 增量；D7 自 5 调整，官方建议 1–2s） |
 | `TASK_TTL_SEC` | `7200` | 视频任务表（V2 增量；TTL 2h，内存态重启清零） |
 | `TASK_MAX` | `100` | 视频任务表（V2 增量；容量上限，超出逐出旧任务） |
@@ -140,14 +140,14 @@ sudoedit /etc/mcp-imagegen/env      # 填入两个密钥
 | `HTTPXMAXCONNECTIONS` | `10` | httpx 连接层 |
 | `HTTPXMAXKEEPALIVECONNECTIONS` | `4` | httpx 连接层 |
 
-**V2 已删除变量（`config.py` 不再读取，随硅基流动 Provider 一并删除）**：`SILICONFLOWTOKEN`、`TIMEOUTSCHNELL`、`TIMEOUTKOLORSSMALL`、`TIMEOUTKOLORS_LARGE`。
+**V2 已删除变量（`config.py` 不再读取，随另一家上游 Provider 一并删除）**：`UPSTREAM_B_TOKEN`、`TIMEOUTSCHNELL`、`TIMEOUTKOLORSSMALL`、`TIMEOUTKOLORS_LARGE`。
 
-> ⚠ **待确认（文档核对发现，本轮不动代码文件）**：项目根 `config.example.env` 中 `TIMEOUTSCHNELL` / `TIMEOUTKOLORSSMALL` / `TIMEOUTKOLORS_LARGE` 三行仍残留（死配置，不影响启动），且 `AGNES_TOKEN` 在"密钥段"与"Agnes 段"出现两行（同值无害但重复）——建议开发侧下轮清理该样例文件；本表以 `config.py` 为准。
+> ⚠ **待确认（文档核对发现，本轮不动代码文件）**：项目根 `config.example.env` 中 `TIMEOUTSCHNELL` / `TIMEOUTKOLORSSMALL` / `TIMEOUTKOLORS_LARGE` 三行仍残留（死配置，不影响启动），且 `UPSTREAM_TOKEN` 在"密钥段"与"上游服务提供方 段"出现两行（同值无害但重复）——建议开发侧下轮清理该样例文件；本表以 `config.py` 为准。
 
 **改动须知**：
 
 - 改配置需 `systemctl restart` 生效（只读配置，无热更新）；
-- 启动自检嵌套不等式（红线 B6，违例即 fail-fast）：`read ≤ 分档 ≤ TOTALBUDGETSEC(200) < Agent 建议(210) < TimeoutStop(220)`；V2 另校验 Agnes read 档（`生图/单查/提交 read ≤ 单查 ≤ 提交 ≤ 总预算`）与视频任务表参数（见 §6 输出第三行）；故调大 `TOTALBUDGETSEC` 前须同步核对 Agent 客户端超时与 systemd `TimeoutStopSec`。
+- 启动自检嵌套不等式（红线 B6，违例即 fail-fast）：`read ≤ 分档 ≤ TOTALBUDGETSEC(200) < Agent 建议(210) < TimeoutStop(220)`；V2 另校验 上游服务提供方 read 档（`生图/单查/提交 read ≤ 单查 ≤ 提交 ≤ 总预算`）与视频任务表参数（见 §6 输出第三行）；故调大 `TOTALBUDGETSEC` 前须同步核对 Agent 客户端超时与 systemd `TimeoutStopSec`。
 
 ## 6. 启动前配置自检（一次性，退出码 0=通过 / 2=失败）
 
@@ -160,7 +160,7 @@ sudo sh -c 'cd /opt/mcp-imagegen && set -a && . /etc/mcp-imagegen/env && set +a 
 ```
 [config] 嵌套不等式自检: read ≤ 分档(max=60s) ≤ deadline(200s) < Agent建议(210s) < TimeoutStop(220s) ✓
 [config] 队列等待 30s ≤ 总预算 ✓ | persist 下载 图30s/视频120s ≤ 总预算 ✓ | 并发槽 3 | 熔断 硬600s/软300s
-[config] V2 Agnes read 档自检: 生图 60s / 提交 30s / 单查 10s ≤ 单查 ≤ 提交 ≤ deadline (200s) ✓ | 轮询 2s | 任务表 TTL 7200s / 容量 100 ✓
+[config] V2 上游服务提供方 read 档自检: 生图 60s / 提交 30s / 单查 10s ≤ 单查 ≤ 提交 ≤ deadline (200s) ✓ | 轮询 2s | 任务表 TTL 7200s / 容量 100 ✓
 [startup] 配置自检通过（--check）
 ```
 
@@ -196,7 +196,7 @@ sudo systemctl enable --now mcp-imagegen-disk-check.timer
 | `WorkingDirectory=/opt/mcp-imagegen` | — | `server.py` 同级导入 `config`/`app`/`engine` 等模块 |
 | `ExecStartPre=/opt/mcp-imagegen/venv/bin/python server.py --check` | — | 每次启动前自动配置自检，违例（退出码 2）阻止启动 |
 | `ExecStart=/opt/mcp-imagegen/venv/bin/python server.py` | — | 前台运行，交 systemd 守护 |
-| `EnvironmentFile=/etc/mcp-imagegen/env`（root:root 600，systemd 读取注入，服务用户无需可读） | — | §5；V2 全部新变量（`AGNES_TOKEN`、`VIDEO_DIR`、视频三超时、任务表两项等）经此同一文件注入，单元文件无变量硬编码，**无需改动** |
+| `EnvironmentFile=/etc/mcp-imagegen/env`（root:root 600，systemd 读取注入，服务用户无需可读） | — | §5；V2 全部新变量（`UPSTREAM_TOKEN`、`VIDEO_DIR`、视频三超时、任务表两项等）经此同一文件注入，单元文件无变量硬编码，**无需改动** |
 | `After=network.target` | — | 依赖网络就绪 |
 | `SyslogIdentifier=mcp-imagegen` | — | journal 中的日志标识 |
 | `NoNewPrivileges/PrivateTmp/ProtectHome/ProtectSystem=full` | — | 轻量加固（V2：应用写 `IMAGE_DIR` / `VIDEO_DIR`，两目录均落 `/var/lib`，`ProtectSystem=full` 不禁止，兼容） |
@@ -208,7 +208,7 @@ sudo systemctl enable --now mcp-imagegen-disk-check.timer
 >
 > **V2 文档层面核对（2026-10-10）**：三单元与 Caddyfile **功能层无需改动**——V2 新变量均经同一 `EnvironmentFile` 注入（见上表）；`/files/*` 视频（`.mp4`/`.webm`）与图片同由后端按扩展名分流，Caddy 路由原样透传即可；水位检查经应用代码已覆盖双目录。**注释层 4 处滞后**（纯注释、不影响功能；按任务纪律本轮不动文件，列清单交开发确认后下轮统一改）：
 > 1. `mcp-imagegen.service` 头部安装注释：仅示范创建 images 目录，缺 videos（与本文 §2 对齐即可）；
-> 2. `mcp-imagegen.service` 注释「（含 SILICONFLOWTOKEN / MCPACCESS_TOKEN）」→ 应改「（含 MCPACCESS_TOKEN / AGNES_TOKEN）」（`SILICONFLOWTOKEN` 已删除）；
+> 2. `mcp-imagegen.service` 注释「（含 UPSTREAM_B_TOKEN / MCPACCESS_TOKEN）」→ 应改「（含 MCPACCESS_TOKEN / UPSTREAM_TOKEN）」（`UPSTREAM_B_TOKEN` 已删除）；
 > 3. `mcp-imagegen.service` 注释「应用仅写 IMAGE_DIR」→ 应改「应用写 IMAGE_DIR / VIDEO_DIR」；
 > 4. `mcp-imagegen-disk-check.service` 头部注释两处「IMAGE_DIR 所在文件系统」→ 应改双目录表述；
 > 另（可选）：`Caddyfile` 注释「图片静态服务」可顺手改「图片/视频静态服务」，同为纯注释。
@@ -311,7 +311,7 @@ sudo systemctl reload caddy
 |---|---|
 | 启动即退出，退出码 2 | `sudo journalctl -xeu mcp-imagegen`：密钥为空 / 嵌套不等式违例（§5、§6） |
 | 客户端 401 `[error] category=mcp_auth` | `/etc/mcp-imagegen/env` 的 `MCPACCESS_TOKEN` 与客户端 Bearer 不一致 |
-| 上游 401/403 `[error] category=upstream_auth` | `AGNES_TOKEN` 配错或 Key 无效/过期（provider=Agnes；上线前按 §13 ② 在 Agnes 控制台核对；服务器侧问题，客户端勿重试） |
+| 上游 401/403 `[error] category=upstream_auth` | `UPSTREAM_TOKEN` 配错或 Key 无效/过期（provider=上游服务提供方；上线前按 §13 ② 在 上游服务提供方 控制台核对；服务器侧问题，客户端勿重试） |
 | 服务反复重启后停 | `StartLimit` 5 次/60s 风暴保护触发；`journalctl -u mcp-imagegen` 看崩溃根因 |
 | 日志出现磁盘水位 WARN | `df -h /var/lib/mcp-imagegen/images /var/lib/mcp-imagegen/videos`（V2 水位覆盖双目录）；**人工**清理旧文件（服务永不自动删图/视频，C10） |
 | 工具调用慢但成功 | 正常：视频轮询受 200s 总预算约束（超预算返 `task_id` 收条非错误，稍后 `query_video` 续查）；客户端超时须 ≥210s（详见 agent-config.md §4） |
@@ -325,9 +325,9 @@ sudo systemctl reload caddy
 
 | # | 检查项 | 要点 |
 |---|---|---|
-| ① | **换正式 Agnes Key** | 群内发过的测试 Key 已随消息暴露且实测 401 无效——**不得用于上线**。在 Agnes 控制台重新生成正式 Key，填入 `/etc/mcp-imagegen/env` 的 `AGNES_TOKEN`（600 权限文件；Key 不入代码仓库/文档/日志，纪律 B7） |
-| ② | **Agnes 控制台核对 Key** | `api.agnes-ai.cn` 后台 → API Keys：确认 Key 在有效期内/未吊销；完整复制整串（`sk-` 开头，无空格换行截断）；确认是 API 专用 Key（聊天应用 Token 与 API Key 不通用）。此前实测：无效 Key 返回 401 `Invalid token`——端点可达、属 Key 校验层拒绝，换 Key 即过 |
-| ③ | **首次部署附录 A 实测项** | 按项目内方案《MCP图片视频生成Server_增量设计方案V2.md》九节 9.3「Key 到位后 30 分钟首轮联调清单」五项执行并回填：生图默认档（响应字段/耗时校 30s 档）、生图 2K 档（耗时校 `TIMEOUT_AGNES_IMAGE_SEC`）、非法 size（400 错误体 message 透传）、视频提交→轮询至完成（状态枚举/总耗时校 A-5）、连发 3 次生图观察 429 与 Retry-After——对应附录 A-2/A-3/A-4/A-5 实测回填 |
+| ① | **换正式 上游服务提供方 Key** | 群内发过的测试 Key 已随消息暴露且实测 401 无效——**不得用于上线**。在 上游服务提供方 控制台重新生成正式 Key，填入 `/etc/mcp-imagegen/env` 的 `UPSTREAM_TOKEN`（600 权限文件；Key 不入代码仓库/文档/日志，纪律 B7） |
+| ② | **上游服务提供方 控制台核对 Key** | `api.example.com` 后台 → API Keys：确认 Key 在有效期内/未吊销；完整复制整串（`sk-` 开头，无空格换行截断）；确认是 API 专用 Key（聊天应用 Token 与 API Key 不通用）。此前实测：无效 Key 返回 401 `Invalid token`——端点可达、属 Key 校验层拒绝，换 Key 即过 |
+| ③ | **首次部署附录 A 实测项** | 按项目内方案《MCP图片视频生成Server_增量设计方案V2.md》九节 9.3「Key 到位后 30 分钟首轮联调清单」五项执行并回填：生图默认档（响应字段/耗时校 30s 档）、生图 2K 档（耗时校 `TIMEOUT_UPSTREAM_IMAGE_SEC`）、非法 size（400 错误体 message 透传）、视频提交→轮询至完成（状态枚举/总耗时校 A-5）、连发 3 次生图观察 429 与 Retry-After——对应附录 A-2/A-3/A-4/A-5 实测回填 |
 | ④ | 换 Key 后重启与复核 | `systemctl restart mcp-imagegen`（EnvironmentFile 改动须 restart 生效）→ `journalctl` 确认 §6 三行自检 + `[startup]` 就绪；再跑一遍 §8 安装验证 |
 
 ---
@@ -337,6 +337,6 @@ sudo systemctl reload caddy
 | 版本 | 日期 | 变更 |
 |---|---|---|
 | V1.0 | 2026-10-10 | 初版：安装/配置/systemd 装载/更新流程/运维三件套/Caddy 前置；环境变量与 `config.py`、`config.example.env` 逐字核对；关键命令实测通过；与 Ethan 交付的 systemd 单元、Caddyfile 逐字核对一致（含 `ExecStartPre`、水位 timer 04:30、Caddy `response_header_timeout 220s`） |
-| V2.0 | 2026-10-10 | V2 部署文档同步（Agnes 双模型三工具）：§5.1 变量表重写（19→25 项，硅基四变量删除、Agnes/视频/任务表九项新增）；§2 增 `VIDEO_DIR` 创建与权限；§6 自检输出更新为 V2 三行；§7.1 双目录水位 + 单元注释 4 处滞后清单（功能层无需改）；§9/§10 日志 12→15 字段；§12 排查表适配；新增 §13 上线前检查清单 |
+| V2.0 | 2026-10-10 | V2 部署文档同步（上游服务提供方 双模型三工具）：§5.1 变量表重写（19→25 项，另一家上游四变量删除、上游服务提供方/视频/任务表九项新增）；§2 增 `VIDEO_DIR` 创建与权限；§6 自检输出更新为 V2 三行；§7.1 双目录水位 + 单元注释 4 处滞后清单（功能层无需改）；§9/§10 日志 12→15 字段；§12 排查表适配；新增 §13 上线前检查清单 |
 
 下一步建议：正式 Key 落位后先过 §13 上线闸门（换 Key → 控制台核对 → 附录 A 实测回填），再按 §1–§8 真机完整演练并逐项对账，进入 24h 稳定性观察（验收⑯）；开发确认 §7.1 注释滞后清单后，下轮统一改单元文件注释（连同 `config.example.env` 残留清理）。

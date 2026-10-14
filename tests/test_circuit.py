@@ -30,7 +30,7 @@ def make(clock=None, hard=600.0, soft=300.0):
 # ---------------------------------------------------------------------------
 def test_initial_state_closed(clock):
     cb = make(clock)
-    s = cb.check("agnes-image")
+    s = cb.check("image")
     assert not s.open and not s.probe
     assert s.state == STATE_CLOSED
     # V2：check 为纯查询，不落表（snapshot 只反映真实发生过写入的模型）
@@ -39,9 +39,9 @@ def test_initial_state_closed(clock):
 
 def test_two_models_independent(clock):
     cb = make(clock)
-    cb.record_failure("agnes-image", FailureKind.HARD)
-    assert cb.check("agnes-image").open
-    assert not cb.check("agnes-video").open  # 另一模型不受影响
+    cb.record_failure("image", FailureKind.HARD)
+    assert cb.check("image").open
+    assert not cb.check("video").open  # 另一模型不受影响
 
 
 def test_rejects_nonpositive_durations():
@@ -56,8 +56,8 @@ def test_rejects_nonpositive_durations():
 # ---------------------------------------------------------------------------
 def test_hard_failure_opens_immediately(clock):
     cb = make(clock)
-    cb.record_failure("agnes-image", FailureKind.HARD)
-    s = cb.check("agnes-image")
+    cb.record_failure("image", FailureKind.HARD)
+    s = cb.check("image")
     assert s.open
     assert s.state == STATE_OPEN_HARD
     assert s.kind is FailureKind.HARD
@@ -66,17 +66,17 @@ def test_hard_failure_opens_immediately(clock):
 
 def test_hard_open_before_expiry(clock):
     cb = make(clock)
-    cb.record_failure("agnes-image", FailureKind.HARD)
+    cb.record_failure("image", FailureKind.HARD)
     clock.advance(599.9)
-    assert cb.check("agnes-image").open  # 未到期仍 OPEN
-    assert cb.check("agnes-image").remaining_sec == pytest.approx(0.1, abs=0.05)
+    assert cb.check("image").open  # 未到期仍 OPEN
+    assert cb.check("image").remaining_sec == pytest.approx(0.1, abs=0.05)
 
 
 def test_hard_open_at_expiry_half_open_probe(clock):
     cb = make(clock)
-    cb.record_failure("agnes-image", FailureKind.HARD)
+    cb.record_failure("image", FailureKind.HARD)
     clock.advance(600.0)
-    s = cb.check("agnes-image")  # 到期 → 半开 + 探针资格
+    s = cb.check("image")  # 到期 → 半开 + 探针资格
     assert not s.open
     assert s.probe
     assert s.state == STATE_HALF_OPEN
@@ -85,33 +85,33 @@ def test_hard_open_at_expiry_half_open_probe(clock):
 def test_half_open_only_one_probe(clock):
     """半开防泄洪（R4）：探针资格只授予一次，后续按 OPEN。"""
     cb = make(clock)
-    cb.record_failure("agnes-image", FailureKind.HARD)
+    cb.record_failure("image", FailureKind.HARD)
     clock.advance(600.0)
-    first = cb.check("agnes-image")
+    first = cb.check("image")
     assert first.probe
-    second = cb.check("agnes-image")
+    second = cb.check("image")
     assert second.open  # 第二个请求按 OPEN 处理
     assert not second.probe
 
 
 def test_probe_success_closes(clock):
     cb = make(clock)
-    cb.record_failure("agnes-image", FailureKind.HARD)
+    cb.record_failure("image", FailureKind.HARD)
     clock.advance(600.0)
-    assert cb.check("agnes-image").probe
-    cb.record_success("agnes-image")
-    s = cb.check("agnes-image")
+    assert cb.check("image").probe
+    cb.record_success("image")
+    s = cb.check("image")
     assert not s.open and not s.probe
     assert s.state == STATE_CLOSED
 
 
 def test_probe_hard_failure_reopens_hard(clock):
     cb = make(clock)
-    cb.record_failure("agnes-image", FailureKind.HARD)
+    cb.record_failure("image", FailureKind.HARD)
     clock.advance(600.0)
-    assert cb.check("agnes-image").probe
-    cb.record_failure("agnes-image", FailureKind.HARD)  # 探针又撞 429
-    s = cb.check("agnes-image")
+    assert cb.check("image").probe
+    cb.record_failure("image", FailureKind.HARD)  # 探针又撞 429
+    s = cb.check("image")
     assert s.open and s.state == STATE_OPEN_HARD
     assert s.remaining_sec == pytest.approx(600.0)  # 续期一整轮
 
@@ -121,37 +121,37 @@ def test_probe_hard_failure_reopens_hard(clock):
 # ---------------------------------------------------------------------------
 def test_single_soft_failure_does_not_open(clock):
     cb = make(clock)
-    cb.record_failure("agnes-image", FailureKind.SOFT)
-    assert not cb.check("agnes-image").open
+    cb.record_failure("image", FailureKind.SOFT)
+    assert not cb.check("image").open
 
 
 def test_two_consecutive_soft_failures_open_soft(clock):
     cb = make(clock)
-    cb.record_failure("agnes-image", FailureKind.SOFT)
-    cb.record_failure("agnes-image", FailureKind.SOFT)
-    s = cb.check("agnes-image")
+    cb.record_failure("image", FailureKind.SOFT)
+    cb.record_failure("image", FailureKind.SOFT)
+    s = cb.check("image")
     assert s.open and s.state == STATE_OPEN_SOFT
     assert s.remaining_sec == pytest.approx(300.0)
 
 
 def test_soft_counter_reset_by_success(clock):
     cb = make(clock)
-    cb.record_failure("agnes-image", FailureKind.SOFT)
-    cb.record_success("agnes-image")  # 清零
-    cb.record_failure("agnes-image", FailureKind.SOFT)
-    assert not cb.check("agnes-image").open  # 1 次不计
-    cb.record_failure("agnes-image", FailureKind.SOFT)  # 连续第 2 次 → 熔断
-    assert cb.check("agnes-image").open
+    cb.record_failure("image", FailureKind.SOFT)
+    cb.record_success("image")  # 清零
+    cb.record_failure("image", FailureKind.SOFT)
+    assert not cb.check("image").open  # 1 次不计
+    cb.record_failure("image", FailureKind.SOFT)  # 连续第 2 次 → 熔断
+    assert cb.check("image").open
 
 
 def test_probe_soft_failure_reopens_soft(clock):
     cb = make(clock)
-    cb.record_failure("agnes-image", FailureKind.SOFT)
-    cb.record_failure("agnes-image", FailureKind.SOFT)
+    cb.record_failure("image", FailureKind.SOFT)
+    cb.record_failure("image", FailureKind.SOFT)
     clock.advance(300.0)
-    assert cb.check("agnes-image").probe
-    cb.record_failure("agnes-image", FailureKind.SOFT)  # 探针失败
-    s = cb.check("agnes-image")
+    assert cb.check("image").probe
+    cb.record_failure("image", FailureKind.SOFT)  # 探针失败
+    s = cb.check("image")
     assert s.open and s.state == STATE_OPEN_SOFT
     assert s.remaining_sec == pytest.approx(300.0)
 
@@ -159,39 +159,39 @@ def test_probe_soft_failure_reopens_soft(clock):
 def test_soft_failure_in_hard_open_extends_without_downgrade(clock):
     """硬熔断不因软失败降级（E2：显式请求失败写入同一路径）。"""
     cb = make(clock)
-    cb.record_failure("agnes-image", FailureKind.HARD)
+    cb.record_failure("image", FailureKind.HARD)
     clock.advance(300.0)
-    cb.record_failure("agnes-image", FailureKind.SOFT)  # 续期且不降级
-    s = cb.check("agnes-image")
+    cb.record_failure("image", FailureKind.SOFT)  # 续期且不降级
+    s = cb.check("image")
     assert s.open and s.state == STATE_OPEN_HARD
     assert s.remaining_sec == pytest.approx(600.0)  # 从续期点重计
 
 
 def test_hard_failure_in_soft_open_upgrades(clock):
     cb = make(clock)
-    cb.record_failure("agnes-image", FailureKind.SOFT)
-    cb.record_failure("agnes-image", FailureKind.SOFT)
-    cb.record_failure("agnes-image", FailureKind.HARD)  # 直接升级硬熔断
-    s = cb.check("agnes-image")
+    cb.record_failure("image", FailureKind.SOFT)
+    cb.record_failure("image", FailureKind.SOFT)
+    cb.record_failure("image", FailureKind.HARD)  # 直接升级硬熔断
+    s = cb.check("image")
     assert s.open and s.state == STATE_OPEN_HARD
 
 
 def test_hard_failure_resets_soft_counter(clock):
     cb = make(clock)
-    cb.record_failure("agnes-image", FailureKind.SOFT)
-    cb.record_failure("agnes-image", FailureKind.HARD)
-    cb.record_success("agnes-image")
-    cb.record_failure("agnes-image", FailureKind.SOFT)  # 计数已清零，此为第 1 次
-    assert not cb.check("agnes-image").open
+    cb.record_failure("image", FailureKind.SOFT)
+    cb.record_failure("image", FailureKind.HARD)
+    cb.record_success("image")
+    cb.record_failure("image", FailureKind.SOFT)  # 计数已清零，此为第 1 次
+    assert not cb.check("image").open
 
 
 def test_success_from_open_state_closes(clock):
     """E2：OPEN 态下显式请求成功 → 解除熔断。"""
     cb = make(clock)
-    cb.record_failure("agnes-image", FailureKind.HARD)
-    assert cb.check("agnes-image").open
-    cb.record_success("agnes-image")
-    assert not cb.check("agnes-image").open
+    cb.record_failure("image", FailureKind.HARD)
+    assert cb.check("image").open
+    cb.record_success("image")
+    assert not cb.check("image").open
 
 
 # ---------------------------------------------------------------------------
@@ -200,18 +200,18 @@ def test_success_from_open_state_closes(clock):
 def test_abandon_probe_regrants_eligibility(clock):
     """探针请求未能发出时回收资格，半开状态机不悬死。"""
     cb = make(clock)
-    cb.record_failure("agnes-image", FailureKind.HARD)
+    cb.record_failure("image", FailureKind.HARD)
     clock.advance(600.0)
-    assert cb.check("agnes-image").probe
-    cb.abandon_probe("agnes-image")  # 归还资格（不推进 opened_at）
-    assert cb.check("agnes-image").probe  # 再次授予
+    assert cb.check("image").probe
+    cb.abandon_probe("image")  # 归还资格（不推进 opened_at）
+    assert cb.check("image").probe  # 再次授予
 
 
 def test_abandon_probe_ignored_for_non_half_open(clock):
     cb = make(clock)
-    cb.record_failure("agnes-image", FailureKind.HARD)
-    cb.abandon_probe("agnes-image")  # OPEN 态调用：无副作用
-    assert cb.check("agnes-image").open
+    cb.record_failure("image", FailureKind.HARD)
+    cb.abandon_probe("image")  # OPEN 态调用：无副作用
+    assert cb.check("image").open
     cb.abandon_probe("no-such-model")  # 未知模型：不炸
 
 
@@ -220,25 +220,25 @@ def test_abandon_probe_ignored_for_non_half_open(clock):
 # ---------------------------------------------------------------------------
 def test_full_cycle_hard_close_reopen(clock):
     cb = make(clock)
-    cb.record_failure("agnes-image", FailureKind.HARD)
+    cb.record_failure("image", FailureKind.HARD)
     clock.advance(600.0)
-    assert cb.check("agnes-image").probe
-    cb.record_success("agnes-image")  # CLOSED
-    assert not cb.check("agnes-image").open
-    cb.record_failure("agnes-image", FailureKind.HARD)  # 再次硬熔断
+    assert cb.check("image").probe
+    cb.record_success("image")  # CLOSED
+    assert not cb.check("image").open
+    cb.record_failure("image", FailureKind.HARD)  # 再次硬熔断
     clock.advance(599.99)
-    assert cb.check("agnes-image").open
+    assert cb.check("image").open
     clock.advance(0.01)
-    assert cb.check("agnes-image").probe
+    assert cb.check("image").probe
 
 
 def test_snapshot_multi_model(clock):
     cb = make(clock)
-    cb.record_failure("agnes-image", FailureKind.SOFT)
-    cb.record_failure("agnes-image", FailureKind.SOFT)
+    cb.record_failure("image", FailureKind.SOFT)
+    cb.record_failure("image", FailureKind.SOFT)
     snap = cb.snapshot()
-    assert snap["agnes-image"] == STATE_OPEN_SOFT
-    assert "agnes-video" not in snap or snap.get("agnes-video") != STATE_OPEN_SOFT
+    assert snap["image"] == STATE_OPEN_SOFT
+    assert "video" not in snap or snap.get("video") != STATE_OPEN_SOFT
 
 
 def test_soft_threshold_is_two():

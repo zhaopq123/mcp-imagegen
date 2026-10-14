@@ -34,7 +34,7 @@ from conftest import FakeClock, make_config
 import infra.persist as persist_mod
 from app import contract as contract_mod
 from app.video_pipeline import VideoPipeline
-from infra import agnes as agnes_mod
+from providers import gateway as gateway_mod
 from infra import budget as budget_mod
 from infra import tasks as tasks_mod
 
@@ -50,20 +50,20 @@ UPSTREAM_WEBM = "https://up.example/v/clip.webm"
 # ---------------------------------------------------------------------------
 # 工具：结果工厂 / 假客户端 / 假 sleep
 # ---------------------------------------------------------------------------
-def submit_ok(video_id: str = "vid-p") -> agnes_mod.ApiCallResult:
-    return agnes_mod.ApiCallResult(
-        ok=True, status_code=200, model_id="agnes-video-2.5-flash",
+def submit_ok(video_id: str = "vid-p") -> gateway_mod.ApiCallResult:
+    return gateway_mod.ApiCallResult(
+        ok=True, status_code=200, provider_id="video", model_id="video",
         video_id=video_id)
 
 
-def query_completed(url: str) -> agnes_mod.ApiCallResult:
-    return agnes_mod.ApiCallResult(
-        ok=True, status_code=200, model_id="agnes-video-2.5-flash",
+def query_completed(url: str) -> gateway_mod.ApiCallResult:
+    return gateway_mod.ApiCallResult(
+        ok=True, status_code=200, provider_id="video", model_id="video",
         video_status="completed", video_url=url)
 
 
 class FakeVideoApi:
-    """AgnesClient 假替身：一次提交 + 脚本化单查（本轮无需占槽记录）。"""
+    """ProviderGateway 假替身：一次提交 + 脚本化单查（本轮无需占槽记录）。"""
 
     def __init__(self, submit_result=None, query_script=None) -> None:
         self.submit_result = submit_result or submit_ok()
@@ -71,9 +71,9 @@ class FakeVideoApi:
         self.submit_calls: list[dict] = []
         self.query_calls: list[dict] = []
 
-    async def submit_video(self, *, model, prompt, seconds, aspect_ratio,
+    async def submit_video(self, *, model=None, prompt, seconds, aspect_ratio,
                            deadline, seed=None, mode="text", first_frame=None,
-                           last_frame=None, reference_images=None):
+                           last_frame=None, reference_images=None, provider=None):
         self.submit_calls.append({
             "model": model, "prompt": prompt, "seconds": seconds,
             "aspect_ratio": aspect_ratio, "deadline": deadline, "seed": seed,
@@ -82,7 +82,7 @@ class FakeVideoApi:
         })
         return self.submit_result
 
-    async def query_video(self, *, video_id, model, deadline):
+    async def query_video(self, *, video_id, model=None, deadline, provider=None):
         self.query_calls.append({
             "video_id": video_id, "model": model, "deadline": deadline})
         return self.query_script.pop(0)
@@ -206,7 +206,7 @@ async def test_success_mp4_content_type(tmp_path, caplog):
     # meta 行：persisted（非 url_expires / 非 persist_failed）
     meta_line = lines[1]
     assert [ord(c) for c in meta_line[:7]] == ORD_META
-    assert "model=agnes-video" in meta_line
+    assert "model=video" in meta_line
     assert "seconds=5" in meta_line
     assert "aspect_ratio=16:9" in meta_line
     assert "persisted" in meta_line

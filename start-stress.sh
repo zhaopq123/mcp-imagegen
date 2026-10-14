@@ -2,10 +2,10 @@
 set -a
 . /etc/mcp-imagegen/env
 set +a
-export AGNES_BASE_URL=http://127.0.0.1:8001
+export UPSTREAM_BASE_URL=http://127.0.0.1:8001
 export PORT=8002
 export MCPACCESS_TOKEN=stresstoken
-export AGNES_TOKEN=mock
+export UPSTREAM_TOKEN=mock
 export IMAGE_DIR=/tmp/stress-images
 export VIDEO_DIR=/tmp/stress-videos
 export UPSTREAM_RPS=50

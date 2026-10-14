@@ -1,6 +1,6 @@
 # mcp-imagegen
 
-> 基于 **Agnes AI** 的图片 / 视频生成 MCP Server —— 单上游、三工具、可自托管。
+> 基于 **Provider 抽象** 的图片 / 视频生成 MCP Server —— 可接入任意第三方或自建上游，零默认配置即开箱，配好管理面板才可用，自带管理控制台。
 
 一个 Model Context Protocol（MCP）服务器，把文生图与文生视频封装成标准 MCP 工具，
 供 Claude Desktop / DSH / 豆包工作 / WorkBuddy 等任意支持 MCP 的客户端调用。
@@ -14,7 +14,7 @@
 |---|---|
 | **四工具** | `generate_image`（文生图/参考图生图，支持批量拆分）· `generate_video`（文生视频、首尾帧/参考图、服务端排队）· `query_video`（查询视频任务状态）· `list_video_tasks`（批量查看后台作业） |
 | **图像迭代闭环** | 可上传本机图片，也可把本服务的图片/视频产物作为后续参考输入；图像字节不经第三方图床 |
-| **单上游** | 仅依赖 Agnes AI（`agnes-image-2.5-flash` / `agnes-video-2.5-flash`），配置面简单 |
+| **Provider 抽象** | 上游信息全部在管理面板配置（base_url / 模型 / 密钥 / 请求模板 / 限速），不写死任何厂商；零配置启动即告知「无可用提供方」 |
 | **并发与排队** | 可配并发槽（默认 3），排队超时返回 `busy` 而非无限等待 |
 | **熔断保护** | 硬熔断（429/402）与软熔断（连续失败），避免把上游配额打爆 |
 | **持久化转存** | `persist=true` 时把上游临时 URL 的产物转存到本地，经 `/files/<name>` 提供长期可访问链接 |
@@ -43,14 +43,16 @@ python3 -m venv venv
 cp config.example.env .env
 ```
 
-**必填两项**（缺失则启动 fail-fast）：
+**必填一项**（缺失则启动 fail-fast）：
 
 | 变量 | 说明 |
 |---|---|
-| `AGNES_TOKEN` | Agnes AI 的 API Key |
 | `MCPACCESS_TOKEN` | 客户端访问本服务所需的 Bearer Token（自己随便定一个强随机串） |
+| `STORE_PATH` | 提供方 / 访问令牌 / 管理员口令的持久化文件（默认 `data/store.json`，已在 `.gitignore` 中排除，切勿入库） |
 
-其余 20+ 项见 `config.example.env`，全部有默认值。
+> ⚠️ V5 **不再要求上游密钥写在环境变量里**：上游（第三方或自建）通过管理面板配置，密钥只存在 `data/store.json`（本地文件，不进代码仓库、不进日志）。零上游配置时服务照常启动，但调用工具会明确返回「无可用提供方」而非静默失败。
+
+其余运行参数见 `config.example.env`，全部有默认值。
 
 ### 3. 启动前自检
 
@@ -67,6 +69,20 @@ set -a; . ./.env; set +a
 ```
 
 服务监听 `0.0.0.0:8000`，MCP 端点为 `http://<host>:8000/mcp`。
+
+---
+
+## 管理面板（配置上游 / 运行参数）
+
+V5 把「上游配置」从环境变量搬进了 Web 控制台（单文件内联 SPA，零外部依赖）。
+首次启动后打开 `http://<host>:8000/admin`，用面板完成初始化与管理：
+
+- **初始化**：首次进入设置管理员口令（弱口令会被拒），之后凭口令登录，会话用 `HttpOnly` + `SameSite=Strict` Cookie 保护，写操作需带 `X-Admin-Request` 头防 CSRF；
+- **提供方 CRUD**：新增 / 编辑 / 删除上游，填 `base_url`、模型名、鉴权方式、请求/轮询模板、每秒请求数与突发额度（`limits.rps` / `limits.burst`，默认 10 / 20，脆弱上游可调小）；列表接口对密钥脱敏（只回 `token_preview` + `token_set`）；
+- **运行参数热更新**：并发上限、排队等待、视频轮询间隔等在面板改完**立即生效，无需重启**；
+- **看板**：总览 / 日志 / 视频任务 / 令牌管理一应俱全。
+
+> 提供方密钥只落在 `data/store.json`（已被 `.gitignore` 排除）。仓库里**没有任何上游地址与密钥**。
 
 ---
 
@@ -200,9 +216,9 @@ curl -X POST "http://<host>:8000/upload" \\
 
 ```bash
 ./venv/bin/pip install -r requirements-dev.txt
-./venv/bin/python -m pytest -q          # 424 项单测
-./venv/bin/python acceptance/e2e_acceptance.py        # e2e 全量（含慢死路径，约 3 分钟）
-./venv/bin/python acceptance/e2e_acceptance.py --fast # 快速档
+./venv/bin/python -m pytest -q          # 557 项单测 + 1 跳过
+./venv/bin/python scripts/e2e_v5.py     # V5 端到端自检（真起服务+真 mock 上游，约 1 分钟）
+./venv/bin/python scripts/stress_mcp.py # 多会话 / 多并发压测
 ```
 
 ---
@@ -260,7 +276,7 @@ server.py                   入口：配置自检 → 组件装配 → FastMCP �
 │   ├── router.py           模型路由
 │   └── normalizer.py       响应归一化
 ├── infra/
-│   ├── agnes.py            Agnes AI 客户端（httpx）
+│   ├── upstream.py            上游服务提供方 客户端（httpx）
 │   ├── budget.py           并发槽池
 │   ├── circuit.py          熔断器（硬 / 软）
 │   ├── persist.py          产物转存服务
@@ -281,4 +297,4 @@ server.py                   入口：配置自检 → 组件装配 → FastMCP �
 
 ## 致谢
 
-上游能力由 [Agnes AI](https://api.agnes-ai.cn) 提供。本项目仅做协议适配与工程加固。
+上游能力由 [上游服务提供方](https://api.example.com) 提供。本项目仅做协议适配与工程加固。

@@ -12,7 +12,7 @@ ratio（D2 新增）：官方 8 档枚举（F3），仅与档位式 size 配合�
 默认不传（上游默认 1:1）。
 
 已删（反向锁定防回归）：quality/steps/guidance/seed 归一表（E25：
-生图请求体不含模型专属参数，seed 为视频侧公共参数，见 agnes.py）、
+生图请求体不含模型专属参数，seed 为视频侧公共参数，见 providers/gateway.py）、
 旧上游两套吸附档位表、cjk_ratio / is_cjk（消费者路由④已删）。
 """
 from __future__ import annotations

@@ -27,16 +27,19 @@ V2 第七轮官方文档对齐 D2/D3/D4 落点）。
 红线：
 - A1″：generate_image description 在 A1′（方案 V2 六节原文）基础上随
   D2 追加 size/ratio 语义句并**重新冻结**（tests/test_tool.py 全等
-  断言，任何优化冲动一律拒绝）：
-  > Generate images from a text prompt using agnes-image-2.5-flash.
-  > Supports batch generation (split into sequential calls server-side).
-  > size accepts a tier (1K/2K/3K/4K) or a WxH value like 1024x768;
-  > ratio (e.g. 16:9) may only be set alongside a tiered size, never
-  > with WxH. NOTE: upstream image URLs are short-lived; set
-  > persist=true to get a durable self-hosted URL.
+  断言，任何优化冲动一律拒绝）。V5 解冻一次，仅为两件事：① 去掉历史
+  上游品牌名（服务现在可对接任意提供方）；② 追加 provider 参数语义句。
+  > Generate images from a text prompt using the configured image
+  > provider. Supports batch generation (split into sequential calls
+  > server-side). size accepts a tier (1K/2K/3K/4K) or a WxH value like
+  > 1024x768; ratio (e.g. 16:9) may only be set alongside a tiered size,
+  > never with WxH. provider: optional name of a configured upstream
+  > service to use for this call. NOTE: upstream image URLs are
+  > short-lived; set persist=true to get a durable self-hosted URL.
 - A2′/A3′：generate_video / query_video description 沿用规格书原文
   （方案 V2 六节 A1′ 明文"零改动"——D2/D3/D4 均不改工具级描述，只改
-  参数级 Field 描述）。原文经群聊渲染层下划线吞蚀，
+  参数级 Field 描述）；V5 同样只做「去品牌名 + 加 provider 句」两处
+  解冻。原文经群聊渲染层下划线吞蚀，
   已按不变证据复原：规格书 2.4 契约表同消息内 "task_id=… 请稍后调用
   query_video 查询" 完整保留（吞蚀为配对现象，非原文缺字），且本工具
   注册名即 query_video、参数名即 task_id——描述必须指向真实工具名；
@@ -71,32 +74,36 @@ TOOL_NAME_LIST = "list_video_tasks"
 # 本次解冻是**产品决策**（用户 2026-10-13 明示「全做」），依据见
 # docs/V4_产品分析与改造说明.md §3.1。
 TOOL_DESCRIPTION = (
-    "Generate images from a text prompt using agnes-image-2.5-flash. "
-    "Supports batch generation (split into sequential calls server-side). "
-    "size accepts a tier (1K/2K/3K/4K) or a WxH value like 1024x768; "
-    "ratio (e.g. 16:9) may only be set alongside a tiered size, never "
-    "with WxH. image: optional reference image(s) for image-to-image "
-    "editing or multi-image composition — accept a public URL, a data "
-    "URI/base64, or this server's own artifact name or /files/<name> "
-    "URL. NOTE: upstream image URLs are short-lived; set persist=true "
-    "to get a durable self-hosted URL."
+    "Generate images from a text prompt using the configured image "
+    "provider. Supports batch generation (split into sequential calls "
+    "server-side). size accepts a tier (1K/2K/3K/4K) or a WxH value "
+    "like 1024x768; ratio (e.g. 16:9) may only be set alongside a "
+    "tiered size, never with WxH. provider: optional id of a "
+    "configured upstream service to use for this call (omit it to let "
+    "the server route by priority). image: optional reference image(s) "
+    "for image-to-image editing or multi-image composition — accepts a "
+    "public URL, a data URI/base64, or this server's own artifact name "
+    "or /files/<name> URL. NOTE: upstream image URLs are short-lived; "
+    "set persist=true to get a durable self-hosted URL."
 )
 
 # A2‴（V4 重冻结）：在规格书 2.2 原文基础上追加首尾帧/参考图语义句
 # （en-dash U+2013 保留；产品决策依据同上）。
 TOOL_DESCRIPTION_VIDEO = (
     "Generate a short video (4\u201312 seconds) from a text prompt using "
-    "agnes-video-2.5-flash. Waits synchronously within the time budget; "
-    "if the task is still running at deadline, returns a task_id which "
-    "can be polled via the query_video tool. Returns video URL on "
-    "success. first_frame/last_frame: optional keyframe images (use "
-    "first_frame to animate this image as the real first frame); "
-    "reference_images: optional style/content references (re-composes). "
-    "Each accepts a public URL, data URI/base64, or this server's own "
-    "artifact name or /files/<name> URL. When the upstream queue is "
-    "full the server queues the submission and returns a task_id with "
-    "status=queued. NOTE: set persist=true for a durable URL (upstream "
-    "URLs are short-lived)."
+    "the configured video provider. Waits synchronously within the time "
+    "budget; if the task is still running at deadline, returns a "
+    "task_id which can be polled via the query_video tool. Returns "
+    "video URL on success. provider: optional id of a configured "
+    "upstream service to use for this call (omit it to let the server "
+    "route by priority). first_frame/last_frame: optional keyframe "
+    "images (use first_frame to animate this image as the real first "
+    "frame); reference_images: optional style/content references "
+    "(re-composes). Each accepts a public URL, data URI/base64, or "
+    "this server's own artifact name or /files/<name> URL. When the "
+    "upstream queue is full the server queues the submission and "
+    "returns a task_id with status=queued. NOTE: set persist=true for "
+    "a durable URL (upstream URLs are short-lived)."
 )
 
 # A3′：query_video description 逐字符冻结（规格书 2.3 原文；该段仅含
@@ -110,11 +117,11 @@ TOOL_DESCRIPTION_QUERY = (
 
 # A2：参数名（名称有序；D2/D3 增量；V4 增参考图/首尾帧；pipeline 侧二次校验范围）
 TOOL_PARAMS: tuple[str, ...] = (
-    "prompt", "size", "ratio", "batch_size", "persist", "image",
+    "prompt", "size", "ratio", "batch_size", "persist", "image", "provider",
 )
 TOOL_PARAMS_VIDEO: tuple[str, ...] = (
     "prompt", "seconds", "aspect_ratio", "seed", "persist",
-    "first_frame", "last_frame", "reference_images",
+    "first_frame", "last_frame", "reference_images", "provider",
 )
 TOOL_PARAMS_QUERY: tuple[str, ...] = ("task_id",)
 TOOL_PARAMS_LIST: tuple[str, ...] = ("limit",)
@@ -162,6 +169,11 @@ def register_tool(
                 "/files/<name> URL（可直接拿上一张生成结果当参考图）；"
                 "不传=纯文生图")
         ] = None,
+        provider: Annotated[
+            Optional[str], Field(
+                description="指定用哪个服务提供方（管理面板里配置的 id）；"
+                "不传=按服务端路由（令牌绑定 → 优先级）")
+        ] = None,
     ) -> str:
         """见模块级 TOOL_DESCRIPTION（此处 docstring 不进 schema）。"""
         return await pipeline.run(
@@ -172,6 +184,7 @@ def register_tool(
             persist_flag=persist,
             images=image,
             http_headers=_current_http_headers(),
+            provider=provider,
         )
 
     @mcp.tool(name=TOOL_NAME_VIDEO, description=TOOL_DESCRIPTION_VIDEO, output_schema=None)
@@ -210,6 +223,11 @@ def register_tool(
                 "仅作风格/内容参考，会重新构图——要构图可控请用 "
                 "first_frame；与 first_frame/last_frame 互斥")
         ] = None,
+        provider: Annotated[
+            Optional[str], Field(
+                description="指定用哪个服务提供方（管理面板里配置的 id）；"
+                "不传=按服务端路由（令牌绑定 → 优先级）")
+        ] = None,
     ) -> str:
         """见模块级 TOOL_DESCRIPTION_VIDEO（此处 docstring 不进 schema）。"""
         return await video_pipeline.run(
@@ -222,6 +240,7 @@ def register_tool(
             last_frame=last_frame,
             reference_images=reference_images,
             http_headers=_current_http_headers(),
+            provider=provider,
         )
 
     @mcp.tool(name=TOOL_NAME_QUERY, description=TOOL_DESCRIPTION_QUERY, output_schema=None)

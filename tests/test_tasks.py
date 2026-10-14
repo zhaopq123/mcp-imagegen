@@ -23,7 +23,7 @@ def make_table(clock, **kw):
 
 
 def reg(table, task_id, **kw):
-    return table.register(task_id, model=kw.get("model", "agnes-video"),
+    return table.register(task_id, model=kw.get("model", "video"),
                           prompt_hash=kw.get("prompt_hash", "h-" + task_id))
 
 
@@ -36,7 +36,7 @@ def test_register_and_get_hit(clock):
     entry = table.get("t1")
     assert entry is not None
     assert entry.task_id == "t1"
-    assert entry.model == "agnes-video"
+    assert entry.model == "video"
     assert entry.prompt_hash == "h-t1"
     assert entry.status == tasks.STATUS_RUNNING
     assert entry.url is None

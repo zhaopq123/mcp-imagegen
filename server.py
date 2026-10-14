@@ -1,21 +1,22 @@
-"""MCP 图片生成 Server · 入口（S1 配置自检 + S3 全装配 + S4 systemd 协作）。
+"""服务入口：装配 → 自检 → 前台运行。
 
-装配链：
-    config.load_config → 组件（circuit / slot pool / api client / persist /
-    pipeline）→ FastMCP（tool + /healthz + /files + lifespan）→ BearerGate
-    （/mcp 鉴权）→ uvicorn（0.0.0.0:PORT）。
+装配链::
 
-systemd 协作（Type=notify，6.1/6.2）：
-    - startup（绑定完成）→ sd_notify READY=1；
-    - 心跳 task（事件循环内，R2 铁律禁线程）每 15s 发 WATCHDOG=1；
-    - 每日 04:00 客户端重建（rotate 指针热切换，E6）；
-    - SIGTERM → uvicorn 停收新请求 → 在途连接排空
-      （timeout_graceful_shutdown=220 = TimeoutStopSec）→ lifespan
-      shutdown：STOPPING=1 + 组件 aclose 收尾 → 退出。
+    load_config → Store（Provider/令牌/管理员凭据）→ ProviderGateway
+    → 多队列泳道池 → Persist → 生图管道 / 视频管道 → FastMCP（工具 +
+    /healthz + /files + /upload + /admin）→ 访问令牌门 → uvicorn
 
-运行：
-    python server.py            # 前台服务（systemd 下运行）
-    python server.py --check    # 仅配置自检（退出码 0/2，部署前检查）
+systemd 协作（Type=notify）：
+    - 绑定完成 → sd_notify READY=1；
+    - 心跳协程每 15s 发 WATCHDOG=1（R2：绝不开线程）；
+    - 连接池定期热重建（CLIENT_ROTATE_SEC）；
+    - SIGTERM → uvicorn 停收新请求 → 在途排空（TimeoutStopSec）→
+      lifespan shutdown：STOPPING=1 + 组件收尾 → 退出。
+
+运行::
+
+    python server.py            # 前台服务
+    python server.py --check    # 仅自检（退出码 0/2）
 """
 from __future__ import annotations
 
@@ -23,152 +24,75 @@ import asyncio
 import contextlib
 import logging
 import sys
+import time
 from collections.abc import AsyncIterator
 
 import uvicorn
 from fastmcp import FastMCP
 
+from admin import AdminAPI, AdminContext, RingLogHandler
+from admin.auth import SessionManager
 from app import endpoints, tool
 from app.pipeline import GeneratePipeline
 from app.video_pipeline import VideoPipeline
 from config import SYSTEMD_TIMEOUT_STOP_SEC, Config, ConfigError, load_config
-from infra import agnes, budget, circuit, persist, ratelimit, tasks
-from ops import liveness, shutdown
+from infra import budget, circuit, persist, tasks
+from ops import liveness, logline, metrics as metrics_mod, shutdown
+from providers import Store, gateway as gateway_mod
+from providers.store import new_token
 
 logger = logging.getLogger("mcp_imagegen.server")
 
+VERSION = "5.0.0"
+
 
 # ---------------------------------------------------------------------------
-# 装配
+# 组件集合
 # ---------------------------------------------------------------------------
-def build_app(
-    cfg: Config,
-    components: "Components | None" = None,
-    *,
-    transport=None,
-    persist_transport=None,
-    notifier: "liveness.SdNotifier | None" = None,
-) -> "BearerApp":
-    """组件组装 + ASGI 应用（供 uvicorn 与端到端测试）。
-
-    transport/persist_transport/notifier 仅供测试注入；生产缺省 None。
-    """
-    if components is None:
-        components = Components.build(
-            cfg, notifier=notifier, transport=transport,
-            persist_transport=persist_transport,
-        )
-
-    @contextlib.asynccontextmanager
-    async def lifespan(app) -> AsyncIterator[None]:
-        # ---- startup（uvicorn 绑定完成后进入）：READY=1 + 后台任务 ----
-        components.notifier.notify("READY=1")
-        logger.info(
-            "[startup] 就绪 port=%d image_dir=%s video_dir=%s 总预算=%.0fs | "
-            "泳道 %s",
-            cfg.port, cfg.image_dir, cfg.video_dir, cfg.total_budget_sec,
-            components.pool.stats(),
-        )
-        heartbeat = asyncio.create_task(
-            liveness.heartbeat_loop(components.notifier),
-            name="watchdog-heartbeat",
-        )
-        rebuild = asyncio.create_task(
-            liveness.daily_rebuild_loop(components.api_client),
-            name="daily-rebuild",
-        )
-        # T9：任务表 TTL 清理（事件循环协程，禁线程 R2；与心跳同纪律）
-        cleanup = asyncio.create_task(
-            components.task_table.cleanup_loop(),
-            name="task-table-cleanup",
-        )
-        try:
-            yield
-        finally:
-            # ---- shutdown：停机通知 → 在途对账 → 组件收尾 ----
-            heartbeat.cancel()
-            rebuild.cancel()
-            cleanup.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await heartbeat
-            with contextlib.suppress(asyncio.CancelledError):
-                await rebuild
-            with contextlib.suppress(asyncio.CancelledError):
-                await cleanup
-            components.coordinator.begin_shutdown()  # STOPPING=1 + 日志
-            # V3：先停后台视频作业跟踪（等待方立即转 E17 deferred；
-            # 上游任务不受影响），再等请求排空
-            components.video_pipeline.cancel_background()
-            await components.coordinator.wait_drained(SYSTEMD_TIMEOUT_STOP_SEC)
-            await components.api_client.aclose()
-            await components.persist.aclose()
-            logger.info("[shutdown] 组件收尾完成，进程退出")
-
-    mcp = FastMCP(name="mcp-imagegen", lifespan=lifespan)
-    tool.register_tool(mcp, components.pipeline, components.video_pipeline)
-    mcp.custom_route("/healthz", methods=["GET"])(
-        endpoints.make_healthz_endpoint(components))
-    mcp.custom_route("/files/{name}", methods=["GET"])(
-        endpoints.make_files_endpoint(cfg.image_dir, cfg.video_dir))
-    mcp.custom_route("/upload", methods=["POST"])(
-        endpoints.make_upload_endpoint(
-            cfg.image_dir, max_bytes=cfg.upload_max_bytes))
-
-    inner = mcp.http_app(path="/mcp")
-    return BearerApp(inner, cfg.mcp_access_token, lifespan_holder=lifespan)
-
-
-class BearerApp:
-    """ASGI 组合：BearerGate(/mcp 鉴权) + fastmcp http_app（lifespan 透传）。"""
-
-    def __init__(self, inner, token: str, lifespan_holder=None) -> None:
-        self.gate = endpoints.BearerGate(inner, token)
-        self._inner = inner
-        self._lifespan_holder = lifespan_holder  # 仅供测试引用
-
-    async def __call__(self, scope, receive, send) -> None:
-        await self.gate(scope, receive, send)
-
-    @property
-    def routes(self):
-        return getattr(self._inner, "routes", [])
-
-
 class Components:
-    """全组件集合（构造顺序 = 依赖顺序；单一事件循环内使用）。"""
+    """全部组件（构造顺序 = 依赖顺序；单一事件循环内使用）。"""
 
     def __init__(
-        self, cfg: Config, circuit_: circuit.CircuitBreaker,
-        pool: budget.SlotPool, api_client: agnes.AgnesClient,
+        self, cfg: Config, store: Store, circuit_: circuit.CircuitBreaker,
+        pool: budget.SlotPool, gateway: gateway_mod.ProviderGateway,
         persist_: persist.PersistService, pipeline: GeneratePipeline,
         notifier: liveness.SdNotifier, coordinator: shutdown.ShutdownCoordinator,
         task_table: tasks.TaskTable, video_pipeline: VideoPipeline,
+        metrics: metrics_mod.Metrics, ring: RingLogHandler,
+        sessions: SessionManager,
     ) -> None:
         self.cfg = cfg
+        self.store = store
         self.circuit = circuit_
         self.pool = pool
-        self.api_client = api_client
+        self.gateway = gateway
         self.persist = persist_
         self.pipeline = pipeline
         self.notifier = notifier
         self.coordinator = coordinator
-        self.task_table = task_table        # T9：query_video 对账状态源
-        self.video_pipeline = video_pipeline  # T9：与生图共用槽池/persist/停机协调
+        self.task_table = task_table
+        self.video_pipeline = video_pipeline
+        self.metrics = metrics
+        self.ring = ring
+        self.sessions = sessions
 
+    # ------------------------------------------------------------------
     @classmethod
     def build(
         cls,
         cfg: Config,
         *,
+        store: Store | None = None,
         notifier: liveness.SdNotifier | None = None,
         transport=None,
         persist_transport=None,
     ) -> "Components":
+        store = store or Store(cfg.store_path)
+        if not store.loaded:
+            store.load()
         notifier = notifier if notifier is not None else liveness.SdNotifier()
         circuit_ = circuit.CircuitBreaker(
-            hard_sec=cfg.circuit_hard_sec, soft_sec=cfg.circuit_soft_sec
-        )
-        # V3：多队列泳道池（生图 / 视频分离，独立额度与排队深度）
+            hard_sec=cfg.circuit_hard_sec, soft_sec=cfg.circuit_soft_sec)
         pool = budget.MultiQueuePool(
             {
                 "image": budget.QueueLane(
@@ -180,29 +104,217 @@ class Components:
             },
             default="image",
         )
-        api_client = agnes.AgnesClient(
-            cfg, transport=transport,
-            limiter=ratelimit.RateLimiter(
-                rps=cfg.upstream_rps, burst=cfg.upstream_burst,
-                cooldown_sec=cfg.upstream_cooldown_sec),
-        )
+        gateway = gateway_mod.ProviderGateway(
+            cfg, store, transport=transport)
         persist_ = persist.PersistService(cfg, transport=persist_transport)
         coordinator = shutdown.ShutdownCoordinator(notifier=notifier)
         pipeline = GeneratePipeline(
-            cfg, pool, circuit_, api_client, persist_, tracker=coordinator,
-        )
-        # T9/V3：作业表（TaskTable 子类，带 future 通知）+ 视频流水线
-        # （共用泳道池 / persist / 停机协调；query_video 不占并发槽，E20）
+            cfg, pool, circuit_, gateway, persist_, tracker=coordinator)
         task_table = tasks.JobTable(
             ttl_sec=cfg.task_ttl_sec, max_entries=cfg.task_max)
         video_pipeline = VideoPipeline(
-            cfg, pool, api_client, task_table, tracker=coordinator,
-            persist=persist_,
-        )
-        return cls(
-            cfg, circuit_, pool, api_client, persist_, pipeline,
+            cfg, pool, gateway, task_table, tracker=coordinator,
+            persist=persist_)
+
+        metrics = metrics_mod.Metrics()
+        ring = RingLogHandler()
+        sessions = SessionManager(store)
+        components = cls(
+            cfg, store, circuit_, pool, gateway, persist_, pipeline,
             notifier, coordinator, task_table, video_pipeline,
+            metrics, ring, sessions)
+        components._install_metrics_hook()
+        return components
+
+    # ------------------------------------------------------------------
+    def _install_metrics_hook(self) -> None:
+        """把指标采集挂到「每请求恰好一次」的日志出口上。
+
+        不挂在 pipeline 里是为了：任何一条新增的收尾分支都不会漏统计——
+        漏统计的指标比没有指标更危险（会让人误判系统健康）。
+        """
+        logline.LogRecord.clear_hooks()
+        logline.LogRecord.add_hook(self._metrics_hook)
+
+    def _metrics_hook(self, record: logline.LogRecord) -> None:
+        total_raw = str(record.total or "").rstrip("s")
+        try:
+            latency_ms = float(total_raw) * 1000 if total_raw else 0.0
+        except ValueError:
+            latency_ms = 0.0
+        self.metrics.record(
+            kind=getattr(record, "kind", "image"),
+            result=record.result or "null",
+            latency_ms=latency_ms,
+            provider=getattr(record, "provider", "") or "",
+            detail=record.params or "",
         )
+
+    # ------------------------------------------------------------------
+    # 热更新（管理面板 → 运行参数）
+    # ------------------------------------------------------------------
+    def apply_settings(self, patch: dict) -> "Config":
+        """应用可热更新的运行参数，返回新 Config。
+
+        非法值抛 ConfigError（由面板转 400）。返回新 cfg 而不是快照字典：
+        调用方（管理面板）要拿它替换自己的引用——否则面板读到的还是旧值，
+        用户会看到"改了没生效"，而实际上运行态早就换了。
+        """
+        new_cfg = self.cfg.with_overrides(patch)
+        new_cfg.self_check_report()  # 违例即抛，绝不把坏配置写进运行态
+        self.cfg = new_cfg
+        lane_image = self.pool.resize(
+            "image", new_cfg.image_max_concurrency,
+            new_cfg.image_queue_wait_sec, new_cfg.image_queue_max)
+        lane_video = self.pool.resize(
+            "video", new_cfg.video_max_concurrency,
+            new_cfg.video_queue_wait_sec, new_cfg.video_queue_max)
+        self.pipeline.reconfigure(new_cfg)
+        self.video_pipeline.reconfigure(new_cfg)
+        self.persist.reconfigure(new_cfg)
+        self.gateway.reconfigure(new_cfg)
+        logger.info(
+            "[settings] 运行参数已热更新 | 泳道 生图%s 视频%s",
+            lane_image.stats(), lane_video.stats())
+        return new_cfg
+
+
+# ---------------------------------------------------------------------------
+# 引导：令牌与管理员
+# ---------------------------------------------------------------------------
+def bootstrap_access(cfg: Config, store: Store, log=logger) -> None:
+    """确保至少有一个可用访问令牌（否则客户端一个都连不上）。
+
+    优先级：store 里已有 → 不动；
+           环境变量 MCPACCESS_TOKEN（兼容旧部署）→ 落成 store 里的 default；
+           都没有 → 自动签发一个随机令牌并打印到日志（**唯一一次**明文机会）。
+    """
+    if store.tokens:
+        return
+    from providers.schema import TokenRecord
+
+    secret = (cfg.mcp_access_token or "").strip()
+    source = "环境变量 MCPACCESS_TOKEN"
+    if not secret:
+        secret = new_token()
+        source = "随机生成"
+    store.upsert_token(TokenRecord(
+        id="default", name="默认令牌", token=secret,
+        enabled=True, created_at=time.time()))
+    log.warning(
+        "[bootstrap] 已创建默认访问令牌（来源：%s）：%s\n"
+        "            请把它配到 MCP 客户端的 Authorization: Bearer <token>；\n"
+        "            之后可在管理面板「访问令牌」里随时轮换或新增。",
+        source, secret)
+
+
+# ---------------------------------------------------------------------------
+# ASGI 应用
+# ---------------------------------------------------------------------------
+def build_app(
+    cfg: Config,
+    components: "Components | None" = None,
+    *,
+    transport=None,
+    persist_transport=None,
+    notifier: "liveness.SdNotifier | None" = None,
+) -> "AccessApp":
+    """组件组装 + ASGI 应用（供 uvicorn 与端到端测试）。"""
+    if components is None:
+        components = Components.build(
+            cfg, notifier=notifier, transport=transport,
+            persist_transport=persist_transport)
+
+    @contextlib.asynccontextmanager
+    async def lifespan(app) -> AsyncIterator[None]:
+        active = components
+        active.notifier.notify("READY=1")
+        logger.info(
+            "[startup] 就绪 port=%d image_dir=%s video_dir=%s 总预算=%.0fs | "
+            "泳道 %s | 服务提供方 %d 个（生图 %s / 视频 %s）",
+            active.cfg.port, active.cfg.image_dir, active.cfg.video_dir,
+            active.cfg.total_budget_sec, active.pool.stats(),
+            len(active.gateway.stats()),
+            active.gateway.has_capability("image"),
+            active.gateway.has_capability("video"),
+        )
+        heartbeat = asyncio.create_task(
+            liveness.heartbeat_loop(active.notifier), name="watchdog-heartbeat")
+        rebuild = asyncio.create_task(
+            liveness.interval_rebuild_loop(
+                active.gateway, active.cfg.client_rotate_sec),
+            name="pool-rebuild")
+        cleanup = asyncio.create_task(
+            active.task_table.cleanup_loop(), name="task-table-cleanup")
+        sweeper = asyncio.create_task(
+            _session_sweep_loop(active.sessions), name="session-sweep")
+        try:
+            yield
+        finally:
+            for task_ in (heartbeat, rebuild, cleanup, sweeper):
+                task_.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await task_
+            active.coordinator.begin_shutdown()
+            # 先停后台视频作业跟踪（等待方立即转 deferred；上游任务不受影响）
+            active.video_pipeline.cancel_background()
+            await active.coordinator.wait_drained(SYSTEMD_TIMEOUT_STOP_SEC)
+            await active.gateway.aclose()
+            await active.persist.aclose()
+            logger.info("[shutdown] 组件收尾完成，进程退出")
+
+    mcp = FastMCP(name="mcp-imagegen", lifespan=lifespan)
+    tool.register_tool(mcp, components.pipeline, components.video_pipeline)
+    mcp.custom_route("/healthz", methods=["GET"])(
+        endpoints.make_healthz_endpoint(components))
+    mcp.custom_route("/files/{name}", methods=["GET"])(
+        endpoints.make_files_endpoint(
+            components.cfg.image_dir, components.cfg.video_dir))
+    mcp.custom_route("/upload", methods=["POST"])(
+        endpoints.make_upload_endpoint(
+            components.cfg.image_dir,
+            max_bytes=components.cfg.upload_max_bytes))
+
+    # ---- 管理面板：整棵子树交给 AdminAPI 自己分发 ----
+    prefix = (components.cfg.admin_path_prefix or "/admin").rstrip("/")
+    admin_api = AdminAPI(AdminContext(
+        cfg=components.cfg, store=components.store, gateway=components.gateway,
+        pool=components.pool, video_pipeline=components.video_pipeline,
+        persist=components.persist, sessions=components.sessions,
+        metrics=components.metrics, ring=components.ring,
+        apply_settings=components.apply_settings, version=VERSION,
+    ), prefix=prefix)
+    methods = ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"]
+    mcp.custom_route(prefix, methods=["GET"])(admin_api)
+    mcp.custom_route(prefix + "/{rest:path}", methods=methods)(admin_api)
+
+    inner = mcp.http_app(path="/mcp")
+    return AccessApp(inner, components.store)
+
+
+async def _session_sweep_loop(sessions: SessionManager) -> None:
+    """定期清理过期会话（内存表不无限增长）。"""
+    while True:
+        await asyncio.sleep(300)
+        try:
+            sessions.sweep()
+        except Exception:  # noqa: BLE001
+            logger.debug("[admin] 会话清理异常（忽略）")
+
+
+class AccessApp:
+    """ASGI 组合：访问令牌门（/mcp、/upload）+ fastmcp + 管理面板。"""
+
+    def __init__(self, inner, store: Store) -> None:
+        self.gate = endpoints.AccessGate(inner, store)
+        self._inner = inner
+
+    async def __call__(self, scope, receive, send) -> None:
+        await self.gate(scope, receive, send)
+
+    @property
+    def routes(self):
+        return getattr(self._inner, "routes", [])
 
 
 # ---------------------------------------------------------------------------
@@ -220,14 +332,14 @@ async def serve(cfg: Config, components: Components | None = None) -> int:
         port=cfg.port,
         log_level="info",
         access_log=False,  # 每请求一行访问日志由 logline 统一输出（避免双行）
-        timeout_graceful_shutdown=int(SYSTEMD_TIMEOUT_STOP_SEC),  # ≤ TimeoutStopSec
+        timeout_graceful_shutdown=int(SYSTEMD_TIMEOUT_STOP_SEC),
     )
     server = uvicorn.Server(uconfig)
     try:
         await server.serve()
     finally:
         await components.persist.aclose()
-        await components.api_client.aclose()
+        await components.gateway.aclose()
     return 0
 
 
@@ -248,6 +360,18 @@ def main(check_only: bool = False) -> int:
     if check_only:
         print("[startup] 配置自检通过（--check）")
         return 0
+
+    store = Store(cfg.store_path)
+    try:
+        store.load()
+    except Exception as exc:  # noqa: BLE001
+        print(f"[startup] 配置仓库加载失败: {exc}", file=sys.stderr)
+        return 2
+    bootstrap_access(cfg, store)
+    if not store.admin_ready:
+        logger.warning(
+            "[startup] 管理面板尚未设置管理员口令：首次访问 %s 会进入初始化向导",
+            cfg.admin_path_prefix)
 
     return asyncio.run(serve(cfg))
 

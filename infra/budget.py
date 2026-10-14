@@ -330,5 +330,18 @@ class MultiQueuePool:
     def lane(self, name: str) -> QueueLane:
         return self._lanes.get(name) or self._lanes[self._default]
 
+    def resize(self, name: str, size: int, wait_sec: float,
+               max_queued: int = 0) -> QueueLane:
+        """在线调整一条泳道的配额（管理面板改并发时热生效）。
+
+        语义说明：替换的是**泳道对象**，已经在旧泳道排队/占槽的请求继续
+        使用旧配额（它们是在旧规则下发起的），新请求走新配额。这样既不
+        打断在途请求，也不需要重启——代价是短暂的「双配额并存」，在<秒级
+        的切换窗口里完全可以接受。
+        """
+        lane = QueueLane(name, size, wait_sec, max_queued)
+        self._lanes[name] = lane
+        return lane
+
     def stats(self) -> "dict[str, dict[str, int]]":
         return {name: lane.stats() for name, lane in self._lanes.items()}

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """真机联调脚本（V2 第六轮；管理员派单五项逐项计时/记录）。
 
-与单测/e2e 的边界：本脚本打**真实上游**（Agnes AI，端点与密钥来自 env
+与单测/e2e 的边界：本脚本打**真实上游**（端点与密钥来自 env
 文件），不复用 pytest 收集（文件名不带 test_ 前缀，pytest.ini testpaths
 亦限定 tests/）。可重复执行；每次运行结果**追加**写入
 scripts/live_check_results.json（run_id 区分）。
@@ -53,8 +53,8 @@ from server import Components, build_app  # noqa: E402
 
 RESULTS_PATH = ROOT / "scripts" / "live_check_results.json"
 PROTOCOL_VERSION = "2025-06-18"
-IMAGE_MODEL = "agnes-image-2.5-flash"
-VIDEO_MODEL = "agnes-video-2.5-flash"
+IMAGE_MODEL = "example-image-1"
+VIDEO_MODEL = "example-video-1"
 VIDEO_QUERY_TIMEOUT_TOTAL_SEC = 1800   # 视频续查外层上限（30 分钟）
 VIDEO_QUERY_INTERVAL_SEC = 10.0         # query_video 外层续查间隔
 
@@ -276,19 +276,19 @@ async def mcp_initialize(client: httpx.AsyncClient, token: str, session: list) -
 # 各阶段
 # ---------------------------------------------------------------------------
 async def phase_raw_img_default(env_map: dict, run: dict, prompt: str) -> None:
-    r = await raw_generate(env_map["AGNES_TOKEN"], env_map["AGNES_BASE_URL"],
+    r = await raw_generate(env_map["UPSTREAM_TOKEN"], env_map["UPSTREAM_BASE_URL"],
                            size="1024x1024", ratio=None, prompt=prompt)
     run["raw_img_default"] = r
 
 
 async def phase_raw_img_2k(env_map: dict, run: dict, prompt: str) -> None:
-    r = await raw_generate(env_map["AGNES_TOKEN"], env_map["AGNES_BASE_URL"],
+    r = await raw_generate(env_map["UPSTREAM_TOKEN"], env_map["UPSTREAM_BASE_URL"],
                            size="2K", ratio="16:9", prompt=prompt)
     run["raw_img_2k"] = r
 
 
 async def phase_raw_img_bad(env_map: dict, run: dict, prompt: str) -> None:
-    r = await raw_generate(env_map["AGNES_TOKEN"], env_map["AGNES_BASE_URL"],
+    r = await raw_generate(env_map["UPSTREAM_TOKEN"], env_map["UPSTREAM_BASE_URL"],
                            size="banana", ratio=None, prompt=prompt)
     run["raw_img_bad"] = r
 
@@ -303,7 +303,7 @@ async def phase_svc_image(env_map: dict, run: dict, prompt: str) -> None:
         run["svc_image"] = {
             "elapsed_sec": round(time.monotonic() - t0, 3),
             "reply": text,
-            "timeout_tier": cfg.timeout_agnes_image_sec,
+            "timeout_tier": cfg.timeout_upstream_image_sec,
         }
 
 
@@ -439,7 +439,7 @@ async def phase_raw_429(env_map: dict, run: dict, prompt: str, burst: int,
                         concurrent: bool = False) -> None:
     results = []
     async with httpx.AsyncClient(
-        base_url=env_map["AGNES_BASE_URL"],
+        base_url=env_map["UPSTREAM_BASE_URL"],
         timeout=httpx.Timeout(connect=10, read=360, write=30, pool=10),
     ) as client:
         async def one(i: int) -> dict:
@@ -448,7 +448,7 @@ async def phase_raw_429(env_map: dict, run: dict, prompt: str, burst: int,
                 resp = await client.post(
                     "/v1/images/generations",
                     headers={"Authorization":
-                             f"Bearer {env_map['AGNES_TOKEN']}"},
+                             f"Bearer {env_map['UPSTREAM_TOKEN']}"},
                     json={"model": IMAGE_MODEL, "prompt": f"{prompt} #{i}",
                           "size": "1024x1024"},
                 )
@@ -494,7 +494,7 @@ PHASES = ("raw_img_default", "raw_img_2k", "raw_img_bad",
 
 async def main_async(args) -> int:
     env_map = load_env_file(Path(args.env_file))
-    for required in ("AGNES_TOKEN", "AGNES_BASE_URL", "MCPACCESS_TOKEN"):
+    for required in ("UPSTREAM_TOKEN", "UPSTREAM_BASE_URL", "MCPACCESS_TOKEN"):
         if not env_map.get(required):
             print(f"[live] env 缺少 {required}，中止", file=sys.stderr)
             return 2
@@ -510,7 +510,7 @@ async def main_async(args) -> int:
     run = {
         "run_id": uuid.uuid4().hex[:12],
         "started_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
-        "base_url": env_map["AGNES_BASE_URL"],
+        "base_url": env_map["UPSTREAM_BASE_URL"],
         "phases_requested": wanted,
     }
     img_prompt = args.prompt or "一只戴圆框眼镜的橘猫坐在窗台看雨，暖色调胶片感"
@@ -551,7 +551,7 @@ async def main_async(args) -> int:
 
 
 def main() -> int:
-    ap = argparse.ArgumentParser(description="Agnes 真机联调（V2 第六轮）")
+    ap = argparse.ArgumentParser(description="服务提供方真机联调（V5）")
     ap.add_argument("--env-file", default="/home/z/envs/mcp-imagegen.env",
                     help="env 文件路径（默认 /home/z/envs/mcp-imagegen.env）")
     ap.add_argument("--only", default="all",

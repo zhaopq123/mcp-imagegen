@@ -22,7 +22,7 @@ V3 核心改造（多队列 + 并发 + 异步，本轮主题）——
     并发槽（与生图共用 MAXCONCURRENCY 池：一请求一槽 E5；排队等待
     计入 deadline E4；轮询等待期持续占槽 R14；async with 语义保证
     finally 释放，超预算返 running 路径同样释放 R15）→
-    Agnes 提交（read ≤ 提交档 30s）得 video_id → 任务表 register
+    服务提供方提交（read ≤ 提交档 30s）得上游任务号 → 任务表 register
     （task_id 即 video_id）→ 轮询循环（每轮先 sleep(
     VIDEO_POLL_INTERVAL_SEC) 再单查上游，单查 read ≤10s，嵌套
     10 ≤ 30 ≤ deadline，B6）：
@@ -80,19 +80,25 @@ from dataclasses import dataclass, replace
 from typing import Awaitable, Callable, Mapping, Optional, Sequence
 
 from app import contract as contract_mod
+from app import context as context_mod
 from config import REQUEST_GUARD_SLACK_SEC, Config
 from engine import errors as errors_mod
-from infra import agnes as agnes_mod
 from infra import budget as budget_mod
 from infra import persist as persist_mod
 from infra import refs as refs_mod
 from infra import tasks as tasks_mod
 from ops import logline as logline_mod
 from ops import shutdown as shutdown_mod
+from providers import gateway as gateway_mod
 
 logger = logging.getLogger("mcp_imagegen.video_pipeline")
 
-VIDEO_MODEL = "agnes-video"  # 别名（对齐生图侧 agnes-image 用法，E15）
+VIDEO_MODEL = "video"       # 能力别名（对齐生图侧 image 用法）
+
+# 生成模式（由是否传入的媒体字段自动判定；见 decide_mode）
+VIDEO_MODE_TEXT = "text"
+VIDEO_MODE_KEYFRAME = "keyframe"
+VIDEO_MODE_REFERENCE = "reference"
 SECONDS_MIN = 4              # seconds 值域 [4, 12]（闭区间）
 SECONDS_MAX = 12
 # D4（官方视频画幅表，2026-10-10 定案）：三档扩六档——
@@ -100,13 +106,17 @@ SECONDS_MAX = 12
 # 3:4(720x960) / 21:9(1680x720)
 ASPECT_RATIOS = ("16:9", "9:16", "1:1", "4:3", "3:4", "21:9")
 
-# V4：视频参考图数量上限（agnes-video-2.5-flash 上游硬限 5 张，官方文档）
+# V4：视频参考图数量上限（多数上游实现硬限 5 张）
 VIDEO_REFERENCE_MAX = 5
 
 # V3：视频泳道名（多队列调度；与生图 image 泳道隔离，互不饿死）
 LANE_VIDEO = "video"
 
 SleepFn = Callable[[float], Awaitable[None]]
+
+def provider_hint_of(job: tasks_mod.JobEntry) -> Optional[str]:
+    """后台 worker 用的路由偏好读取（作业可能不带该字段）。"""
+    return getattr(job, "provider_hint", None) or None
 
 
 def decide_mode(
@@ -126,10 +136,10 @@ def decide_mode(
     （"我要这张图当首帧"），不承担上游的字段配对规则。
     """
     if first_frame or last_frame:
-        return agnes_mod.VIDEO_MODE_KEYFRAME
+        return VIDEO_MODE_KEYFRAME
     if reference_images:
-        return agnes_mod.VIDEO_MODE_REFERENCE
-    return agnes_mod.VIDEO_MODE_TEXT
+        return VIDEO_MODE_REFERENCE
+    return VIDEO_MODE_TEXT
 
 
 def validate_video_params(
@@ -232,7 +242,7 @@ class VideoPipeline:
         self,
         cfg: Config,
         pool: budget_mod.SlotPool,
-        api_client: agnes_mod.AgnesClient,
+        api_client: gateway_mod.ProviderGateway,
         task_table: tasks_mod.TaskTable,
         tracker: Optional[shutdown_mod.ShutdownCoordinator] = None,
         clock: Optional[Callable[[], float]] = None,
@@ -273,6 +283,27 @@ class VideoPipeline:
             getattr(cfg, "video_reference_max", VIDEO_REFERENCE_MAX))
 
     # ------------------------------------------------------------------
+    # 热更新（面板改运行参数后立即生效）
+    # ------------------------------------------------------------------
+    def reconfigure(self, cfg: Config) -> None:
+        self._cfg = cfg
+        self._job_gate = asyncio.Semaphore(
+            max(1, int(getattr(cfg, "video_job_concurrency", 8))))
+        self._job_max_wait = float(
+            getattr(cfg, "video_job_max_wait_sec", 1800.0))
+        self._job_max = max(1, int(getattr(cfg, "video_job_max", 24)))
+        self._queue_wait_sec = float(
+            getattr(cfg, "video_submit_queue_wait_sec", 600.0))
+        self._retry_min_sec = float(
+            getattr(cfg, "video_submit_retry_min_sec", 20.0))
+        self._retry_max_sec = float(
+            getattr(cfg, "video_submit_retry_max_sec", 90.0))
+        self._ref_max_bytes = int(
+            getattr(cfg, "reference_max_bytes", 10 * 1024 * 1024))
+        self._video_ref_max = int(
+            getattr(cfg, "video_reference_max", VIDEO_REFERENCE_MAX))
+
+    # ------------------------------------------------------------------
     # 入口一：generate_video
     # ------------------------------------------------------------------
     async def run(
@@ -287,8 +318,11 @@ class VideoPipeline:
         last_frame: Optional[str] = None,
         reference_images: Optional[Sequence[str]] = None,
         http_headers: Optional[Mapping[str, str]] = None,
+        provider: Optional[str] = None,
     ) -> str:
         """单请求入口：返回契约文本（成功 URL+meta / E17 running / error 行）。
+
+        V5：provider 可选——显式指定服务提供方（优先于令牌的默认绑定）。
 
         D3：seed 可选（None 不注入请求体；官方未标注值域，直传上游）。
         V4：first_frame/last_frame（首帧/尾帧，→ keyframe 模式）与
@@ -307,6 +341,7 @@ class VideoPipeline:
                     first_frame=first_frame, last_frame=last_frame,
                     reference_images=reference_images,
                     http_headers=http_headers,
+                    provider=provider,
                 )
         except TimeoutError:
             # 护栏触发（deadline 检查应先到；此为 6.1 防御纵深）——
@@ -337,7 +372,8 @@ class VideoPipeline:
         rec = logline_mod.LogRecord(
             req_id=req_id,
             prompt_hash="null",  # 查询无 prompt
-            params=f"model={VIDEO_MODEL};task_id={task_id}",
+            params=f"model=video;task_id={task_id}",
+            kind="video",
         )
         try:
             async with asyncio.timeout(guard):
@@ -360,7 +396,8 @@ class VideoPipeline:
         aspect_ratio: str, persist_flag: bool, seed: Optional[int],
         first_frame: Optional[str] = None, last_frame: Optional[str] = None,
         reference_images: Optional[Sequence[str]] = None,
-        http_headers: Optional[Mapping[str, str]],
+        http_headers: Optional[Mapping[str, str]] = None,
+        provider: Optional[str] = None,
     ) -> str:
         rec = self._new_record(
             req_id, prompt, seconds, aspect_ratio, persist_flag, seed)
@@ -412,6 +449,7 @@ class VideoPipeline:
                         mode=mode, first_frame=resolved_first,
                         last_frame=resolved_last,
                         reference_images=resolved_refs,
+                        provider_hint=provider or self._provider_hint(),
                     )
             except budget_mod.LaneFullError as exc:
                 # V3：泳道排队超限 → busy 快失败（不消耗等待预算）
@@ -449,7 +487,8 @@ class VideoPipeline:
                     persist_flag=persist_flag, mode=mode,
                     first_frame=resolved_first, last_frame=resolved_last,
                     reference_images=resolved_refs,
-                    http_headers=http_headers, ref_count=ref_count)
+                    http_headers=http_headers, ref_count=ref_count,
+                    provider_hint=provider or self._provider_hint())
 
             video_id = payload
             state.task_id = video_id  # 护栏兜底路径可转 E17
@@ -462,7 +501,8 @@ class VideoPipeline:
                 aspect_ratio=aspect_ratio, seed=seed, mode=mode,
                 ref_count=ref_count, upstream_id=video_id,
                 first_frame=resolved_first, last_frame=resolved_last,
-                reference_images=resolved_refs)
+                reference_images=resolved_refs,
+                provider_hint=provider or self._provider_hint())
             self._spawn_worker(
                 job, seconds=seconds, aspect_ratio=aspect_ratio,
                 persist_flag=persist_flag, seed=seed, http_headers=http_headers)
@@ -488,12 +528,16 @@ class VideoPipeline:
         self, *, rec: logline_mod.LogRecord, timer: _StageTimer,
         deadline: budget_mod.Deadline, prompt: str, seconds: int,
         aspect_ratio: str, seed: Optional[int] = None,
-        mode: str = agnes_mod.VIDEO_MODE_TEXT,
+        mode: str = VIDEO_MODE_TEXT,
         first_frame: Optional[str] = None,
         last_frame: Optional[str] = None,
         reference_images: Tuple[str, ...] = (),
+        provider_hint: Optional[str] = None,
     ) -> "tuple[str, str | None]":
         """提交到上游（槽内执行）。
+
+        V5：provider_hint 由调用方（请求上下文 / 作业记录）显式带入，
+        不在深层再读 ContextVar——脱离请求的协程里读不到发起者。
 
         返回二元组（kind, payload）——不用裸 str 做出口判定：video_id 与
         错误契约行同为 str，混在一个返回值里无法区分（V3 首轮真实 bug）：
@@ -505,10 +549,11 @@ class VideoPipeline:
         rec.model = VIDEO_MODEL
         try:
             api = await self._api.submit_video(
-                model=VIDEO_MODEL, prompt=prompt, seconds=seconds,
+                prompt=prompt, seconds=seconds,
                 aspect_ratio=aspect_ratio, deadline=deadline, seed=seed,
                 mode=mode, first_frame=first_frame, last_frame=last_frame,
                 reference_images=reference_images or None,
+                provider=provider_hint,
             )
         except budget_mod.DeadlineExceededError:
             return ("exhausted", None)
@@ -523,7 +568,7 @@ class VideoPipeline:
         return ("ok", api.video_id)
 
     @staticmethod
-    def _is_queue_full(api: agnes_mod.ApiCallResult) -> bool:
+    def _is_queue_full(api: gateway_mod.ApiCallResult) -> bool:
         """上游「队列满」判定（503 + video_queue_full / 队列已满文案）。
 
         只认队列满这一类——其余 5xx 仍按原错误路径返回（不能把真正的
@@ -536,7 +581,7 @@ class VideoPipeline:
             or ("queue" in detail and "full" in detail)
 
     @staticmethod
-    def _is_retryable_submit(api: agnes_mod.ApiCallResult) -> bool:
+    def _is_retryable_submit(api: gateway_mod.ApiCallResult) -> bool:
         """代排队可重试的提交失败：队列满（503）或上游限流（429）。
 
         V4 修订（生产实测补）：429 必须纳入。免费额度下视频提交撞
@@ -560,6 +605,7 @@ class VideoPipeline:
         first_frame: Optional[str] = None,
         last_frame: Optional[str] = None,
         reference_images: Optional[tuple] = None,
+        provider_hint: Optional[str] = None,
     ) -> tasks_mod.JobEntry:
         """登记作业（含 future 通知）。
 
@@ -568,6 +614,10 @@ class VideoPipeline:
 
         V4：status/upstream_id/mode/ref_count 与提交参数随作业携带，
         供「排队中」的作业在后台完成提交与轮询。
+
+        V5：provider_hint 记录发起方令牌绑定的服务提供方——后台 worker
+        是脱离请求上下文的协程，ContextVar 在那里读不到发起者的值，
+        所以必须显式随作业带上（否则异步续查会打到全局路由的另一个提供方）。
         """
         register = getattr(self._table, "register_job", None)
         if callable(register):
@@ -577,7 +627,8 @@ class VideoPipeline:
                 status=status, upstream_id=upstream_id, mode=mode,
                 ref_count=ref_count, prompt=prompt,
                 first_frame=first_frame, last_frame=last_frame,
-                reference_images=reference_images)
+                reference_images=reference_images,
+                provider_hint=provider_hint)
         self._table.register(
             task_id=video_id, model=VIDEO_MODEL, prompt_hash=rec.prompt_hash)
         # 退化路径同样必须建 future——否则等待方会"等了个空气"直接转
@@ -590,7 +641,7 @@ class VideoPipeline:
             ref_count=ref_count, prompt=prompt,
             first_frame=first_frame, last_frame=last_frame,
             reference_images=reference_images,
-            future=loop.create_future())
+            future=loop.create_future(), provider_hint=provider_hint)
 
     async def _enqueue(
         self, *, rec: logline_mod.LogRecord, timer: _StageTimer,
@@ -599,6 +650,7 @@ class VideoPipeline:
         mode: str, first_frame: Optional[str], last_frame: Optional[str],
         reference_images: Tuple[str, ...],
         http_headers: Optional[Mapping[str, str]], ref_count: int,
+        provider_hint: Optional[str] = None,
     ) -> str:
         """V4：上游队列满 → 本端排队（非错误），后台 worker 代为重试提交。
 
@@ -618,7 +670,8 @@ class VideoPipeline:
             aspect_ratio=aspect_ratio, seed=seed,
             status=tasks_mod.STATUS_QUEUED, mode=mode, ref_count=ref_count,
             first_frame=first_frame, last_frame=last_frame,
-            reference_images=reference_images)
+            reference_images=reference_images,
+            provider_hint=provider_hint)
         self._spawn_worker(
             job, seconds=seconds, aspect_ratio=aspect_ratio,
             persist_flag=persist_flag, seed=seed, http_headers=http_headers)
@@ -719,16 +772,16 @@ class VideoPipeline:
             job.submit_attempts += 1
             try:
                 api = await self._api.submit_video(
-                    model=VIDEO_MODEL,
                     prompt=job.prompt or "",
                     seconds=job.seconds if job.seconds is not None else seconds,
                     aspect_ratio=job.aspect_ratio or aspect_ratio,
                     deadline=submit_deadline,
                     seed=job.seed if job.seed is not None else seed,
-                    mode=job.mode or agnes_mod.VIDEO_MODE_TEXT,
+                    mode=job.mode or VIDEO_MODE_TEXT,
                     first_frame=job.first_frame,
                     last_frame=job.last_frame,
                     reference_images=job.reference_images or None,
+                    provider=provider_hint_of(job),
                 )
             except budget_mod.DeadlineExceededError:
                 self._mark_abort(
@@ -846,8 +899,8 @@ class VideoPipeline:
                     upstream_id = job.upstream_id or job.task_id
                     try:
                         api = await self._api.query_video(
-                            video_id=upstream_id, model=VIDEO_MODEL,
-                            deadline=deadline)
+                            video_id=upstream_id, deadline=deadline,
+                            provider=provider_hint_of(job))
                     except budget_mod.DeadlineExceededError:
                         self._mark_abort(
                             job, reason="后台轮询预算耗尽",
@@ -1093,7 +1146,8 @@ class VideoPipeline:
             #      实时打上游（read ≤10s；不占并发槽 E20）----
             try:
                 api = await self._api.query_video(
-                    video_id=task_id, model=VIDEO_MODEL, deadline=deadline)
+                    video_id=task_id, deadline=deadline,
+                    provider=self._provider_hint())
             except budget_mod.DeadlineExceededError:
                 rec.timeout_hit = logline_mod.TIMEOUT_DEADLINE
                 return self._finish_error(
@@ -1154,9 +1208,13 @@ class VideoPipeline:
     # ------------------------------------------------------------------
     # 其他辅助
     # ------------------------------------------------------------------
-    def _classify(self, api: agnes_mod.ApiCallResult) -> errors_mod.ErrorInfo:
+    def _classify(self, api: gateway_mod.ApiCallResult) -> errors_mod.ErrorInfo:
         """ApiCallResult → ErrorInfo（与生图 pipeline 同一映射）。"""
         detail = api.error_detail or ""  # 防御：ok=True 的异常形态无 detail
+        # reason 非空 = 本端配置类问题（同上，与生图 pipeline 同一映射）
+        if api.reason:
+            return errors_mod.not_configured_error(
+                "轮询" if api.reason == "poll_undefined" else "视频", detail)
         if api.status_code is None:  # 网络/超时异常（重试 1 次后仍失败）
             return errors_mod.network_error(detail)
         return errors_mod.classify_http_status(api.status_code, detail)
@@ -1169,12 +1227,18 @@ class VideoPipeline:
             req_id=req_id,
             prompt_hash=logline_mod.prompt_hash(prompt if isinstance(prompt, str) else ""),
             params=(
-                f"model={VIDEO_MODEL};seconds={seconds};"
+                f"model=video;seconds={seconds};"
                 f"aspect_ratio={aspect_ratio};"
                 + (f"seed={seed};" if seed is not None else "")
                 + f"persist={'true' if persist_flag else 'false'}"
             ),
+            kind="video",
         )
+
+    def _provider_hint(self) -> Optional[str]:
+        """当前请求的服务提供方偏好（来自访问令牌绑定；无则为全局路由）。"""
+        scope = context_mod.token_scope()
+        return (scope or {}).get("provider") or None
 
     def _resolve_media(
         self, value: Optional[str],

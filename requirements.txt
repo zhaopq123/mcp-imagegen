@@ -1,6 +1,6 @@
 # MCP 图片生成 Server · 运行依赖
 # - fastmcp：MCP 工具端点（streamable-http）与工具 schema
-# - httpx：Agnes API 客户端 + persist 下载
+# - httpx：服务提供方 API 客户端 + persist 下载
 # - sd_notify 为 vendored 实现（ops/liveness.py SdNotifier），不依赖 sdnotify 包
 #
 # 实测钉死（2026-10-10 部署验证）：
