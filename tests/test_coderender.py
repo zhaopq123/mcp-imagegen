@@ -173,6 +173,59 @@ def test_limits_are_sane():
     assert coderender.MAX_FRAMES <= 300
     assert coderender.MAX_RENDER_SEC <= 60
     assert coderender.MAX_SVG_BYTES <= 2 * 1024 * 1024
+    assert coderender.MAX_TOTAL_SEC <= 180
+
+
+# ── 中文字体（不给 -font，IM 会把中文整段静默丢掉）──
+
+@pytest.fixture()
+def _clear_font_cache(monkeypatch):
+    monkeypatch.setattr(coderender, "_FONT_CACHE", [])
+    monkeypatch.delenv("CODERENDER_FONT", raising=False)
+    monkeypatch.delenv("WS_RENDER_FONT", raising=False)
+    yield
+    monkeypatch.setattr(coderender, "_FONT_CACHE", [])
+
+
+def test_cjk_font_env_override(tmp_path, _clear_font_cache, monkeypatch):
+    f = tmp_path / "my.ttf"
+    f.write_bytes(b"\x00")
+    monkeypatch.setenv("CODERENDER_FONT", str(f))
+    assert coderender.cjk_font() == str(f)
+
+
+def test_cjk_font_prefers_nicer_family(_clear_font_cache, monkeypatch):
+    """fc-list 给的候选里要挑顺眼的（文泉驿/思源 > Noto > Droid 兜底）。"""
+    monkeypatch.setattr(coderender, "_fc_list_zh", lambda: [
+        "/usr/share/fonts/truetype/droid/DroidSansFallbackFull.ttf",
+        "/usr/share/fonts/truetype/wqy/wqy-microhei.ttc",
+    ])
+    monkeypatch.setattr(coderender, "_scan_font_dirs", lambda: [])
+    assert coderender.cjk_font().endswith("wqy-microhei.ttc")
+
+
+def test_cjk_font_none_when_absent(_clear_font_cache, monkeypatch):
+    monkeypatch.setattr(coderender, "_fc_list_zh", lambda: [])
+    monkeypatch.setattr(coderender, "_scan_font_dirs", lambda: [])
+    assert coderender.cjk_font() is None
+
+
+def test_magick_cmd_includes_font(_clear_font_cache, monkeypatch):
+    monkeypatch.setattr(coderender, "cjk_font", lambda: "/f/wqy.ttc")
+    cmd = coderender._magick_cmd("convert", "in.svg", "out.png", 600, 300)
+    assert cmd[0] == "convert"
+    assert "-font" in cmd and "/f/wqy.ttc" in cmd
+    # 字体必须排在输入文件之前（IM6 里 -font 是 setting 不是 operator）
+    assert cmd.index("-font") < cmd.index("in.svg")
+    assert cmd[-1] == "out.png"
+
+
+def test_magick_cmd_without_font(_clear_font_cache, monkeypatch):
+    monkeypatch.setattr(coderender, "cjk_font", lambda: None)
+    cmd = coderender._magick_cmd("convert", "in.svg", "out.png", 600, 300)
+    assert "-font" not in cmd
+    assert cmd == ["convert", "-background", "none", "in.svg",
+                   "-resize", "600x300!", "out.png"]
 
 
 @pytest.mark.asyncio

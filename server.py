@@ -237,7 +237,8 @@ def build_app(
         active.notifier.notify("READY=1")
         logger.info(
             "[startup] 就绪 port=%d image_dir=%s video_dir=%s 总预算=%.0fs | "
-            "泳道 %s | 服务提供方 %d 个（生图 %s / 视频 %s）| 代码渲染=%s",
+            "泳道 %s | 服务提供方 %d 个（生图 %s / 视频 %s）| 代码渲染=%s "
+            "中文字体=%s",
             active.cfg.port, active.cfg.image_dir, active.cfg.video_dir,
             active.cfg.total_budget_sec, active.pool.stats(),
             len(active.gateway.stats()),
@@ -246,6 +247,8 @@ def build_app(
             # 顺手把渲染器探活结果预热并打进启动日志：render_image /
             # render_video 缺依赖时要能一眼看出来（否则只有用户调用才知道）
             coderender_mod.renderer_available() or "不可用",
+            # 中文字体缺失时中文会被静默丢掉，必须在启动日志里可见
+            coderender_mod.cjk_font() or "缺失（中文会掉字）",
         )
         heartbeat = asyncio.create_task(
             liveness.heartbeat_loop(active.notifier), name="watchdog-heartbeat")

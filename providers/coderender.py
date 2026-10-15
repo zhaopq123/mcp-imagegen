@@ -143,6 +143,96 @@ def renderer_available() -> Optional[str]:
         return None
 
 
+# ── 中文字体（不指定 → IM 静默不画中文）────────────────────────────
+# 线上实测：容器里有 DroidSansFallbackFull.ttf（覆盖中日韩），
+# fontconfig 也认得它，但 ImageMagick 的**内置 SVG 渲染器不做字体回退**——
+# <text> 没写 font-family 时它用自带默认字体（只有拉丁字形），
+# 中文/日文直接不画、也不报错，用户只会看到"图上少了字"。
+# 解药是显式 `-font <能覆盖中文的字体文件>`（实测有效；family 名不管用）。
+_FONT_CACHE: list = []
+_FONT_HINTS = ("wqy", "microhei", "zenhei", "sourcehan", "source han",
+               "noto", "cjk", "droid", "fallback", "simhei", "simsun",
+               "msyh", "arphic", "uming", "ukai", "heiti", "songti")
+_FONT_DIRS = (
+    "/usr/share/fonts", "/usr/local/share/fonts", "/usr/share/fonts/truetype",
+    "/usr/share/fonts/opentype", "/System/Library/Fonts",  # macOS（本地调试）
+)
+
+
+def _font_hint_rank(path: str) -> int:
+    low = path.lower()
+    for i, hint in enumerate(_FONT_HINTS):
+        if hint in low:
+            return i
+    return len(_FONT_HINTS)
+
+
+def _fc_list_zh() -> list:
+    """问 fontconfig 要「覆盖中文」的字体文件（有 fc-list 就优先用它）。"""
+    exe = shutil.which("fc-list")
+    if not exe:
+        return []
+    try:
+        proc = subprocess.run([exe, ":lang=zh", "file"],
+                              capture_output=True, timeout=10)
+    except Exception:  # noqa: BLE001
+        return []
+    out = []
+    for line in proc.stdout.decode("utf-8", "replace").splitlines():
+        path = line.split(":")[0].strip()
+        if path and os.path.isfile(path):
+            out.append(path)
+    return out
+
+
+def _scan_font_dirs() -> list:
+    """兜底：翻字体目录找名字像中文的字体的文件。"""
+    found = []
+    for root in _FONT_DIRS:
+        if not os.path.isdir(root):
+            continue
+        for dirpath, _dirs, files in os.walk(root):
+            if len(found) > 40:
+                break
+            for name in files:
+                low = name.lower()
+                if low.endswith((".ttc", ".ttf", ".otf")) and any(
+                        h.replace(" ", "") in low.replace(" ", "").replace("-", "")
+                        for h in _FONT_HINTS):
+                    found.append(os.path.join(dirpath, name))
+    return found
+
+
+def cjk_font() -> Optional[str]:
+    """给 ImageMagick 用的中文字体路径；找不到返回 None（结果缓存）。
+
+    优先级：环境变量 CODERENDER_FONT / WS_RENDER_FONT（运维可覆盖）
+    → fc-list 的中文库 → 字体目录名匹配。候选按「好看程度」投票
+    （文泉驿/思源 > Noto > Droid 兜底）。
+    """
+    if _FONT_CACHE:
+        return _FONT_CACHE[0]
+    found: Optional[str] = None
+    for env in ("CODERENDER_FONT", "WS_RENDER_FONT"):
+        cand = (os.environ.get(env) or "").strip()
+        if cand and os.path.isfile(cand):
+            found = cand
+            break
+    if not found:
+        for source in (_fc_list_zh(), _scan_font_dirs()):
+            if source:
+                found = sorted(source, key=_font_hint_rank)[0]
+                break
+    _FONT_CACHE.append(found)
+    if not found:
+        log.warning(
+            "[coderender] 未找到中文字体：SVG 里的中文会被 ImageMagick "
+            "静默丢掉（只画拉丁字形）。装一个即可，例如 "
+            "apt-get install -y fonts-droid-fallback（或用 CODERENDER_FONT "
+            "指定字体文件绝对路径）")
+    return found
+
+
 def _normalize_svg(code: str, width: int, height: int) -> str:
     """把用户的 SVG 补齐成可渲染的完整文档（缺尺寸/命名空间就补上）。"""
     text = (code or "").strip()
@@ -408,6 +498,19 @@ async def _cairosvg_png(svg_path: str, png_path: str,
     return None
 
 
+def _magick_cmd(conv: str, svg_path: str, png_path: str,
+                width: int, height: int) -> list:
+    """拼 ImageMagick 渲染命令（独立出来是为了能单测「有没有带 -font」）。"""
+    # -font 必须在输入文件之前（IM6 里它是 setting，不是 operator）。
+    # 不指定就可能整段中文不画——见 cjk_font() 的说明。
+    cmd = [conv, "-background", "none"]
+    font = cjk_font()
+    if font:
+        cmd += ["-font", font]
+    cmd += [svg_path, "-resize", f"{width}x{height}!", png_path]
+    return cmd
+
+
 async def _render_svg_to_png(svg: str, width: int, height: int,
                              workdir: str, name: str) -> str:
     """SVG → PNG 文件路径。优先 cairosvg，回退 ImageMagick。"""
@@ -427,8 +530,7 @@ async def _render_svg_to_png(svg: str, width: int, height: int,
         raise RuntimeError(
             "服务端缺少渲染器。请在容器内安装其一："
             "`apt-get install -y imagemagick` 或 `pip install cairosvg`")
-    cmd = [conv, "-background", "none", svg_path, "-resize",
-           f"{width}x{height}!", png_path]
+    cmd = _magick_cmd(conv, svg_path, png_path, width, height)
     proc = await asyncio.create_subprocess_exec(
         *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
         stdin=asyncio.subprocess.DEVNULL)
