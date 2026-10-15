@@ -312,6 +312,7 @@ sudo systemctl reload caddy
 | 启动即退出，退出码 2 | `sudo journalctl -xeu mcp-imagegen`：密钥为空 / 嵌套不等式违例（§5、§6） |
 | 客户端 401 `[error] category=mcp_auth` | `/etc/mcp-imagegen/env` 的 `MCPACCESS_TOKEN` 与客户端 Bearer 不一致 |
 | 上游 401/403 `[error] category=upstream_auth` | `UPSTREAM_TOKEN` 配错或 Key 无效/过期（provider=上游服务提供方；上线前按 §13 ② 在 上游服务提供方 控制台核对；服务器侧问题，客户端勿重试） |
+| 上游 403 `[error] category=insufficient_quota` | 上游**账号额度/余额用尽**（响应体含 `insufficient_user_quota` / 「额度不足」等），**与密钥无关**——去 上游服务提供方 控制台充值时或换一个账号/提供方；勿按「换 Key」排查 |
 | 服务反复重启后停 | `StartLimit` 5 次/60s 风暴保护触发；`journalctl -u mcp-imagegen` 看崩溃根因 |
 | 日志出现磁盘水位 WARN | `df -h /var/lib/mcp-imagegen/images /var/lib/mcp-imagegen/videos`（V2 水位覆盖双目录）；**人工**清理旧文件（服务永不自动删图/视频，C10） |
 | 工具调用慢但成功 | 正常：视频轮询受 200s 总预算约束（超预算返 `task_id` 收条非错误，稍后 `query_video` 续查）；客户端超时须 ≥210s（详见 agent-config.md §4） |
