@@ -12,7 +12,8 @@
 
 | 能力 | 说明 |
 |---|---|
-| **四工具** | `generate_image`（文生图/参考图生图，支持批量拆分）· `generate_video`（文生视频、首尾帧/参考图、服务端排队）· `query_video`（查询视频任务状态）· `list_video_tasks`（批量查看后台作业） |
+| **六工具** | `generate_image`（文生图/参考图生图，支持批量拆分）· `generate_video`（文生视频、首尾帧/参考图、服务端排队）· `query_video`（查询视频任务状态）· `list_video_tasks`（批量查看后台作业）· `render_image`（**代码生图**：SVG/Python → PNG）· `render_video`（**代码生视频**：SVG/Python → GIF/MP4） |
+| **代码直出** | `render_image` / `render_video` 在服务端本地渲染，**不联网、不耗上游额度**；适合图表、示意图、带精确文字的海报、批量模板图——AI 生图画不准的东西。需要容器内有 ImageMagick（见「代码渲染的前置依赖」） |
 | **图像迭代闭环** | 可上传本机图片，也可把本服务的图片/视频产物作为后续参考输入；图像字节不经第三方图床 |
 | **Provider 抽象** | 上游信息全部在管理面板配置（base_url / 模型 / 密钥 / 请求模板 / 限速），不写死任何厂商；零配置启动即告知「无可用提供方」 |
 | **并发与排队** | 生图 / 生视频各自独立泳道（默认 8 / 4，可在面板热调），排队超时返回 `busy` 而非无限等待 |
@@ -268,6 +269,52 @@ curl -X POST "http://<host>:8000/upload" \\
 
 批量查看内存中跟踪的视频任务，按最新提交优先；返回 task_id、状态与结果 URL。
 
+### `render_image`（代码生图）
+
+用**代码**画图，不调用任何上游、不消耗额度：给一段 SVG，或一段产出 SVG 的 Python，
+服务端渲染成 PNG 并返回 `/files/<name>` 链接。AI 生图画不准的东西（图表、
+流程图、表格、图标、带精确文字的海报封面、批量模板图）用这个。
+
+| 参数 | 类型 | 默认 | 说明 |
+|---|---|---|---|
+| `code` | string | **必填** | SVG 代码，或产出 SVG 的短 Python 脚本 |
+| `size` | string | `1024x1024` | `WxH`（如 `1024x768`），单边 16–4096 |
+| `lang` | string | 自动 | `svg` / `python`；不传则自动判断（以 `<` 开头当 SVG，否则当 Python）|
+
+Python 代码在受限沙箱里跑：不能读写文件、不能联网、除 `math` / `json` /
+`random` / `statistics` / `colorsys` 外不能 import；`width` / `height` 已预置为变量；
+把结果 `print` 出来或赋值给 `svg` / `out` / `result` 变量即可。
+
+### `render_video`（代码生视频）
+
+同一套代码通道出**动画**：动画示意图、加载指示、进度条、动效文字。默认出 GIF
+（到处都能显示），容器里装了 ffmpeg 就出 MP4（`format=auto`）。
+
+| 参数 | 类型 | 默认 | 说明 |
+|---|---|---|---|
+| `code` | string | **必填** | SVG（用 `__FRAME__` 占位帧号）或 Python（预置 `frame` / `total` / `width` / `height`）|
+| `size` | string | `720x720` | `WxH`，单边 16–1920 |
+| `frames` | int | `36` | 1–120；帧越多越慢 |
+| `fps` | int | `12` | 1–30 |
+| `format` | string | `auto` | `auto` / `mp4` / `gif`；`mp4` 需要容器内有 ffmpeg |
+
+单帧渲染上限 20 秒、整次请求上限 90 秒（防把服务当渲染农场）；超限会返回
+`[error]` 行而不是无限跑。
+
+**代码渲染的前置依赖**（与上游无关，纯本地能力）：
+
+```bash
+# SVG → PNG/GIF 渲染器（必需；缺了会返回 not_configured 并给出提示）
+apt-get install -y imagemagick
+# MP4 输出（可选）
+apt-get install -y ffmpeg
+# 中文字体（强烈建议）：容器里没有中文字体时，图中的中文会被静默丢弃，
+# 只剩英文和数字。装了任意一个即可，启动日志会打印实际选中的字体。
+apt-get install -y fonts-droid-fallback     # 或 fonts-wqy-microhei / fonts-noto-cjk
+# 也可以用环境变量显式指定字体文件
+CODERENDER_FONT=/usr/share/fonts/truetype/wqy/wqy-microhei.ttc
+```
+
 ---
 
 ## HTTP 端点
@@ -335,9 +382,10 @@ uvicorn
 server.py                   入口：配置自检 → 组件装配 → FastMCP → BearerGate → uvicorn
 ├── config.py               配置加载 + 嵌套不等式自检（fail-fast）
 ├── app/
-│   ├── tool.py             三个 MCP 工具的定义与 schema
+│   ├── tool.py             六个 MCP 工具的定义与 schema
 │   ├── pipeline.py         生图流水线（槽池 / 熔断 / 重试）
 │   ├── video_pipeline.py   视频流水线（提交 / 轮询 / 对账）
+│   ├── coderender_pipeline.py  代码生图/生视频工具层（参数校验 / 落盘 / 契约行）
 │   ├── endpoints.py        /healthz、/files、BearerGate 鉴权
 │   └── contract.py         对外契约常量
 ├── engine/
@@ -345,15 +393,25 @@ server.py                   入口：配置自检 → 组件装配 → FastMCP �
 │   ├── router.py           模型路由
 │   └── normalizer.py       响应归一化
 ├── infra/
-│   ├── upstream.py            上游服务提供方 客户端（httpx）
-│   ├── budget.py           并发槽池
+│   ├── budget.py           并发槽池（多队列泳道）
 │   ├── circuit.py          熔断器（硬 / 软）
-│   ├── persist.py          产物转存服务
+│   ├── persist.py          产物转存服务 + /files URL 构造
+│   ├── ratelimit.py        上游限速
+│   ├── refs.py             参考图/首尾帧取材（URL / data URI / 本服务产物）
 │   └── tasks.py            视频任务表（内存态 + TTL）
+├── providers/              上游抽象（零厂商硬编码）
+│   ├── schema.py           ProviderConfig / CapabilitySpec / RequestSpec …
+│   ├── store.py            配置仓库（data/store.json，含令牌与管理员口令）
+│   ├── gateway.py          请求执行（模板渲染 / 抽取 / 重试 / 路由）
+│   ├── template.py         占位符模板与响应抽取
+│   ├── autodetect.py       一键接入：按候选路径探测上游形状并反推模板
+│   └── coderender.py       代码生图/生视频的本地渲染与 Python 沙箱
+├── admin/                  管理面板（api / auth / page）
 └── ops/
     ├── liveness.py         sd_notify 与心跳（vendored，无外部依赖）
     ├── shutdown.py         优雅停机协调
-    └── logline.py          结构化访问日志
+    ├── logline.py          结构化访问日志
+    └── metrics.py          运行指标
 ```
 
 ---

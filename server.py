@@ -33,12 +33,14 @@ from fastmcp import FastMCP
 from admin import AdminAPI, AdminContext, RingLogHandler
 from admin.auth import SessionManager
 from app import endpoints, tool
+from app import coderender_pipeline
 from app.pipeline import GeneratePipeline
 from app.video_pipeline import VideoPipeline
 from config import SYSTEMD_TIMEOUT_STOP_SEC, Config, ConfigError, load_config
 from infra import budget, circuit, persist, tasks
 from ops import liveness, logline, metrics as metrics_mod, shutdown
 from providers import Store, gateway as gateway_mod
+from providers import coderender as coderender_mod
 from providers.store import new_token
 
 logger = logging.getLogger("mcp_imagegen.server")
@@ -60,6 +62,7 @@ class Components:
         task_table: tasks.TaskTable, video_pipeline: VideoPipeline,
         metrics: metrics_mod.Metrics, ring: RingLogHandler,
         sessions: SessionManager,
+        code_render: coderender_pipeline.CodeRenderPipeline,
     ) -> None:
         self.cfg = cfg
         self.store = store
@@ -75,6 +78,7 @@ class Components:
         self.metrics = metrics
         self.ring = ring
         self.sessions = sessions
+        self.code_render = code_render
 
     # ------------------------------------------------------------------
     @classmethod
@@ -115,6 +119,7 @@ class Components:
         video_pipeline = VideoPipeline(
             cfg, pool, gateway, task_table, tracker=coordinator,
             persist=persist_)
+        code_render = coderender_pipeline.CodeRenderPipeline(cfg)
 
         metrics = metrics_mod.Metrics()
         ring = RingLogHandler()
@@ -122,7 +127,7 @@ class Components:
         components = cls(
             cfg, store, circuit_, pool, gateway, persist_, pipeline,
             notifier, coordinator, task_table, video_pipeline,
-            metrics, ring, sessions)
+            metrics, ring, sessions, code_render)
         components._install_metrics_hook()
         return components
 
@@ -173,6 +178,7 @@ class Components:
         self.video_pipeline.reconfigure(new_cfg)
         self.persist.reconfigure(new_cfg)
         self.gateway.reconfigure(new_cfg)
+        self.code_render.reconfigure(new_cfg)
         logger.info(
             "[settings] 运行参数已热更新 | 泳道 生图%s 视频%s",
             lane_image.stats(), lane_video.stats())
@@ -231,12 +237,18 @@ def build_app(
         active.notifier.notify("READY=1")
         logger.info(
             "[startup] 就绪 port=%d image_dir=%s video_dir=%s 总预算=%.0fs | "
-            "泳道 %s | 服务提供方 %d 个（生图 %s / 视频 %s）",
+            "泳道 %s | 服务提供方 %d 个（生图 %s / 视频 %s）| 代码渲染=%s "
+            "中文字体=%s",
             active.cfg.port, active.cfg.image_dir, active.cfg.video_dir,
             active.cfg.total_budget_sec, active.pool.stats(),
             len(active.gateway.stats()),
             active.gateway.has_capability("image"),
             active.gateway.has_capability("video"),
+            # 顺手把渲染器探活结果预热并打进启动日志：render_image /
+            # render_video 缺依赖时要能一眼看出来（否则只有用户调用才知道）
+            coderender_mod.renderer_available() or "不可用",
+            # 中文字体缺失时中文会被静默丢掉，必须在启动日志里可见
+            coderender_mod.cjk_font() or "缺失（中文会掉字）",
         )
         heartbeat = asyncio.create_task(
             liveness.heartbeat_loop(active.notifier), name="watchdog-heartbeat")
@@ -264,7 +276,9 @@ def build_app(
             logger.info("[shutdown] 组件收尾完成，进程退出")
 
     mcp = FastMCP(name="mcp-imagegen", lifespan=lifespan)
-    tool.register_tool(mcp, components.pipeline, components.video_pipeline)
+    tool.register_tool(
+        mcp, components.pipeline, components.video_pipeline,
+        components.code_render)
     mcp.custom_route("/healthz", methods=["GET"])(
         endpoints.make_healthz_endpoint(components))
     mcp.custom_route("/files/{name}", methods=["GET"])(

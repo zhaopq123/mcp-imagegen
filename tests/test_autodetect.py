@@ -188,3 +188,58 @@ def test_no_vendor_constants_in_source():
     for bad in ("siliconflow", "agnes", "openai.azure", "api.deepseek",
                 "dashscope", "volces", "ark.cn", "aliyuncs"):
         assert bad not in src.lower(), f"探测模块不应硬编码厂商：{bad}"
+
+
+def test_split_endpoint_full_url():
+    """用户粘完整端点 URL 时，应拆成 base_url + path。
+
+    用户就是按「完整接口地址」给的（如
+    https://api.agnes-ai.cn/v1/images/generations），不是只给域名。
+    """
+    b, p = autodetect.split_endpoint("https://api.agnes-ai.cn/v1/images/generations")
+    assert b == "https://api.agnes-ai.cn"
+    assert p == "/v1/images/generations"
+
+    # 末尾斜杠
+    assert autodetect.split_endpoint("https://a.cn/v1/images/generations/") == \
+        ("https://a.cn", "/v1/images/generations")
+    # 带查询串
+    assert autodetect.split_endpoint("https://a.cn/v1/images/generations?v=2") == \
+        ("https://a.cn", "/v1/images/generations")
+    # 只给域名 → path 空（交给候选探测）
+    assert autodetect.split_endpoint("https://a.cn") == ("https://a.cn", "")
+    assert autodetect.split_endpoint("https://a.cn/") == ("https://a.cn", "")
+    # http 也认
+    assert autodetect.split_endpoint("http://a.cn/v1/videos")[1] == "/v1/videos"
+    # 空
+    assert autodetect.split_endpoint("") == ("", "")
+
+
+@pytest.mark.asyncio
+async def test_explicit_path_tried_first_and_only():
+    """用户给了完整 path 时，只试这一个（不再挨个试候选）。"""
+    sp = _spec(base="https://api.agnes-ai.cn")
+    setattr(sp, "_explicit_path", "/v1/images/generations")
+    c = FakeClient({"/v1/images/generations": FakeResp(
+        200, {"data": [{"url": "https://cdn/x.png"}]})})
+    res = await autodetect.autodetect(c, sp, "sk-test", "image", "m")
+    assert res["ok"] is True
+    cap = res["capability"]
+    assert cap["request"]["path"] == "/v1/images/generations"
+    # 只发了一次请求 —— 没去试其他候选
+    assert len(c.calls) == 1
+    assert res["tried"][0].get("source") == "用户填写"
+
+
+@pytest.mark.asyncio
+async def test_explicit_path_falls_back_to_candidates():
+    """用户给的 path 不通时，回退候选清单（不能直接失败）。"""
+    sp = _spec(base="https://api.agnes-ai.cn")
+    setattr(sp, "_explicit_path", "/wrong/path")
+    c = FakeClient({"/v1/images/generations": FakeResp(
+        200, {"data": [{"url": "https://cdn/x.png"}]})})
+    res = await autodetect.autodetect(c, sp, "sk-test", "image", "m")
+    assert res["ok"] is True
+    assert res["capability"]["request"]["path"] == "/v1/images/generations"
+    # 第一条是用户填的（失败），后面是候选
+    assert res["tried"][0]["path"] == "/wrong/path"

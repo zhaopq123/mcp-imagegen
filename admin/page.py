@@ -104,6 +104,24 @@ a { color: inherit; text-decoration: none; }
 label.field { display: block; margin-bottom: 13px; }
 label.field > span { display: block; font-size: 12px; color: var(--muted); margin-bottom: 5px; }
 .hint { font-size: 11.5px; color: var(--muted); margin-top: 4px; }
+/* 接入三格：横向编号 + 输入框，一屏搞定 */
+.steps { display: flex; align-items: flex-end; gap: 8px; flex-wrap: wrap; }
+.steps .step-n { width: 20px; height: 20px; flex: 0 0 20px; margin-bottom: 8px;
+  border-radius: 50%; background: var(--brand); color: #fff; font-size: 11px;
+  display: flex; align-items: center; justify-content: center; font-weight: 700; }
+.caps { display: flex; align-items: center; gap: 10px; margin-top: 14px; flex-wrap: wrap; }
+.chip { display: inline-flex; align-items: center; gap: 6px; padding: 5px 12px;
+  border: 1px solid var(--border); border-radius: 999px; cursor: pointer; font-size: 12.5px; }
+.chip:hover { border-color: var(--brand); }
+.chip input { accent-color: var(--brand); }
+.adv-body h4 { margin: 14px 0 6px; font-size: 12px; color: var(--muted);
+  text-transform: uppercase; letter-spacing: .04em; }
+.adv-body h4:first-of-type { margin-top: 0; }
+/* 快速接入区：三格输入 + 一键接入，主体是这个区块 */
+.quick { border: 1px solid var(--border); border-radius: 12px; background: var(--card-2); padding: 12px; margin: 0 0 14px; }
+.quick > b { display: block; margin-bottom: 10px; font-size: 13px; color: var(--text); }
+.quick .grid { margin-bottom: 10px; }
+.quick #autodetect-out:not(:empty) { margin-top: 10px; }
 /* 高级模板折叠：默认收起，让「填 3 项就能用」这件事一眼可见 */
 .adv { margin-top: 12px; border: 1px solid var(--border); border-radius: 10px; background: var(--card-2); }
 .adv > summary { cursor: pointer; padding: 9px 12px; font-size: 12.5px; color: var(--muted); user-select: none; list-style: none; }
@@ -391,6 +409,11 @@ async function loadPage(silent) {
   try { await view(content, silent); } catch (e) { content.innerHTML = '<div class="card"><div class="empty">加载失败：' + esc(e.message || e) + "</div></div>"; }
 }
 
+/* ---------------- 快速接入（首屏） ---------------- */
+/* 诉求原文「只需要配模型名 + api key，配好之后自动匹配其他」——
+   所以做成登录后第一屏最显眼的东西，不用先点菜单/切标签页。 */
+
+
 /* ---------------- dashboard ---------------- */
 async function viewDashboard(node, silent) {
   const res = await api("/dashboard");
@@ -542,7 +565,7 @@ function openProviderEditor(pid) {
       else drawTabs();
     });
   function drawTabs() {
-    const tabs = [["basic", "基础"], ["auth", "鉴权"], ["image", "生图"], ["video", "视频"], ["limits", "限速与连接"], ["json", "JSON"]];
+    const tabs = [["basic", "接入信息"], ["adv", "高级"], ["json", "JSON"]];
     mask.querySelector("#tabs").innerHTML = tabs.map(function (t) {
       return '<div class="tab' + (state.tab === t[0] ? " active" : "") + '" data-tab="' + t[0] + '">' + t[1] + "</div>";
     }).join("");
@@ -579,161 +602,189 @@ function openProviderEditor(pid) {
   function drawBody() {
     const it = state.item, body = mask.querySelector("#modal-body"), t = state.tab;
     if (t === "json") {
-      body.innerHTML = '<label class="field"><span>完整配置（可直接粘贴导入格式）</span><textarea class="textarea" id="json-text" rows="20">' + esc(JSON.stringify(it, null, 2)) + "</textarea></label>";
+      body.innerHTML = '<label class="field"><span>完整配置（可粘贴导入格式）</span><textarea class="textarea" id="json-text" rows="20">' + esc(JSON.stringify(it, null, 2)) + "</textarea></label>";
       return;
     }
+    /* ── 接入信息：一屏三格，其余全交给服务端探测 ── */
     if (t === "basic") {
-      body.innerHTML = '<div class="hint" style="margin:0 0 12px;padding:10px 12px;border:1px solid var(--border);border-radius:10px;background:var(--card-2)">'
-        + "<b>推荐：自动装配</b> —— 填好「基础地址」和「密钥」后点下方按钮，"
-        + "服务会自己探测请求路径、请求体和响应格式（并顺手拉取可用模型列表），"
-        + "通常<b>不需要手工填任何模板</b>。"
+      const img = ensureCap("image"), vid = ensureCap("video");
+      body.innerHTML = '<div class="steps">'
+        + '<div class="step-n">1</div>'
+        + '<label class="field" style="flex:1"><span>接口地址</span>'
+        + '<input class="input" id="q-base" data-f="q-base" value="' + esc(it.base_url || "")
+        + '" placeholder="https://api.服务商.com/v1/images/generations"></label>'
+        + '<div class="step-n">2</div>'
+        + '<label class="field" style="flex:1"><span>Key</span>'
+        + '<input class="input" id="q-token" data-f="q-token" type="password" value="'
+        + esc((it.auth || {}).token || "") + '" placeholder="sk-..."></label>'
+        + '<div class="step-n">3</div>'
+        + '<label class="field" style="flex:1"><span>模型名</span>'
+        + '<input class="input" id="q-model" data-f="q-model" value="' + esc(img.model || "")
+        + '" placeholder="留空则自动从上游拉取"></label>'
         + "</div>"
-        + '<div style="display:flex;gap:8px;margin:0 0 12px;flex-wrap:wrap">'
-        + '<button class="btn primary" id="autodetect-btn">⚡ 自动装配（探测路径与模型）</button>'
-        + '<button class="btn" id="models-btn">拉取模型列表</button>'
+        + '<div class="caps">'
+        + '<label class="chip"><input type="radio" name="cap-kind" data-f="cap-img" ' + (img.enabled || !vid.enabled ? "checked" : "") + '><span>生图</span></label>'
+        + '<label class="chip"><input type="radio" name="cap-kind" data-f="cap-vid" ' + (vid.enabled && !img.enabled ? "checked" : "") + '><span>视频</span></label>'
+        + '<span class="spacer" style="flex:1"></span>'
+        + '<button class="btn primary" id="do-connect">⚡ 接入</button>'
         + "</div>"
-        + '<div id="autodetect-out"></div>'
-        + f("显示名称", "name", "", it.name)
-        + f("唯一 ID", "id", "字母/数字/下划线/连字符，保存后不建议改", it.id)
-        + f("基础地址 Base URL", "base_url", "以 http:// 或 https:// 开头，末尾斜杠会自动去掉", it.base_url)
-        + '<label class="field"><span>预设 Preset</span><select class="select" data-f="preset">'
-        + ["custom", "openai"].map(function (p) { return '<option value="' + p + '"' + (it.preset === p ? " selected" : "") + ">" + p + "</option>"; }).join("")
-        + '</select><div class="hint">只影响表单默认值，实际行为由下面的请求模板决定</div></label>'
-        + f("优先级 Priority", "priority", "数字越小越优先", it.priority)
-        + '<div class="hint">高级区里的 <code>{prompt}</code> 这类占位符用于注入变量（<code>{{images}}</code> 原样注入数组）。</div>';
+        + '<div class="hint" style="margin-top:8px">把服务商给的<b>完整接口地址</b>粘进第 ① 格'
+        + "（含 <code>/v1/images/generations</code> 这样的完整路径），再点「接入」。"
+        + "服务照你给的地址调，自动处理请求体与响应解析。</div>"
+        + '<div id="autodetect-out"></div>';
+      bindConnect();
+      return;
     }
-    if (t === "auth") {
-      const a = it.auth || {};
-      body.innerHTML = '<label class="field"><span>鉴权方式</span><select class="select" data-f="auth.kind">'
+    /* ── 高级：原basic/auth/image/video/limits 的全部内容，统一收纳 ── */
+    if (t === "adv") {
+      const img = ensureCap("image"), vid = ensureCap("video");
+      const a = it.auth || {}, l = it.limits || {}, pl = it.pool || {};
+      const ireq = img.request || {}, iex = img.extract || {};
+      const vreq = vid.request || {};
+      body.innerHTML = advWrap(
+        '<div class="hint">通常<b>不需要改这里</b>——「接入」会自动填好。'
+        + "只有当上游不是常见的 OpenAI 兼容形状时才需要手工指定。</div>"
+        + "<h4>标识</h4>"
+        + f("显示名称", "name", "", it.name)
+        + f("唯一 ID", "id", "保存后不建议改", it.id)
+        + f("优先级 Priority", "priority", "数字越小越优先", it.priority)
+        + "<h4>鉴权</h4>"
+        + '<label class="field"><span>鉴权方式</span><select class="select" data-f="auth.kind">'
         + ["bearer", "header", "query", "none"].map(function (k) { return '<option value="' + k + '"' + (a.kind === k ? " selected" : "") + ">" + k + "</option>"; }).join("")
         + "</select></label>"
-        + f("密钥 Token", "auth.token", "留空表示「不修改」；写成 <code>env:变量名</code> 可从环境变量读取（推荐，密钥不落配置文件）", a.token ? "（已保存，留空则不修改）" : "")
-        + f("名称 Name", "auth.name", "header / query 模式下是键名", a.name)
-        + f("前缀 Prefix", "auth.prefix", "bearer 模式默认 “Bearer&nbsp;”", a.prefix);
-      return;
-    }
-    if (t === "image" || t === "video") {
-      const isVideo = t === "video";
-      const cap = ensureCap(t);
-      const req = cap.request || {}, ex = cap.extract || {};
-      /* 基础只有两个：启用 + 模型名。抽取路径留空 = 自动猜测（兼容
-         data[].url / images[].url 双形态），绝大多数上游无需手填。 */
-      const basic = '<label class="field" style="display:flex;align-items:center;gap:8px"><span style="margin:0">启用该能力</span>'
-        + '<label class="switch"><input type="checkbox" data-f="cap.enabled" ' + (cap.enabled ? "checked" : "") + '><span class="slider"></span></label></label>'
-        + f("模型名 Model", "cap.model",
-            isVideo ? "上游的视频模型名，如 sora-2" : "上游的生图模型名，如 gpt-image-1", cap.model)
-        + '<div class="hint">已按 OpenAI 兼容形状预填请求路径与请求体，'
-        + (isVideo ? "并预填了轮询端点" : "") + '；模型名填上即可用。</div>';
-      const adv = f("请求方法与路径", "cap.request.method", "", req.method) + ""
-        + f("路径 Path", "cap.request.path", "支持占位符，如 <code>/v1/videos/{task_id}</code>", req.path)
-        + '<label class="field"><span>请求体模板（JSON）</span><textarea class="textarea" data-area="cap.request.body" rows="10">'
-        + esc(typeof req.body === "string" ? req.body : JSON.stringify(req.body || {}, null, 2)) + "</textarea></label>"
-        + (isVideo ? '<label class="field"><span>轮询端点 Path</span><input class="input" data-f="cap.poll.path" value="' + esc(((cap.poll || {}).path) || "") + '"><div class="hint">留空表示「提交即出结果」，不做轮询</div></label>'
-          + '<label class="field"><span>轮询查询参数（JSON 对象）</span><textarea class="textarea" data-area="cap.poll.query" rows="4">' + esc(JSON.stringify(((cap.poll || {}).query) || {}, null, 2)) + "</textarea></label>"
-          : "")
-        + '<label class="field"><span>' + (isVideo ? "任务号抽取路径" : "图片地址抽取路径") + '</span>'
-        + '<input class="input" data-f="cap.extract.' + (isVideo ? "task_id" : "urls") + '" placeholder="' + (isVideo ? "留空=自动猜测 id/video_id/task_id" : "留空=自动猜测 data[].url / images[].url") + '" value="' + esc(isVideo ? (ex.task_id || "") : (ex.urls || "")) + '"></label>'
-        + (isVideo ? '<label class="field"><span>状态抽取路径</span><input class="input" data-f="cap.extract.status" value="' + esc(ex.status || "") + '"><div class="hint">留空=自动猜测 status/state</div></label>'
-          + '<label class="field"><span>结果地址抽取路径</span><input class="input" data-f="cap.extract.url" value="' + esc(ex.url || "") + '"></label>'
-          + '<label class="field"><span>状态映射（JSON）</span><textarea class="textarea" data-area="cap.extract.status_map" rows="3">' + esc(JSON.stringify(ex.status_map || {}, null, 2)) + '</textarea><div class="hint">把上游的状态字符串映射成 running / completed / failed</div></label>'
-          : '<label class="field" style="display:flex;align-items:center;gap:8px"><span style="margin:0">返回值是 base64</span>'
-          + '<label class="switch"><input type="checkbox" data-f="cap.extract.b64" ' + (ex.b64 ? "checked" : "") + '><span class="slider"></span></label></label>');
-      body.innerHTML = basic + advWrap(adv, false);
-      return;
-    }
-    if (t === "limits") {
-      const l = it.limits || {}, p = it.pool || {};
-      body.innerHTML = '<div class="grid two">'
-        + '<div>' + f("每秒令牌数 rps", "limits.rps", "本地令牌桶，超出发前先排队", l.rps)
+        + f("密钥 Token", "auth.token", "留空表示不修改；写成 <code>env:变量名</code> 可从环境变量读取", a.token ? "（已保存，留空则不修改）" : "")
+        + f("头名 Name", "auth.name", "header / query 模式下的键名", a.name)
+        + f("前缀 Prefix", "auth.prefix", "bearer 模式默认 “Bearer&nbsp;”", a.prefix)
+        + "<h4>生图请求</h4>"
+        + f("路径 Path", "cap.image.request.path", "支持占位符", ireq.path)
+        + '<label class="field"><span>请求体模板（JSON）</span><textarea class="textarea" data-area="cap.image.request.body" rows="8">'
+        + esc(JSON.stringify(ireq.body || {}, null, 2)) + "</textarea></label>"
+        + '<label class="field"><span>图片地址抽取路径</span><input class="input" data-f="cap.image.extract.urls" placeholder="留空=自动猜测" value="' + esc(iex.urls || "") + '"></label>'
+        + "<h4>视频请求</h4>"
+        + f("路径 Path", "cap.video.request.path", "留空=提交即出结果", vreq.path)
+        + '<label class="field"><span>轮询端点</span><input class="input" data-f="cap.video.poll.path" value="'
+        + esc(((vid.poll || {}).path) || "") + '" placeholder="如 /v1/videos/{task_id}"></label>'
+        + "<h4>限速与连接</h4>"
+        + '<div class="grid two">'
+        + f("每秒令牌数 rps", "limits.rps", "本地令牌桶", l.rps)
         + f("突发容量 burst", "limits.burst", "", l.burst)
-        + f("过载冻结秒数", "limits.cooldown_sec", "收到 429/5xx 后冻结窗口", l.cooldown_sec) + "</div>"
-        + '<div>' + f("最大连接数", "pool.max_connections", "0 = 用全局值", p.max_connections || 0)
-        + f("保活连接数", "pool.max_keepalive_connections", "0 = 用全局值", p.max_keepalive_connections || 0)
-        + f("读超时（秒）", "pool.read_sec", "0 = 用全局分档", p.read_sec || 0) + "</div></div>";
+        + f("过载冻结秒", "limits.cooldown_sec", "收到 429/5xx 后冻结", l.cooldown_sec)
+        + f("最大连接数", "pool.max_connections", "0=用全局", pl.max_connections || 0)
+        + "</div>", true);
       return;
     }
-    if (t === "basic") bindAutodetect();
   }
 
-  /* ── 自动装配：只给 base_url + 密钥（+ 可选模型名），其余探测填好 ── */
-  function bindAutodetect() {
-    const out = mask.querySelector("#autodetect-out");
-    const btn = mask.querySelector("#autodetect-btn");
-    const mbtn = mask.querySelector("#models-btn");
+
+  /* ── 接入：三格（API 地址 / Key / 模型名）→ 服务探测 → 自动保存 ── */
+  function bindConnect() {
+    const btn = document.getElementById("do-connect");
     if (!btn) return;
-    /* 把当前表单里已填的值同步进 state.item，才能拿到 base_url / 密钥 / 模型名 */
-    function payload(kind) {
-      collect();
-      const it = state.item;
-      return {
-        id: it.id || "probe", base_url: it.base_url || "",
-        auth: it.auth || { kind: "bearer", token: "" },
-        capability: kind,
-        model: (it.capabilities && it.capabilities[kind] &&
-                (it.capabilities[kind].model || "")) || ""
-      };
-    }
+    const out = document.getElementById("autodetect-out");
+    const val = function (id) { const n = document.getElementById(id); return n ? n.value.trim() : ""; };
+    const chk = function (id) { const n = document.getElementById(id); return !!(n && n.checked); };
+
     function triedTable(tried) {
       if (!tried || !tried.length) return "";
-      return '<details class="adv"><summary>探测明细（' + tried.length + " 个候选路径）</summary><div class='adv-body'>"
-        + "<table><thead><tr><th>路径</th><th>状态</th><th>说明</th></tr></thead><tbody>"
-        + tried.map(function (r) {
-            return "<tr><td class='mono'>" + esc(r.path) + "</td><td>"
-              + esc(r.status === undefined ? (r.error || "-") : r.status)
-              + "</td><td class='muted'>" + esc(r.detail || "") + "</td></tr>";
-          }).join("")
-        + "</tbody></table></div></details>";
+      return '<details class="adv"><summary>试过的路径（' + tried.length + " 个）</summary>"
+        + "<div class='adv-body'>" + tried.map(function (r) {
+            return "<div class='mono' style='font-size:11px'>" + esc(r.path) + " → "
+              + esc(r.status === undefined ? (r.error || "-") : r.status) + " "
+              + esc(r.detail || "") + "</div>";
+          }).join("") + "</div></details>";
     }
-    function modelSelect(models, kind) {
-      if (!models || !models.length) return "";
-      return '<label class="field"><span>选模型（' + models.length + " 个可用）</span>"
-        + '<select class="select" id="model-pick-' + kind + '">'
-        + models.map(function (m) { return '<option value="' + esc(m) + '">' + esc(m) + "</option>"; }).join("")
-        + "</select></label>";
-    }
-    async function run() {
-      const kind = "image";
+
+    async function connect() {
       collect();
-      if (!state.item.base_url) { toast("请先填基础地址 Base URL", "bad"); return; }
-      const token = (state.item.auth || {}).token || "";
-      if (!token) { toast("请先到「鉴权」页填密钥", "bad"); return; }
-      const p = payload(kind);
-      if (!p.model) p.model = "";   // 允许空模型名：先探路径，之后再选
+      const base = val("q-base"), token = val("q-token"), model = val("q-model");
+      if (!base) { toast("请填接口地址（完整 URL）", "bad"); return; }
+      if (!token) { toast("请填 Key", "bad"); return; }
+      /* 能力是单选（radio）：一个上游一种能力，避免同一条配置两个能力抢路由。
+         未选中的那个必须显式 disabled，否则后端会当成两个都启用。 */
+      const wantImg = chk("cap-img"), wantVid = chk("cap-vid");
+      state.item.capabilities = state.item.capabilities || {};
+      ensureCap("image").enabled = !!wantImg;
+      ensureCap("video").enabled = !!wantVid;
+
+      state.item.base_url = base;
+      state.item.auth = state.item.auth || { kind: "bearer", token: "" };
+      state.item.auth.token = token;
+      if (!state.item.id) {
+        state.item.id = "up-" + String(base).split("://").pop().split("/")[0]
+          .replace(/[^a-zA-Z0-9]+/g, "").slice(0, 20).toLowerCase();
+      }
+      if (!state.item.name) {
+        state.item.name = String(base).split("://").pop().split("/")[0];
+      }
+
       btn.disabled = true;
       btn.innerHTML = '<span class="spinner" style="width:12px;height:12px"></span> 探测中…';
-      out.innerHTML = '<div class="hint">正在按候选路径试探（会用极小请求，可能产生一次极小额度消耗）…</div>';
-      const res = await api("/providers/autodetect", { method: "POST", body: JSON.stringify(p) });
-      btn.disabled = false;
-      btn.textContent = "⚡ 自动装配（探测路径与模型）";
-      if (res.ok && res.capability) {
-        /* 回填：把探测到的形状写进 image 能力；模型名用探测结果或用户已填的 */
-        const cap = res.capability || {};
-        cap.model = p.model || cap.model || "";
-        state.item.capabilities = state.item.capabilities || {};
-        state.item.capabilities[kind] = cap;
-        const models = res.models || [];
-        out.innerHTML = '<div class="hint" style="color:var(--ok);margin:0 0 8px">✓ '
-          + esc(res.detail || "自动装配成功") + (models.length ? "（并拉取到 " + models.length + " 个模型）" : "")
-          + "</div>" + modelSelect(models, kind) + triedTable(res.tried);
-        const pick = mask.querySelector("#model-pick-" + kind);
-        if (pick) pick.onchange = function () {
-          collect();
-          const c = ensureCap(kind); c.model = pick.value;
-        };
-        toast("自动装配完成，已填入请求路径与响应解析", "ok");
-        /* 若没填模型名且拉到了列表，默认选第一个 */
-        if (!p.model && models.length) {
-          const c = ensureCap(kind); c.model = models[0];
+      out.innerHTML = '<div class="hint">正在自动匹配（极小请求，可能产生一次极小额度消耗）…</div>';
+
+      const kinds = [];
+      if (wantImg) kinds.push("image");
+      if (wantVid) kinds.push("video");
+      const results = {};
+      const models = [];
+      let anyOk = false, firstFail = null;
+
+      for (const kind of kinds) {
+        const r = await api("/providers/autodetect", { method: "POST",
+          body: JSON.stringify({ id: state.item.id, base_url: base,
+                                 auth: state.item.auth, capability: kind, model: model }) });
+        if (r.ok && r.capability) {
+          const cap = r.capability;
+          if (!cap.model) cap.model = model || ((r.models || [])[0] || "");
+          state.item.capabilities = state.item.capabilities || {};
+          state.item.capabilities[kind] = cap;
+          results[kind] = cap;
+          if (r.models) models.push.apply(models, r.models);
+          anyOk = true;
+        } else {
+          results[kind] = { error: r.message || r.error || "探测失败",
+                            tried: r.tried || [] };
+          if (!firstFail) firstFail = results[kind];
         }
-      } else {
-        out.innerHTML = '<div class="hint" style="color:var(--bad)">✗ '
-          + esc(res.message || "自动装配失败") + "</div>" + triedTable(res.tried)
-          + '<div class="hint">可在「高级」里手工指定路径与请求体。</div>';
-        toast("自动装配未成功，可手工填写或查看明细", "bad");
       }
+
+      btn.disabled = false;
+      btn.textContent = "⚡ 接入";
+
+      if (!anyOk) {
+        out.innerHTML = '<div class="hint" style="color:var(--bad)">✗ '
+          + esc(firstFail.error || "接入失败") + "</div>" + triedTable(firstFail.tried)
+          + '<div class="hint">若是地址或密钥不对请改正后重试；若该上游不是常见的 '
+          + "OpenAI 兼容形状，可去「高级」手工指定。</div>";
+        toast("接入失败", "bad");
+        return;
+      }
+
+      collect();
+      const savePath = state.pid
+        ? "/providers/" + encodeURIComponent(state.pid) : "/providers";
+      const saved = await api(savePath,
+        { method: state.pid ? "PUT" : "POST", body: JSON.stringify(state.item) });
+      if (!saved.ok) {
+        out.innerHTML = '<div class="hint" style="color:var(--bad)">✗ 保存失败：'
+          + esc(saved.message || saved.error) + "</div>";
+        toast("保存失败", "bad");
+        return;
+      }
+      const cap = results.image || results.video;
+      const path = (cap.request || {}).path || "";
+      out.innerHTML = '<div class="hint" style="color:var(--ok)">✓ 已接入并保存'
+        + (models.length ? "（上游共 " + models.length + " 个模型）" : "")
+        + (path ? "：<span class='mono'>" + esc(path) + "</span>" : "") + "</div>"
+        + (firstFail ? '<div class="hint" style="color:var(--warn)">其中一项能力探测失败，'
+          + "可去「高级」手工配置。</div>" : "");
+      toast("接入成功，已生效", "ok");
+      setTimeout(function () {
+        closeModal();
+        location.hash = "#/providers";
+        route();
+      }, 1000);
     }
-    btn.onclick = run;
-    if (mbtn) mbtn.onclick = run;
+    btn.onclick = connect;
   }
   function collect() {
     const it = state.item;
@@ -741,7 +792,40 @@ function openProviderEditor(pid) {
       try { return JSON.parse(mask.querySelector("#json-text").value); } catch (e) { toast("JSON 语法有误：" + e.message, "bad"); throw e; }
     }
     mask.querySelectorAll("[data-f]").forEach(function (n) {
-      const path = n.dataset.f.split(".");
+      const raw = n.dataset.f;
+      /* 接入三格也走同一套收集（此前三格没有 data-f，导致 collect() 扫不到，
+         探测成功后再 collect() 会把地址/密钥存成空 —— 用户看到「配上了却说没配」）。
+         注意：它们的值同时被 bindConnect 读取，这里只是保证保存时不丢。 */
+      if (raw === "q-base") { state.item.base_url = n.value.trim(); return; }
+      if (raw === "q-token") {
+        state.item.auth = state.item.auth || { kind: "bearer", token: "" };
+        if (n.value.trim()) state.item.auth.token = n.value.trim();
+        return;
+      }
+      if (raw === "q-model") {
+        /* 模型名单独存在 image 能力上；视频沿用同一模型名（除非高级里单独改过） */
+        const model = n.value.trim();
+        ensureCap("image").model = model;
+        const v = ensureCap("video");
+        if (!v.model || v.model === state.item.__lastImageModel) v.model = model;
+        state.item.__lastImageModel = model;
+        return;
+      }
+      /* 新设计的两个能力开关：cap-img / cap-vid（用 - 分隔） */
+      if (raw === "cap-img" || raw === "cap-vid") {
+        ensureCap(raw === "cap-img" ? "image" : "video").enabled = n.checked;
+        return;
+      }
+      const path = raw.split(".");
+      /* 新设计：cap.image.* / cap.video.* —— 第二段是能力名，直接定位到该能力 */
+      if (path[0] === "cap" && (path[1] === "image" || path[1] === "video")) {
+        const cap = ensureCap(path[1]);
+        if (path[2] === "request") cap.request[path[3]] = n.value;
+        else if (path[2] === "extract") cap.extract[path[3]] = n.value;
+        else if (path[2] === "poll") { cap.poll = cap.poll || {}; cap.poll[path[3]] = n.value; }
+        else cap[path[2]] = n.value;
+        return;
+      }
       let target = state.item, i;
       for (i = 0; i < path.length - 1; i++) {
         const key = path[i];
@@ -771,10 +855,12 @@ function openProviderEditor(pid) {
       try { value = n.value.trim() ? JSON.parse(n.value) : (path[path.length - 1] === "body" ? null : {}); }
       catch (e) { toast("模板 JSON 语法有误：" + e.message, "bad"); throw e; }
       if (path[0] === "cap") {
-        const cap = ensureCap(state.tab);
-        if (path[1] === "request") cap.request[path[2]] = value;
-        if (path[1] === "poll") { cap.poll = cap.poll || {}; cap.poll[path[2]] = value; }
-        if (path[1] === "extract") cap.extract[path[2]] = value;
+        /* 带能力名（cap.image.request.body）优先；否则落到当前 tab */
+        const cap = ensureCap((path[1] === "image" || path[1] === "video") ? path[1] : state.tab);
+        const rest = (path[1] === "image" || path[1] === "video") ? path.slice(2) : path.slice(1);
+        if (rest[0] === "request") cap.request[rest[1]] = value;
+        if (rest[0] === "poll") { cap.poll = cap.poll || {}; cap.poll[rest[1]] = value; }
+        if (rest[0] === "extract") cap.extract[rest[1]] = value;
         return;
       }
       state.item[path[0]] = value;

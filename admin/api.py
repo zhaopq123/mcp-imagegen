@@ -59,6 +59,14 @@ PROBE_SIZE = "512x512"
 PROBE_DEADLINE_SEC = 30.0
 PROBE_VIDEO_ID = "__connectivity_probe__"
 
+# 管理台一律不缓存：面板配置随时会改，缓存旧页面/旧数据会让用户以为
+# 「改了没生效」「没有那个输入框」（2026-10-15 实际踩坑）。
+_NO_CACHE = {
+    "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
+    "Pragma": "no-cache",
+    "Expires": "0",
+}
+
 # 列表里的密钥预览：只留"能认出是哪一把钥匙"的信息量
 _PREVIEW_MIN_LEN = 8      # 短于此一律全遮（短串遮一半等于没遮）
 _PREVIEW_HEAD = 3         # 只露前缀（sk- / gsk_ 这类类型标识）
@@ -165,7 +173,12 @@ class AdminAPI:
         if rest in ("", "index.html"):
             root = request.scope.get("root_path", "")
             html = PAGE_HTML.replace("{{PREFIX}}", f"{root}{self.prefix}")
-            return Response(html, media_type="text/html; charset=utf-8")
+            # 管理台是单页应用且**不外链任何资源**，浏览器很容易把旧版
+            # 页面缓存住——用户会看到「改了却没有输入框」的错觉
+            #（2026-10-15 实际踩到：用户说「没有填的地方」，其实页面是旧的）。
+            # 面板配置随时可能改，显式禁缓存最省事；这里流量很小，不值当优化。
+            return Response(html, media_type="text/html; charset=utf-8",
+                            headers=_NO_CACHE)
         if not rest.startswith("api/"):
             return JSONResponse(
                 {"ok": False, "error": "not_found"}, status_code=404)
@@ -217,13 +230,14 @@ class AdminAPI:
     # ------------------------------------------------------------------
     @staticmethod
     def _ok(payload: dict = None, status: int = 200) -> JSONResponse:
-        return JSONResponse({"ok": True, **(payload or {})}, status_code=status)
+        return JSONResponse({"ok": True, **(payload or {})}, status_code=status,
+                            headers=_NO_CACHE)
 
     @staticmethod
     def _fail(status: int, code: str, message: str = "") -> JSONResponse:
         return JSONResponse(
             {"ok": False, "error": code, "message": message or code},
-            status_code=status)
+            status_code=status, headers=_NO_CACHE)
 
     # ------------------------------------------------------------------
     # 鉴权
@@ -384,22 +398,34 @@ class AdminAPI:
 
     async def _autodetect_provider(self, body: dict,
                                    request: Request) -> JSONResponse:
-        """自动装配：给 base_url + 密钥 + 模型名，探出请求路径/请求体/抽取路径。
+        """自动装配：给地址 + 密钥 + 模型名，其余由服务探测。
 
-        为什么需要：让使用者只填「地址 + 密钥 + 模型名」，其余由服务探测。
-        探测是**最小代价**的（n=1/小 size/短超时），且失败时如实返回
-        已试清单，不做静默降级。
+        **地址支持两种写法**（用户按哪种给都能用）：
+          1) 完整端点 URL：`https://api.example.cn/v1/images/generations`
+             → 直接拆成 base_url + path，**只试这一个**，不通才回退候选清单。
+          2) 仅域名：`https://api.example.cn` → 走候选路径列表探测。
+
+        探测是最小代价的（n=1/小 size/短超时）；失败时如实返回已试清单。
         """
         from providers import autodetect
 
-        base_url = str(body.get("base_url") or "").strip()
+        raw_url = str(body.get("base_url") or "").strip()
+        if not raw_url:
+            return self._fail(400, "missing_base_url", "请先填写接口地址")
+        # 拆完整端点 URL → base_url + 显式 path
+        base_url, explicit_path = autodetect.split_endpoint(raw_url)
         if not base_url:
-            return self._fail(400, "missing_base_url", "请先填写基础地址 Base URL")
+            return self._fail(400, "bad_base_url",
+                              f"地址无法解析：{raw_url}")
+        body = {**body, "base_url": base_url}
         try:
             spec = schema.ProviderConfig.from_dict(
                 {**body, "id": str(body.get("id") or "probe")})
         except Exception as exc:  # noqa: BLE001
             return self._fail(400, "invalid", f"{type(exc).__name__}: {exc}")
+        # 用户粘完整端点 URL 时，把拆出来的 path 挂上去，探测优先用它
+        if explicit_path:
+            setattr(spec, "_explicit_path", explicit_path)
 
         secret = self._resolve_secret(spec)
         kind = str(body.get("capability") or schema.CAP_IMAGE)
