@@ -611,20 +611,20 @@ function openProviderEditor(pid) {
       body.innerHTML = '<div class="steps">'
         + '<div class="step-n">1</div>'
         + '<label class="field" style="flex:1"><span>接口地址</span>'
-        + '<input class="input" id="q-base" value="' + esc(it.base_url || "")
+        + '<input class="input" id="q-base" data-f="q-base" value="' + esc(it.base_url || "")
         + '" placeholder="https://api.服务商.com/v1/images/generations"></label>'
         + '<div class="step-n">2</div>'
         + '<label class="field" style="flex:1"><span>Key</span>'
-        + '<input class="input" id="q-token" type="password" value="'
+        + '<input class="input" id="q-token" data-f="q-token" type="password" value="'
         + esc((it.auth || {}).token || "") + '" placeholder="sk-..."></label>'
         + '<div class="step-n">3</div>'
         + '<label class="field" style="flex:1"><span>模型名</span>'
-        + '<input class="input" id="q-model" value="' + esc(img.model || "")
+        + '<input class="input" id="q-model" data-f="q-model" value="' + esc(img.model || "")
         + '" placeholder="留空则自动从上游拉取"></label>'
         + "</div>"
         + '<div class="caps">'
-        + '<label class="chip"><input type="checkbox" data-f="cap-img" ' + (img.enabled ? "checked" : "") + '><span>生图</span></label>'
-        + '<label class="chip"><input type="checkbox" data-f="cap-vid" ' + (vid.enabled ? "checked" : "") + '><span>视频</span></label>'
+        + '<label class="chip"><input type="radio" name="cap-kind" data-f="cap-img" ' + (img.enabled || !vid.enabled ? "checked" : "") + '><span>生图</span></label>'
+        + '<label class="chip"><input type="radio" name="cap-kind" data-f="cap-vid" ' + (vid.enabled && !img.enabled ? "checked" : "") + '><span>视频</span></label>'
         + '<span class="spacer" style="flex:1"></span>'
         + '<button class="btn primary" id="do-connect">⚡ 接入</button>'
         + "</div>"
@@ -699,8 +699,12 @@ function openProviderEditor(pid) {
       const base = val("q-base"), token = val("q-token"), model = val("q-model");
       if (!base) { toast("请填接口地址（完整 URL）", "bad"); return; }
       if (!token) { toast("请填 Key", "bad"); return; }
+      /* 能力是单选（radio）：一个上游一种能力，避免同一条配置两个能力抢路由。
+         未选中的那个必须显式 disabled，否则后端会当成两个都启用。 */
       const wantImg = chk("cap-img"), wantVid = chk("cap-vid");
-      if (!wantImg && !wantVid) { toast("至少勾选一个能力（生图 / 视频）", "bad"); return; }
+      state.item.capabilities = state.item.capabilities || {};
+      ensureCap("image").enabled = !!wantImg;
+      ensureCap("video").enabled = !!wantVid;
 
       state.item.base_url = base;
       state.item.auth = state.item.auth || { kind: "bearer", token: "" };
@@ -789,6 +793,24 @@ function openProviderEditor(pid) {
     }
     mask.querySelectorAll("[data-f]").forEach(function (n) {
       const raw = n.dataset.f;
+      /* 接入三格也走同一套收集（此前三格没有 data-f，导致 collect() 扫不到，
+         探测成功后再 collect() 会把地址/密钥存成空 —— 用户看到「配上了却说没配」）。
+         注意：它们的值同时被 bindConnect 读取，这里只是保证保存时不丢。 */
+      if (raw === "q-base") { state.item.base_url = n.value.trim(); return; }
+      if (raw === "q-token") {
+        state.item.auth = state.item.auth || { kind: "bearer", token: "" };
+        if (n.value.trim()) state.item.auth.token = n.value.trim();
+        return;
+      }
+      if (raw === "q-model") {
+        /* 模型名单独存在 image 能力上；视频沿用同一模型名（除非高级里单独改过） */
+        const model = n.value.trim();
+        ensureCap("image").model = model;
+        const v = ensureCap("video");
+        if (!v.model || v.model === state.item.__lastImageModel) v.model = model;
+        state.item.__lastImageModel = model;
+        return;
+      }
       /* 新设计的两个能力开关：cap-img / cap-vid（用 - 分隔） */
       if (raw === "cap-img" || raw === "cap-vid") {
         ensureCap(raw === "cap-img" ? "image" : "video").enabled = n.checked;
