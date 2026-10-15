@@ -1140,6 +1140,13 @@ class VideoPipeline:
                 rec.result = "running"
                 rec.total = timer.total_str()
                 rec.emit()
+                if entry.status == tasks_mod.STATUS_QUEUED:
+                    # 还卡在本端代排队（没拿到上游 id）——不能说「上游仍在生成」，
+                    # 那会让人以为"等着就行"（生产实测：提交 8 次未成功仍在报生成中）
+                    return contract_mod.format_video_queueing(
+                        task_id,
+                        attempts=(job.submit_attempts if job else 0),
+                        reason=(job.error_reason if job else None) or "")
                 return contract_mod.format_video_status(task_id, entry.status)
 
             # ---- 4. 兼容路径（无后台 worker：老 TaskTable / 独立组件场景）：

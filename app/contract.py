@@ -173,6 +173,27 @@ def format_video_status(task_id: str, status: str) -> str:
     )
 
 
+def format_video_queueing(task_id: str, attempts: int = 0,
+                          reason: str = "") -> str:
+    """query_video 命中「仍卡在本端代排队」（尚未提交成功）时的状态行。
+
+    与 ``format_video_status`` 的区别是**语义**，不是措辞：那边是
+    「上游已经在生了」，这边是「上游忙，我们还没提交上去」。生产实测
+    （2026-10-15）曾把后者也回成「上游仍在生成」——作业提交 8 次都没成功，
+    Agent 读到「已在生成」就会以为"等着就行"，白白干等。
+
+    `attempts` 透出后台已尝试提交的次数：一眼分辨「刚排上」与「排很久了」。
+    """
+    detail = f"（{reason}）" if reason else ""
+    tried = f"已尝试提交 {attempts} 次，" if attempts > 0 else ""
+    return (
+        META_PREFIX
+        + f"task_id={task_id} status=queued "
+        + f"上游繁忙，服务端仍在代排队{detail}；"
+        + tried + "后台会继续重试，请稍后再次查询"
+    )
+
+
 def format_error(info: errors.ErrorInfo) -> str:
     """④：单行 [error]（A4：retry 三值语义）。"""
     retry = info.retry if info.retry is not None else "-"

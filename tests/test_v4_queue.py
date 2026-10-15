@@ -271,3 +271,39 @@ def test_is_queue_full_requires_503_with_queue_marker():
         ok=False, status_code=503, error_detail="busy")) is False
     assert f(gateway_mod.ApiCallResult(
         ok=False, status_code=429, error_detail="video_queue_full")) is False
+
+
+async def test_query_while_queueing_says_queueing_not_generating():
+    """仍卡在本端代排队（无上游 id）时，query 不能回「上游仍在生成」。
+
+    生产实测（2026-10-15）：上游免费额度持续限流，作业提交 8 次仍未成功，
+    而 query_video 回的是「上游仍在生成，请稍后再次查询」——把「还没提交
+    上去」说成「已在生成」，Agent 会误判成"等着就行"，白白干等。
+    """
+    ns = make_ns([queue_full()])
+    out = await run_default(ns)
+    assert "status=queued" in out
+    task_id = out.split("task_id=")[1].split()[0].strip("；;, ")
+
+    q = await ns.vp.query(task_id=task_id)
+    assert q.startswith(META_PREFIX)
+    assert "status=queued" in q
+    assert "代排队" in q
+    assert "上游仍在生成" not in q          # 本次修复的核心断言
+
+    # 尝试次数要透出：分辨「刚排上」与「排很久了」
+    ns.table.get(task_id).submit_attempts = 8
+    q2 = await ns.vp.query(task_id=task_id)
+    assert "已尝试提交 8 次" in q2
+    await wait_workers(ns)
+
+
+def test_format_video_queueing_wording_and_attempts():
+    from app import contract as contract_mod
+
+    line = contract_mod.format_video_queueing("q-abc", attempts=8)
+    assert line.startswith(META_PREFIX)
+    assert "task_id=q-abc" in line and "status=queued" in line
+    assert "已尝试提交 8 次" in line
+    # 没尝试过就不该编造次数
+    assert "已尝试提交" not in contract_mod.format_video_queueing("q-abc")
