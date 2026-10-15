@@ -199,6 +199,7 @@ kbd { font-family: var(--mono); background: var(--card-2); border: 1px solid var
 .toast { background: var(--card); border: 1px solid var(--border); border-left: 3px solid var(--brand); padding: 10px 14px; border-radius: 10px; box-shadow: var(--shadow); min-width: 220px; max-width: 420px; font-size: 13px; animation: in .2s ease; }
 .toast.ok { border-left-color: var(--ok); }
 .toast.bad { border-left-color: var(--bad); }
+.toast.warn { border-left-color: var(--warn); }
 @keyframes in { from { opacity: 0; transform: translateY(8px); } }
 .spinner { width: 15px; height: 15px; border: 2px solid var(--border); border-top-color: var(--brand); border-radius: 50%; animation: spin .7s linear infinite; }
 @keyframes spin { to { transform: rotate(360deg); } }
@@ -726,7 +727,8 @@ function openProviderEditor(pid) {
       if (wantVid) kinds.push("video");
       const results = {};
       const models = [];
-      let anyOk = false, firstFail = null;
+      const notes = [];
+      let anyOk = false, firstFail = null, anyDegraded = false;
 
       for (const kind of kinds) {
         const r = await api("/providers/autodetect", { method: "POST",
@@ -739,6 +741,10 @@ function openProviderEditor(pid) {
           state.item.capabilities[kind] = cap;
           results[kind] = cap;
           if (r.models) models.push.apply(models, r.models);
+          if (r.degraded) {
+            anyDegraded = true;
+            notes.push(kind + "：" + (r.detail || "未验证"));
+          }
           anyOk = true;
         } else {
           results[kind] = { error: r.message || r.error || "探测失败",
@@ -772,12 +778,19 @@ function openProviderEditor(pid) {
       }
       const cap = results.image || results.video;
       const path = (cap.request || {}).path || "";
-      out.innerHTML = '<div class="hint" style="color:var(--ok)">✓ 已接入并保存'
-        + (models.length ? "（上游共 " + models.length + " 个模型）" : "")
-        + (path ? "：<span class='mono'>" + esc(path) + "</span>" : "") + "</div>"
+      const headline = anyDegraded
+        ? '<div class="hint" style="color:var(--warn)">⚠ 已接入并保存（未验证）：'
+          + "上游探测时繁忙，未能确认这些路径真的可用。</div>"
+        : '<div class="hint" style="color:var(--ok)">✓ 已接入并保存</div>';
+      out.innerHTML = headline
+        + (models.length ? '<div class="hint">上游共 ' + models.length + " 个模型</div>" : "")
+        + (path ? '<div class="hint mono">' + esc(path) + "</div>" : "")
+        + (notes.length ? '<div class="hint" style="color:var(--warn)">'
+          + notes.map(esc).join("<br>") + "</div>" : "")
         + (firstFail ? '<div class="hint" style="color:var(--warn)">其中一项能力探测失败，'
           + "可去「高级」手工配置。</div>" : "");
-      toast("接入成功，已生效", "ok");
+      toast(anyDegraded ? "已接入（未验证，请先真实调用一次）" : "接入成功，已生效",
+            anyDegraded ? "warn" : "ok");
       setTimeout(function () {
         closeModal();
         location.hash = "#/providers";

@@ -332,10 +332,16 @@ CODERENDER_FONT=/usr/share/fonts/truetype/wqy/wqy-microhei.ttc
 
 ```bash
 ./venv/bin/pip install -r requirements-dev.txt
-./venv/bin/python -m pytest -q          # 557 项单测 + 1 跳过
+./venv/bin/python -m pytest -q          # 单测全量
 ./venv/bin/python scripts/e2e_v5.py     # V5 端到端自检（真起服务+真 mock 上游，约 1 分钟）
 ./venv/bin/python scripts/stress_mcp.py # 多会话 / 多并发压测
+./venv/bin/python scripts/e2e_upstream.py   # 配好上游后的真机自检（图+视频，**会消耗上游额度**）
+./venv/bin/python scripts/e2e_coderender.py # 代码渲染自检（纯本地，不耗额度）
 ```
+
+`e2e_upstream.py` 支持 `--only image|video`、`--poll <秒>`，也可用
+`E2E_BASE` / `E2E_STORE` 指向另一个实例（配合 `scripts/mock_upstream.py`
+就成了一套零额度的全链路回归）。
 
 ---
 

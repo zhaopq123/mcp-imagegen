@@ -23,6 +23,8 @@ def test_matrix_categories_match_v2():
         "busy", "task_not_found",
         # V5：没有任何可用服务提供方（未配置 ≠ 上游故障，retry=no）
         "not_configured",
+        # V5：上游账号额度/余额用尽（403；换 Key 修不好，retry=no）
+        "insufficient_quota",
     }
 
 
@@ -38,6 +40,7 @@ def test_matrix_values_match_spec():
     assert errors.MATRIX[errors.INVALID_PARAMS] == (False, "fixthenretry")
     assert errors.MATRIX[errors.MCP_AUTH] == (False, "no")
     assert errors.MATRIX[errors.UPSTREAM_AUTH] == (False, "no")
+    assert errors.MATRIX[errors.INSUFFICIENT_QUOTA] == (False, "no")
     assert errors.MATRIX[errors.TASK_NOT_FOUND] == (False, "fixthenretry")
     assert errors.MATRIX[errors.RATE_LIMIT] == (False, "yes")
     assert errors.MATRIX[errors.UPSTREAM_ERROR] == (False, "yes")
@@ -190,3 +193,92 @@ def test_error_info_is_immutable():
     info = errors.busy_error(1.0)
     with pytest.raises(Exception):
         info.retry = "no"  # type: ignore[misc]
+
+
+def test_classify_400_task_not_exist_is_not_content_policy():
+    """上游 400 也可能是「任务不存在」——不能一律报内容审核。
+
+    生产实测（2026-10-15）：轮询参数名与上游不符，上游回 400
+    ``{"code":"task_not_exist","message":"任务不存在"}``，却被报成
+    「内容审核未通过(400)」——排查方向被整个带偏。
+    """
+    info = errors.classify_http_status(
+        400, "任务不存在 (request id: 202610150800499035830991XTGzzKt)")
+    assert info.category == errors.TASK_NOT_FOUND
+    assert info.retry == "fixthenretry"
+    assert "参数名" in info.suggestion
+
+
+@pytest.mark.parametrize("detail", [
+    '{"code":"task_not_exist","message":"x"}',
+    "TASK_NOT_EXIST",
+    "Task Not Found",
+])
+def test_classify_400_task_missing_markers(detail):
+    assert errors.classify_http_status(400, detail).category == errors.TASK_NOT_FOUND
+
+
+@pytest.mark.parametrize("detail", [
+    "内容审核未通过：prompt 含违规内容",
+    "bad size value",
+    "content policy violation",
+])
+def test_classify_400_other_business_errors_still_content_policy(detail):
+    assert errors.classify_http_status(400, detail).category == errors.CONTENT_POLICY
+
+
+# ---------------------------------------------------------------------------
+# 403 分流：鉴权失败 vs 账号额度/余额用尽（2026-10-15 真机）
+# ---------------------------------------------------------------------------
+def test_classify_403_insufficient_quota_is_not_auth():
+    """上游 403 也可能是「额度用尽」——不能一律报「密钥配错」。
+
+    生产实测（2026-10-15）：上游 403
+    ``{"code":"insufficient_user_quota","message":"用户额度不足，剩余额度: ￥0.000000"}``
+    被报成「服务提供方的密钥有误或已失效」——用户按提示反复换 Key 也修不好，
+    实际是账号余额为 0。
+    """
+    info = errors.classify_http_status(
+        403, "用户额度不足，剩余额度: ￥0.000000 (request id: 20261015091303314597804f2gLK5LR)")
+    assert info.category == errors.INSUFFICIENT_QUOTA
+    assert info.retry == "no"
+    assert "密钥有误" not in info.suggestion      # 不再误导到「换密钥」
+    assert "充值" in info.suggestion or "更换" in info.suggestion
+
+
+@pytest.mark.parametrize("detail", [
+    "insufficient_user_quota",
+    "Insufficient Quota",
+    "quota_exceeded",
+    "You exceeded your current quota",
+    "insufficient_balance",
+    "余额不足",
+    "额度已用尽",
+])
+def test_classify_403_quota_markers(detail):
+    assert errors.classify_http_status(403, detail).category == errors.INSUFFICIENT_QUOTA
+
+
+@pytest.mark.parametrize("detail", [
+    "Invalid token",
+    "Authentication failed: bad api key",
+    "forbidden",
+    "",
+])
+def test_classify_403_auth_still_auth(detail):
+    """非额度措辞的 403 仍是鉴权类（不误伤真·密钥错误）。"""
+    assert errors.classify_http_status(403, detail).category == errors.UPSTREAM_AUTH
+
+
+def test_classify_401_never_quota():
+    """401 只可能是鉴权：即使正文里出现「额度」也不改判（防误伤）。"""
+    assert errors.classify_http_status(
+        401, "额度不足").category == errors.UPSTREAM_AUTH
+
+
+def test_classify_429_stays_rate_limit_even_with_quota_wording():
+    """429 一律 rate_limit：同家上游 429 = 速率限制，措辞里也带「额度」，
+    若按标记分流会把「稍后重试」误判成「不可重试」（免费档 60~90s 放行一个）。"""
+    info = errors.classify_http_status(429, "免费额度限流，请稍后重试")
+    assert info.category == errors.RATE_LIMIT
+    assert info.retry == "yes"

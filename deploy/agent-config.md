@@ -105,12 +105,14 @@ claude mcp add --transport http mcp-imagegen https://<你的域名>/mcp \
 | `invalid_params` | `fixthenretry` | 按 reason 指明的参数修正后重试 |
 | `mcp_auth` | `no` | 客户端 Bearer 与服务端 `MCPACCESS_TOKEN` 不一致，找管理员 |
 | `upstream_auth` | `no` | 服务端 `UPSTREAM_TOKEN` 配错或 Key 无效/过期（provider=上游服务提供方），找管理员，勿重试 |
+| `insufficient_quota` | `no` | 上游**账号额度/余额用尽**（HTTP 403，如 `insufficient_user_quota`）——与密钥无关，找管理员更换服务提供方或为该账号充值，勿重试 |
 | `rate_limit` | `yes` | 上游限流 429 或服务端熔断 OPEN 快失败（硬熔断 600s/10min），稍后重试 |
 | `upstream_error` | `yes` | 上游 5xx/超时/网络/预算耗尽/视频上游 failed，稍后重试 |
 | `content_policy` | `no` | 内容审核未过，改 prompt 再发（等同新请求） |
 | `upstream_422` | `no` | 归一化层 bug，把错误码反馈给开发者 |
 | `task_not_found` | `fixthenretry` | 视频任务号不存在（TTL 过期/容量逐出/服务重启清空），**重新提交生成**（新 task_id），勿原样重查 |
 | `busy` | `yes` | 并发占满（等待 30s 超限），稍后重调 |
+| `not_configured` | `no` | 服务端没有任何可用的服务提供方（未配置/全禁用/不具备该能力），请管理员在管理面板添加并启用，勿重试 |
 
 > `persist` 失败不是错误行：服务端自动降级返回原上游 URL + `persist_failed` 标记（图/视频同语义），客户端无感知处理。
 

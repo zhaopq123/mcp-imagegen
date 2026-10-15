@@ -16,11 +16,17 @@ upstream_error_message（顶层 {code,message,data} 优先、嵌套
 {"error":{…}} 兜底，真机 F10/F3 实证两种并存）；503 video_queue_full
 经 5xx 分支归 upstream_error、retry=yes（无需新增类别）。
 
+V2 第八轮（真机 403 分流）：上游用 403 表达「账号额度/余额用尽」
+（`insufficient_user_quota`），与 401/403 的「密钥配错」是两回事——
+前者换 Key 修不好。新增 insufficient_quota（retry=no），仅 403 分流；
+429 保持 rate_limit（同家上游 429 = 速率限制，措辞含「额度」易误伤）。
+
 | 类别              | retry         | 说明                                   |
 |-------------------|---------------|----------------------------------------|
 | 参数错            | fixthenretry  | 指明哪个参数                           |
 | MCP 鉴权 401      | no            | 找管理员（访问令牌）                   |
 | 上游鉴权 401/403  | no            | 服务器端配置错（服务提供方的密钥）     |
+| 上游额度不足 403  | no            | 账号余额/额度为 0（换提供方或充值）    |
 | 未配置服务提供方  | no            | 面板里添加并启用一个提供方             |
 | 任务不存在        | fixthenretry  | 视频任务表未命中（TTL/逐出/未知）     |
 | 限流 429          | yes           | 硬熔断 10min                           |
@@ -41,6 +47,7 @@ from typing import Optional
 INVALID_PARAMS = "invalid_params"      # 参数错
 MCP_AUTH = "mcp_auth"                  # MCP 层鉴权 401（MCPACCESS_TOKEN，找管理员）
 UPSTREAM_AUTH = "upstream_auth"        # 上游鉴权 401/403（服务提供方的密钥配错了）
+INSUFFICIENT_QUOTA = "insufficient_quota"  # 上游账号额度/余额不足（403；非密钥问题）
 NOT_CONFIGURED = "not_configured"      # 无可用服务提供方（面板里没配/全禁用）
 RATE_LIMIT = "rate_limit"              # 限流 429（402 已删：该计费模型不适用）
 UPSTREAM_ERROR = "upstream_error"       # 上游 5xx/超时/网络
@@ -61,6 +68,7 @@ MATRIX: dict[str, tuple[Optional[bool], Optional[str]]] = {
     INVALID_PARAMS: (False, RETRY_FIX_THEN_RETRY),
     MCP_AUTH: (False, RETRY_NO),
     UPSTREAM_AUTH: (False, RETRY_NO),
+    INSUFFICIENT_QUOTA: (False, RETRY_NO),
     RATE_LIMIT: (False, RETRY_YES),
     UPSTREAM_ERROR: (False, RETRY_YES),
     CONTENT_POLICY: (False, RETRY_NO),
@@ -93,6 +101,42 @@ def _build(category: str, reason: str, suggestion: str, detail: str = "") -> Err
     return ErrorInfo(category, retry, switchable, full_reason, suggestion)
 
 
+# 上游 400 不只有内容审核：同一家上游实测还用 400 表达业务错误
+# （`{"code":"task_not_exist","message":"任务不存在"}`，2026-10-15 真机）。
+# 不区分就会把「任务号 / 查询参数名不对」诊断成「内容审核未通过」，
+# 把排查方向整个带偏（生产实测：轮询一直报内容审核，实际是参数名不符）。
+_TASK_MISSING_MARKERS = (
+    "task_not_exist", "task not exist", "task not found", "task_not_found",
+    "任务不存在", "任务已过期", "任务已失效",
+)
+
+
+def _looks_like_task_missing(detail: str) -> bool:
+    text = (detail or "").lower()
+    return any(marker in text for marker in _TASK_MISSING_MARKERS)
+
+
+# 上游 403 也不只有鉴权：同一家上游实测用 403 表达「账号额度用尽」
+# （`{"code":"insufficient_user_quota","message":"用户额度不足，剩余额度: ￥0.000000"}`，
+# 2026-10-15 真机）。不区分就会把「该充值 / 该换提供方」诊断成「密钥配错了」，
+# 用户按提示反复换 Key 也修不好（生产实测：用户明明是余额为 0）。
+# 注意：**只在 403 上分流**。同一家上游的 429 是**速率限制**（免费档
+# 60~90s 放行一个），措辞里也带「额度」二字，若在 429 上按中文标记
+# 分流会把「稍后重试」误判成「不可重试」，故 429 一律保持 rate_limit。
+_INSUFFICIENT_QUOTA_MARKERS = (
+    "insufficient_user_quota", "insufficient_quota", "insufficient quota",
+    "quota_exceeded", "quota exceeded", "exceeded your current quota",
+    "insufficient_balance", "insufficient balance", "out of credits",
+    "credit balance",
+    "额度不足", "余额不足", "剩余额度", "额度已用尽", "额度用完",
+)
+
+
+def _looks_like_insufficient_quota(detail: str) -> bool:
+    text = (detail or "").lower()
+    return any(marker in text for marker in _INSUFFICIENT_QUOTA_MARKERS)
+
+
 def classify_http_status(status_code: int, detail: str = "") -> ErrorInfo:
     """上游 HTTP 状态 → 分类（规格书 4.1 的 V2 版；402 已删）。
 
@@ -101,8 +145,23 @@ def classify_http_status(status_code: int, detail: str = "") -> ErrorInfo:
     MCP 层鉴权失败请用 mcp_auth_error()。
     """
     if status_code == 400:
+        if _looks_like_task_missing(detail):
+            return _build(
+                TASK_NOT_FOUND,
+                "上游查无此任务(400)",
+                "核对 task_id 与轮询参数名（video_id / model_name 等）是否与上游一致",
+                detail,
+            )
         return _build(CONTENT_POLICY, "内容审核未通过(400)", "修改 prompt 后重试", detail)
     if status_code in (401, 403):
+        if status_code == 403 and _looks_like_insufficient_quota(detail):
+            return _build(
+                INSUFFICIENT_QUOTA,
+                "上游账号额度/余额不足(403)",
+                "当前服务提供方账号的余额或额度已用尽——请更换服务提供方，"
+                "或为该账号充值后重试（与密钥无关）",
+                detail,
+            )
         return _build(
             UPSTREAM_AUTH,
             f"上游鉴权失败({status_code})",

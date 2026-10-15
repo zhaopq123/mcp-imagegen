@@ -180,3 +180,47 @@ def test_derived_byte_limits():
     cfg = load_config({"REFERENCE_MAX_MB": "2", "UPLOAD_MAX_MB": "4"})
     assert cfg.reference_max_bytes == 2 * 1024 * 1024
     assert cfg.upload_max_bytes == 4 * 1024 * 1024
+
+
+# ---------------------------------------------------------------------------
+# 启动时重放「面板保存的热参数」（否则重启即失效 → 用户看到"改了没生效"）
+# ---------------------------------------------------------------------------
+def _store_with(tmp_path, patch):
+    from providers.store import Store
+
+    store = Store(str(tmp_path / "store.json"))
+    store.load()
+    store.set_settings(patch)
+    return store
+
+
+def test_stored_hot_settings_are_replayed_at_boot(tmp_path):
+    from conftest import make_config
+
+    from server import _apply_stored_settings
+
+    cfg = make_config()
+    assert cfg.video_submit_retry_min_sec == 20.0
+    new_cfg = _apply_stored_settings(
+        cfg, _store_with(tmp_path, {"video_submit_retry_min_sec": 90}))
+    assert new_cfg.video_submit_retry_min_sec == 90.0
+    assert cfg.video_submit_retry_min_sec == 20.0   # 原对象不可变，不受影响
+
+
+def test_no_stored_settings_keeps_config_untouched(tmp_path):
+    from conftest import make_config
+
+    from server import _apply_stored_settings
+
+    cfg = make_config()
+    assert _apply_stored_settings(cfg, _store_with(tmp_path, {})) is cfg
+
+
+def test_bad_stored_setting_does_not_block_boot(tmp_path):
+    """存了失效字段也不能拦启动——boot 路径以「起得来」为先。"""
+    from conftest import make_config
+
+    from server import _apply_stored_settings
+
+    cfg = make_config()
+    assert _apply_stored_settings(cfg, _store_with(tmp_path, {"no_such": 1})) is cfg

@@ -99,6 +99,12 @@ VIDEO_MODEL = "video"       # 能力别名（对齐生图侧 image 用法）
 VIDEO_MODE_TEXT = "text"
 VIDEO_MODE_KEYFRAME = "keyframe"
 VIDEO_MODE_REFERENCE = "reference"
+
+# 轮询撞上游限流（429）/繁忙时的指数退避上限。
+# 为什么必须退避而不是立刻重试：上游查询接口有自己的速率限制，退避太密会
+# 一直踩限流窗口（"连续重试污染观测"的老坑）。
+# 为什么必须有上限：不封顶时退避会涨到十几分钟，成片早已就绪却取不回来。
+_POLL_BACKOFF_MAX_SEC = 30.0
 SECONDS_MIN = 4              # seconds 值域 [4, 12]（闭区间）
 SECONDS_MAX = 12
 # D4（官方视频画幅表，2026-10-10 定案）：三档扩六档——
@@ -883,6 +889,11 @@ class VideoPipeline:
         """
         deadline = budget_mod.Deadline(self._job_max_wait, clock=self._clock)
         interval = self._cfg.video_poll_interval_sec
+        # 本轮轮询前的等待；撞限流时被退避改写（**替换**而非叠加，否则
+        # 实际等待会变成"基础间隔 + 退避"，与日志里报的秒数不符）。
+        next_wait = interval
+        backoff = interval
+        last_transient = ""
         try:
             async with self._job_gate:
                 # ---- V4：排队中 → 先代排队提交（成功才继续轮询）----
@@ -892,7 +903,8 @@ class VideoPipeline:
                             seed=seed):
                         return  # 排队失败/超时：_mark_* 已通知等待方
                 while True:
-                    await self._sleep(interval)
+                    await self._sleep(next_wait)
+                    next_wait = interval      # 下一轮回到基础节奏（退避是一次性的）
                     job.poll_count += 1
                     # V4：轮询必须打**上游 video_id**（upstream_id），
                     # 不能用本端 task_id——代排队的作业二者不同。
@@ -908,6 +920,36 @@ class VideoPipeline:
                         return
                     if not api.ok:
                         info = self._classify(api)
+                        if info.retry == errors_mod.RETRY_YES:
+                            # 「稍后重试」类（429 限流 / 5xx / 网络）**绝不能判成
+                            # 终态失败**：上传任务还在跑，判死就是永久漏收。
+                            # 真机实测（2026-10-15）：上游查询接口有自己的速率
+                            # 限制，间隔 2s 轮询两次就撞 429「查询过于频繁」，
+                            # 作业被判失败后再也不查——而上游任务 4 分钟后就
+                            # completed 了，成片永久丢失。作业总等待预算还在，
+                            # 正确动作是退避后继续轮询。
+                            last_transient = info.reason
+                            if deadline.expired():
+                                # 预算耗尽**不写 FAILED**：上游可能仍在跑，本端只是
+                                # 停止跟踪；此后 query_video 会走实况查询补回（E17）。
+                                self._mark_abort(
+                                    job,
+                                    reason=(f"后台轮询总等待超限（末次上游响应："
+                                            f"{last_transient}）"),
+                                    elapsed=deadline.elapsed())
+                                return
+                            wait = (api.retry_after if api.retry_after is not None
+                                    else backoff)
+                            wait = max(0.0, min(float(wait),
+                                                max(deadline.remaining(), 0.0)))
+                            logger.info(
+                                "[video] 轮询遇上游繁忙(%.0f)，%.0fs 后继续 "
+                                "task_id=%s（已等 %.0fs）",
+                                api.status_code or 0, wait, job.task_id,
+                                deadline.elapsed())
+                            backoff = min(backoff * 2, _POLL_BACKOFF_MAX_SEC)
+                            next_wait = wait
+                            continue
                         self._mark_fail(
                             job,
                             reason=f"{info.reason} | task_id={job.task_id}",
@@ -1140,6 +1182,13 @@ class VideoPipeline:
                 rec.result = "running"
                 rec.total = timer.total_str()
                 rec.emit()
+                if entry.status == tasks_mod.STATUS_QUEUED:
+                    # 还卡在本端代排队（没拿到上游 id）——不能说「上游仍在生成」，
+                    # 那会让人以为"等着就行"（生产实测：提交 8 次未成功仍在报生成中）
+                    return contract_mod.format_video_queueing(
+                        task_id,
+                        attempts=(job.submit_attempts if job else 0),
+                        reason=(job.error_reason if job else None) or "")
                 return contract_mod.format_video_status(task_id, entry.status)
 
             # ---- 4. 兼容路径（无后台 worker：老 TaskTable / 独立组件场景）：

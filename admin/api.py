@@ -455,6 +455,7 @@ class AdminAPI:
         return self._ok({"capability": result["capability"],
                          "tried": result.get("tried", []),
                          "models": result.get("models", []),
+                         "degraded": bool(result.get("degraded")),
                          "detail": result.get("detail", "")})
 
     def _resolve_secret(self, spec: schema.ProviderConfig) -> str:

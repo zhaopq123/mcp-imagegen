@@ -27,6 +27,8 @@ import re
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
+from . import urlmerge
+
 # 能力类型（Provider 自检与路由的单位）
 CAP_IMAGE = "image"
 CAP_VIDEO = "video"
@@ -331,6 +333,35 @@ class ProviderConfig:
                     f"{self.base_url!r}"
                 )
             self.base_url = self.base_url.rstrip("/")
+            self._normalize_base_url()
+
+    def _normalize_base_url(self) -> None:
+        """接口地址粘的是「完整端点 URL」→ 拆成 origin + 端点路径。
+
+        用户是按完整端点 URL 给地址的（``urlmerge.split_endpoint`` 的既定前提），
+        但 base_url 一旦带着端点路径，就**表达不了兄弟端点**——实测（2026-10-15）：
+        查询通道 ``/agnesapi`` 与提交端点 ``/v1/videos`` 是兄弟，出站会把
+        `/agnesapi` 接成 `/v1/videos/agnesapi`，轮询永远查不到任务。
+
+        只拆**确认是某个能力端点重复**的那一段（``is_endpoint_suffix``）；
+        网关前缀（`/openai/v1` 之类）原样保留，不能误伤。
+        """
+        origin, path = urlmerge.split_endpoint(self.base_url)
+        if not path:
+            return
+        endpoints = []
+        for cap in self.capabilities.values():
+            for spec in (getattr(cap, "request", None),
+                         getattr(cap, "poll", None)):
+                seg = getattr(spec, "path", "") if spec is not None else ""
+                if seg:
+                    endpoints.append(seg)
+        if not urlmerge.is_endpoint_suffix(path, endpoints):
+            return
+        self.base_url = origin
+        self._explicit_path = path
+        # 刻意**不**把这段路径回填给其它能力：它是「提交端点」，拷贝到别的
+        # 能力（比如图片）上只会凭空造出一个错的端点。空路径留给用户填。
 
     # ------------------------------------------------------------------
     def cap(self, kind: str) -> Optional[CapabilitySpec]:

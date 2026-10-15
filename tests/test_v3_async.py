@@ -331,22 +331,26 @@ def test_cancel_background_stops_workers():
 
 
 def test_video_error_category_preserved_from_worker():
-    """后台归类的 429 不会被压成 upstream_error（契约不退化）。"""
-    cfg = cfg_of()
+    """后台归类的类别不会被压成 upstream_error（契约不退化）。
 
-    class RateLimitedApi(ScriptedVideoApi):
+    注意用**不可重试**类做样本：429 自 2026-10-15 起不再产生终态失败
+    （轮询撞限流会退避续轮，见 test_v4_queue），拿它当样本就测不到
+    "类别透传"这件事了。
+    """
+
+    class QuotaApi(ScriptedVideoApi):
         async def query_video(self, *, video_id, model=None, deadline,
                               provider=None):
             await asyncio.sleep(0)
             return gateway_mod.ApiCallResult(
-                ok=False, status_code=429, model_id="m",
-                error_detail="rate limited")
+                ok=False, status_code=403, model_id="m",
+                error_detail="用户额度不足，剩余额度: ￥0.000000")
 
-    api = RateLimitedApi([])
-    vp, _ = make_video_pipeline(cfg, api)
+    api = QuotaApi([])
+    vp, _ = make_video_pipeline(cfg_of(), api)
     out = asyncio.run(vp.run(
         prompt="a cat", seconds=5, aspect_ratio="16:9", persist_flag=False))
-    assert "category=rate_limit" in out, out
+    assert "category=insufficient_quota" in out, out
 
 
 # ---------------------------------------------------------------------------

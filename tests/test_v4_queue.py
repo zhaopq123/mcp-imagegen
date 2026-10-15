@@ -55,8 +55,9 @@ def auth_denied() -> gateway_mod.ApiCallResult:
 class ScriptedSubmitApi:
     """按脚本逐次返回提交结果；脚本耗尽后重复最后一项。"""
 
-    def __init__(self, submit_script, query_result=None):
+    def __init__(self, submit_script, query_result=None, query_script=None):
         self.submit_script = list(submit_script)
+        self.query_script = list(query_script or [])
         self.submit_calls: list[dict] = []
         self.query_calls: list[dict] = []
         self.query_result = query_result
@@ -75,6 +76,10 @@ class ScriptedSubmitApi:
 
     async def query_video(self, *, video_id, model=None, deadline, provider=None):
         self.query_calls.append({"video_id": video_id})
+        if self.query_script:
+            # 脚本耗尽后沿用最后一条（避免 pop 空栈把作业推成异常路径）
+            return (self.query_script.pop(0) if len(self.query_script) > 1
+                    else self.query_script[0])
         if self.query_result is None:
             return gateway_mod.ApiCallResult(
                 ok=True, status_code=200, model_id=model,
@@ -92,14 +97,14 @@ class AdvancingSleeper:
         self.clock.advance(sec)
 
 
-def make_ns(submit_script, query_result=None, cfg=None):
+def make_ns(submit_script, query_result=None, cfg=None, query_script=None):
     cfg = cfg or make_config()
     clock = FakeClock()
     # JobTable（生产同款）：V4 作业语义（error_reason / future）在 JobTable
     table = tasks_mod.JobTable(
         ttl_sec=cfg.task_ttl_sec, max_entries=cfg.task_max, clock=clock)
     pool = budget_mod.SlotPool(cfg.max_concurrency, cfg.queue_wait_sec)
-    api = ScriptedSubmitApi(submit_script, query_result)
+    api = ScriptedSubmitApi(submit_script, query_result, query_script)
     sleep = AdvancingSleeper(clock)
     vp = VideoPipeline(cfg, pool, api, table, clock=clock, sleep=sleep)
     return SimpleNamespace(vp=vp, pool=pool, table=table, clock=clock,
@@ -271,3 +276,124 @@ def test_is_queue_full_requires_503_with_queue_marker():
         ok=False, status_code=503, error_detail="busy")) is False
     assert f(gateway_mod.ApiCallResult(
         ok=False, status_code=429, error_detail="video_queue_full")) is False
+
+
+async def test_query_while_queueing_says_queueing_not_generating():
+    """仍卡在本端代排队（无上游 id）时，query 不能回「上游仍在生成」。
+
+    生产实测（2026-10-15）：上游免费额度持续限流，作业提交 8 次仍未成功，
+    而 query_video 回的是「上游仍在生成，请稍后再次查询」——把「还没提交
+    上去」说成「已在生成」，Agent 会误判成"等着就行"，白白干等。
+    """
+    ns = make_ns([queue_full()])
+    out = await run_default(ns)
+    assert "status=queued" in out
+    task_id = out.split("task_id=")[1].split()[0].strip("；;, ")
+
+    q = await ns.vp.query(task_id=task_id)
+    assert q.startswith(META_PREFIX)
+    assert "status=queued" in q
+    assert "代排队" in q
+    assert "上游仍在生成" not in q          # 本次修复的核心断言
+
+    # 尝试次数要透出：分辨「刚排上」与「排很久了」
+    ns.table.get(task_id).submit_attempts = 8
+    q2 = await ns.vp.query(task_id=task_id)
+    assert "已尝试提交 8 次" in q2
+    await wait_workers(ns)
+
+
+def test_format_video_queueing_wording_and_attempts():
+    from app import contract as contract_mod
+
+    line = contract_mod.format_video_queueing("q-abc", attempts=8)
+    assert line.startswith(META_PREFIX)
+    assert "task_id=q-abc" in line and "status=queued" in line
+    assert "已尝试提交 8 次" in line
+    # 没尝试过就不该编造次数
+    assert "已尝试提交" not in contract_mod.format_video_queueing("q-abc")
+
+
+# ---------------------------------------------------------------------------
+# 轮询阶段的上游限流（2026-10-15 真机抓到的真 bug）
+# ---------------------------------------------------------------------------
+def completed(url: str = "http://x/v.mp4") -> gateway_mod.ApiCallResult:
+    return gateway_mod.ApiCallResult(
+        ok=True, status_code=200, provider_id="video", model_id="video",
+        video_status="completed", video_url=url)
+
+
+def running() -> gateway_mod.ApiCallResult:
+    return gateway_mod.ApiCallResult(
+        ok=True, status_code=200, provider_id="video", model_id="video",
+        video_status="running")
+
+
+async def test_poll_429_does_not_kill_the_job():
+    """轮询撞上游 429 → 退避续轮，**绝不能判成终态失败**。
+
+    真机实测（2026-10-15）：上游查询接口有自己的速率限制，2s 间隔连查两次
+    就回 429「查询过于频繁」，作业被 `_mark_fail` 判死后再也不查——而上游
+    任务 4 分钟后就 completed 了，成片永久漏收（"轮询器静默漏收"又一真因）。
+    """
+    ns = make_ns([submit_ok("vid-1")],
+                 query_script=[rate_limited(30.0), running(), completed()])
+    out = await run_default(ns)
+    await wait_workers(ns)
+    # 修复前：第一次 429 就把作业判死，调用方拿到 [error]。
+    # 修复后：退避续轮 → running → completed，调用方直接拿到成片地址。
+    assert "http://x/v.mp4" in out and not out.startswith(ERROR_PREFIX)
+    task_id = next(iter(ns.table._entries))
+    entry = ns.table.get(task_id)
+    assert entry.status == tasks_mod.STATUS_COMPLETED
+    assert entry.url == "http://x/v.mp4"
+    # 三次查询都真的发生了（没在第一次 429 就退出）
+    assert len(ns.api.query_calls) == 3
+
+
+async def test_poll_429_backoff_grows_and_respects_retry_after():
+    """退避取 Retry-After（上游给了就照办），无 Retry-After 时指数增长且封顶。"""
+    ns = make_ns([submit_ok("vid-2")],
+                 query_script=[rate_limited(7.0), rate_limited(None),
+                               rate_limited(None), completed()])
+    await run_default(ns)
+    await wait_workers(ns)
+    interval = ns.cfg.video_poll_interval_sec
+    # 首片是常规轮询间隔；随后 429 带 Retry-After 就照办；再往后指数退避
+    assert ns.sleep.calls[:4] == [pytest.approx(interval), pytest.approx(7.0),
+                                  pytest.approx(interval * 2),
+                                  pytest.approx(interval * 4)]
+    assert max(ns.sleep.calls) <= vp_mod._POLL_BACKOFF_MAX_SEC
+
+
+async def test_poll_429_until_budget_exhausted_aborts_not_fails():
+    """一直 429 到总等待超限 → **abort（保持 running）**，不是 FAILED。
+
+    保持 running 才能让后续 query_video 走实况查询把成片补回来（E17：
+    上游任务不受本端影响）；写 FAILED 就等于把可自愈状态钉死成故障。
+    """
+    cfg = make_config(video_job_max_wait_sec=60.0)
+    ns = make_ns([submit_ok("vid-3")], cfg=cfg,
+                 query_script=[rate_limited(None)])
+    out = await run_default(ns)
+    task_id = out.split("task_id=")[1].split()[0].strip("；;, ")
+    await wait_workers(ns)
+    entry = ns.table.get(task_id)
+    assert entry.status != tasks_mod.STATUS_FAILED
+    assert entry.status == tasks_mod.STATUS_RUNNING
+    assert "后台轮询总等待超限" in (entry.error_reason or "")
+
+
+async def test_poll_non_retryable_error_still_fails_fast():
+    """非可重试类（如 403 额度不足）仍应立即判死，不进退避循环。"""
+    quota = gateway_mod.ApiCallResult(
+        ok=False, status_code=403, provider_id="video", model_id="video",
+        error_detail="用户额度不足，剩余额度: ￥0.000000")
+    ns = make_ns([submit_ok("vid-4")], query_script=[quota])
+    out = await run_default(ns)
+    task_id = out.split("task_id=")[1].split()[0].strip("；;, ")
+    await wait_workers(ns)
+    entry = ns.table.get(task_id)
+    assert entry.status == tasks_mod.STATUS_FAILED
+    assert entry.error_category == "insufficient_quota"
+    assert len(ns.api.query_calls) == 1

@@ -30,31 +30,35 @@ class FakeResp:
 
 
 class FakeClient:
-    """按 path 返回预设响应；记录所有请求的 url 供断言。"""
+    """按 path 返回预设响应；记录所有请求的 url 供断言。
+
+    路径**精确匹配**（真机 HTTP 服务就是这么匹配的）。曾用 `endswith`
+    宽松匹配，结果 `/openai/v1/images/generations` 会命中
+    `/v1/images/generations` 的预设，把「恰好一个候选繁忙」的真实场景
+    伪造成「多个候选繁忙」，掩盖了降级装配分支。
+    """
 
     def __init__(self, routes: dict):
         self.routes = routes
         self.calls: list[dict] = []
 
+    def _pick(self, url):
+        path = url.split("://", 1)[-1]
+        path = "/" + path.split("/", 1)[1] if "/" in path else "/"
+        path = path.split("?", 1)[0]
+        resp = self.routes.get(path)
+        return resp() if callable(resp) else resp if resp is not None else FakeResp(
+            404, {"error": "not found"})
+
     async def post(self, url, headers=None, params=None, json=None, timeout=None):
         self.calls.append({"method": "POST", "url": url, "body": json,
                            "headers": headers or {}, "params": params or {}})
-        path = url.split("://", 1)[-1]
-        path = "/" + path.split("/", 1)[1] if "/" in path else "/"
-        for pfx, resp in self.routes.items():
-            if path == pfx or path.endswith(pfx):
-                return resp() if callable(resp) else resp
-        return FakeResp(404, {"error": "not found"})
+        return self._pick(url)
 
     async def get(self, url, headers=None, params=None, timeout=None):
         self.calls.append({"method": "GET", "url": url,
                            "headers": headers or {}, "params": params or {}})
-        path = url.split("://", 1)[-1]
-        path = "/" + path.split("/", 1)[1] if "/" in path else "/"
-        for pfx, resp in self.routes.items():
-            if path == pfx or path.endswith(pfx):
-                return resp() if callable(resp) else resp
-        return FakeResp(404, {"error": "not found"})
+        return self._pick(url)
 
 
 def _spec(base="https://api.example.com", token="sk-test", kind="bearer"):
@@ -243,3 +247,190 @@ async def test_explicit_path_falls_back_to_candidates():
     assert res["capability"]["request"]["path"] == "/v1/images/generations"
     # 第一条是用户填的（失败），后面是候选
     assert res["tried"][0]["path"] == "/wrong/path"
+
+
+# ---------------------------------------------------------------------------
+# V5：上游繁忙（503/429）时的**降级**装配
+# ---------------------------------------------------------------------------
+@pytest.mark.asyncio
+async def test_busy_upstream_degrades_instead_of_failing():
+    """唯一一个候选回 503 → 路径几乎可以断定是对的，降级装配并标 degraded。
+
+    真机场景（2026-10-15）：视频档持续拥堵，`POST /v1/videos` 一路 503，
+    旧逻辑「非 2xx 就整体失败」会让用户"只给模型名+API+Key"永远接不上。
+    """
+    c = FakeClient({"/v1/videos": FakeResp(
+        503, {"code": "video_queue_full", "message": "视频队列已满，请稍后重试"})})
+    res = await autodetect.autodetect(c, _spec(), "sk-test", "video", "m")
+    assert res["ok"] is True
+    assert res["degraded"] is True
+    assert res["capability"]["request"]["path"] == "/v1/videos"
+    assert "没有拿到成功响应" in res["detail"]   # 如实说明未验证
+    assert res["capability"]["request"]["body"]["prompt"] == "{prompt}"
+
+
+@pytest.mark.parametrize("status", [429, 503])
+async def test_busy_marks_degraded_for_both_transient_codes(status):
+    c = FakeClient({"/v1/images/generations": FakeResp(
+        status, {"message": "busy"})})
+    res = await autodetect.autodetect(c, _spec(), "sk-test", "image", "m")
+    assert res["ok"] is True and res["degraded"] is True
+
+
+@pytest.mark.asyncio
+async def test_two_busy_candidates_do_not_adopt_anything():
+    """两个候选都"忙" → 疑似整站/网关故障，路径无法判别 → 不装配。"""
+    c = FakeClient({
+        "/v1/images/generations": FakeResp(503, {"message": "busy"}),
+        "/v1/images": FakeResp(503, {"message": "busy"}),
+    })
+    res = await autodetect.autodetect(c, _spec(), "sk-test", "image", "m")
+    assert res["ok"] is False
+    assert "多个候选" in res["detail"]
+
+
+@pytest.mark.asyncio
+async def test_explicit_busy_path_not_double_counted():
+    """用户填的完整端点 URL 就是候选里的第一条 —— 不能探两次。
+
+    探两次会让 transient 里出现两条（同一条路径），len==2 就被误判成
+    "多个候选都忙"而放弃降级装配。
+    """
+    sp = _spec(base="https://api.agnes-ai.cn")
+    setattr(sp, "_explicit_path", "/v1/videos")
+    c = FakeClient({"/v1/videos": FakeResp(503, {"message": "busy"})})
+    res = await autodetect.autodetect(c, sp, "sk-test", "video", "m")
+    assert res["ok"] is True and res["degraded"] is True
+    assert res["capability"]["request"]["path"] == "/v1/videos"
+    paths = [t["path"] for t in res["tried"]]
+    assert paths.count("/v1/videos") == 1, paths
+
+
+# ---------------------------------------------------------------------------
+# V5：视频轮询端点探测（必须拿真实 task_id）
+# ---------------------------------------------------------------------------
+@pytest.mark.asyncio
+async def test_video_poll_discovered_with_real_task_id():
+    """提交成功拿到真任务号后，逐个试候选轮询形状，命中就采用。"""
+    c = FakeClient({
+        "/v1/videos": FakeResp(200, {"video_id": "up-1", "status": "queued"}),
+        "/v1/videos/up-1": FakeResp(200, {"status": "completed",
+                                          "url": "https://cdn/v.mp4"}),
+    })
+    res = await autodetect.autodetect(c, _spec(), "sk-test", "video", "m")
+    assert res["ok"] is True and res.get("degraded") is not True
+    cap = res["capability"]
+    assert cap["extract"]["task_id"] == "video_id"
+    assert cap["poll"]["path"] == "/v1/videos/{task_id}"
+    assert cap["poll_extract"]["status"] == "status"
+    assert cap["poll_extract"]["url"] == "url"
+    # 占位符不能被真实探测值污染
+    blob = json.dumps(cap, ensure_ascii=False)
+    assert "up-1" not in blob, "真实 task_id 泄漏进了配置"
+
+
+@pytest.mark.asyncio
+async def test_video_poll_query_style_candidate():
+    """查询式轮询端点也必须能探到（path + query 模板，占位符保留）。"""
+    c = FakeClient({
+        "/v1/videos": FakeResp(200, {"task_id": "up-2", "status": "queued"}),
+        "/v1/videos/query": FakeResp(200, {"status": "running", "progress": 10}),
+    })
+    res = await autodetect.autodetect(c, _spec(), "sk-test", "video", "m")
+    cap = res["capability"]
+    assert cap["poll"]["path"] == "/v1/videos/query"
+    assert cap["poll"]["query"] == {"task_id": "{task_id}", "model": "{model}"}
+    assert cap["poll_extract"]["status"] == "status"
+    assert "up-2" not in json.dumps(cap, ensure_ascii=False)
+
+
+@pytest.mark.asyncio
+async def test_video_poll_not_guessed_when_undiscoverable():
+    """探不到轮询端点 → **留空**并明说要手工填，绝不静默配一个错的。"""
+    c = FakeClient({
+        "/v1/videos": FakeResp(200, {"video_id": "up-3", "status": "queued"}),
+        # 查询接口全都是"任务不存在"（真机实测：路径式与查询式会同时存在）
+        "/v1/videos/query": FakeResp(400, {"code": "task_not_exist"}),
+    })
+    res = await autodetect.autodetect(c, _spec(), "sk-test", "video", "m")
+    cap = res["capability"]
+    assert cap.get("poll") is None
+    assert cap["extract"]["task_id"] == "video_id"   # 任务号路径仍然保留
+    assert "手工" in res["detail"]
+
+
+@pytest.mark.asyncio
+async def test_video_poll_no_task_id_in_response():
+    """提交响应里认不出任务号 → 同样留空 + 提示手工填。"""
+    c = FakeClient({"/v1/videos": FakeResp(200, {"ok": True})})
+    res = await autodetect.autodetect(c, _spec(), "sk-test", "video", "m")
+    cap = res["capability"]
+    assert cap["extract"]["task_id"] == ""
+    assert cap.get("poll") is None
+    assert "手工" in res["detail"]
+
+
+@pytest.mark.asyncio
+async def test_degraded_video_has_no_guessed_poll():
+    """降级装配（上游繁忙，没真任务号）时不许猜轮询端点。"""
+    c = FakeClient({"/v1/videos": FakeResp(503, {"message": "busy"})})
+    res = await autodetect.autodetect(c, _spec(), "sk-test", "video", "m")
+    assert res["degraded"] is True
+    cap = res["capability"]
+    assert cap.get("poll") is None
+    assert "手工" in res["detail"]
+
+
+# ---------------------------------------------------------------------------
+# 纯函数：字段路径 / 轮询抽取路径反推
+# ---------------------------------------------------------------------------
+def test_field_path_top_level_and_container():
+    assert autodetect._field_path({"video_id": "v"}, autodetect._ID_KEYS) == "video_id"
+    assert autodetect._field_path(
+        {"data": {"task_id": "t"}}, autodetect._ID_KEYS) == "data.task_id"
+    assert autodetect._field_path({"nope": 1}, autodetect._ID_KEYS) == ""
+    assert autodetect._field_path([], autodetect._ID_KEYS) == ""
+
+
+def test_derive_poll_extract_shapes():
+    ex = autodetect._derive_poll_extract({"status": "completed", "url": "u"})
+    assert (ex.status, ex.url) == ("status", "url")
+    # v2.0 形态：URL 埋在 metadata 里
+    ex2 = autodetect._derive_poll_extract(
+        {"status": "completed", "metadata": {"url": "u"}})
+    assert (ex2.status, ex2.url) == ("status", "metadata.url")
+    # 只有 status（URL 留给 gateway 在 completed 时 guess_url 兜底）
+    ex3 = autodetect._derive_poll_extract({"state": "running"})
+    assert (ex3.status, ex3.url) == ("state", "")
+
+
+def test_looks_like_poll_body_filters_non_poll_pages():
+    assert autodetect._looks_like_poll_body({"status": "completed"}) is True
+    assert autodetect._looks_like_poll_body({"status": "queued"}) is True
+    assert autodetect._looks_like_poll_body({"state": "processing"}) is True
+    # 没有状态字段 / 状态值认不出 → 不算轮询端点
+    assert autodetect._looks_like_poll_body({"url": "u"}) is False
+    assert autodetect._looks_like_poll_body({"status": "totally-unknown"}) is False
+    assert autodetect._looks_like_poll_body("<html>hi</html>") is False
+
+
+def test_is_transient_only_busy_codes():
+    assert autodetect._is_transient(503) is True
+    assert autodetect._is_transient(429) is True
+    for code in (200, 400, 401, 403, 404, 422, 500):
+        assert autodetect._is_transient(code) is False
+
+
+def test_path_exists_accepts_busy_json():
+    """503/429 是「路径存在 + 上游忙」，HTML 报错页仍不算。"""
+    assert autodetect._path_exists(503, {"code": "video_queue_full"}) is True
+    assert autodetect._path_exists(429, {"message": "too many"}) is True
+    assert autodetect._path_exists(503, "<html>maintenance</html>") is False
+
+
+def test_poll_candidates_have_no_vendor_paths():
+    """轮询候选同样受零厂商常量约束（`/agnesapi` 这种专属路径绝不能出现）。"""
+    blob = json.dumps(autodetect._VIDEO_POLL_CANDIDATES, ensure_ascii=False).lower()
+    for bad in ("agnes", "agnesapi", "siliconflow", "dashscope", "volces",
+                "aliyuncs", "ark.cn"):
+        assert bad not in blob, f"轮询候选不应硬编码厂商路径：{bad}"

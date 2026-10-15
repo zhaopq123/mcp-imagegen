@@ -32,7 +32,7 @@ import httpx
 from infra import budget as budget_mod
 from infra import circuit as circuit_mod
 from infra import ratelimit as ratelimit_mod
-from . import schema, template
+from . import schema, template, urlmerge
 
 logger = logging.getLogger("mcp_imagegen.gateway")
 
@@ -259,7 +259,8 @@ class ProviderRuntime:
 
     # ------------------------------------------------------------------
     def url_for(self, path: str) -> str:
-        return path
+        """把路径并到本 provider 的接口地址上（重合段只留一份，见 urlmerge）。"""
+        return urlmerge.resolve_url(self.cfg.base_url, path)
 
     def auth_parts(self) -> "tuple[dict, dict]":
         """→ (headers, query)；token 缺失时返回空（由调用方报错更明确）。"""
@@ -612,7 +613,11 @@ class ProviderGateway:
             )
 
         method = request.method
-        path = str(template.render_value(request.path, ctx) or "")
+        raw_path = str(template.render_value(request.path, ctx) or "")
+        # 出站前把「用户填的接口地址」与「模板 path」合成绝对 URL：
+        # 用户常常直接粘完整端点 URL（https://h/v1/videos），而 path 又是
+        # /v1/videos，直接相接会拼出 /v1/videos/v1/videos。收口在 urlmerge。
+        url = urlmerge.resolve_url(runtime.cfg.base_url, raw_path)
         headers: dict = dict(_JSON_HEADERS)
         headers.update(template.render_mapping(extra_headers, ctx))
         headers.update(template.render_mapping(request.headers, ctx))
@@ -634,7 +639,7 @@ class ProviderGateway:
         started = self._clock()
         try:
             result = await self._send_with_retry(
-                runtime, client, method, path,
+                runtime, client, method, url,
                 body=body, form=form, headers=headers, query=query,
                 read_tier=read_tier, deadline=deadline,
                 parse=parse, spec=spec, ctx=ctx,
@@ -655,7 +660,7 @@ class ProviderGateway:
 
     async def _send_with_retry(
         self, runtime: ProviderRuntime, client: httpx.AsyncClient,
-        method: str, path: str, *, body, form, headers, query,
+        method: str, url: str, *, body, form, headers, query,
         read_tier: float, deadline: budget_mod.Deadline,
         parse: Callable[..., ApiCallResult], spec, ctx: dict,
     ) -> ApiCallResult:
@@ -670,8 +675,9 @@ class ProviderGateway:
                 read=max(0.0, min(read_tier, deadline.remaining())),
             )
             try:
+                # url 已是绝对地址（见 urlmerge），httpx 不会再与 base_url 合并
                 resp = await client.request(
-                    method, path or "/", json=body, data=form,
+                    method, url or "/", json=body, data=form,
                     params=query or None, headers=headers, timeout=timeout,
                 )
             except (httpx.TimeoutException, httpx.NetworkError) as exc:
@@ -680,7 +686,7 @@ class ProviderGateway:
                     runtime.stats["retries"] += 1
                     logger.warning(
                         "[gateway] provider=%s %s %s 第 %d 次网络异常 %s → 退避重试",
-                        pid, method, path, attempt, type(exc).__name__)
+                        pid, method, url, attempt, type(exc).__name__)
                     await self._backoff(deadline, retry_after=None)
                     continue
                 return ApiCallResult(
