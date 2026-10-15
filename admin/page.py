@@ -104,6 +104,11 @@ a { color: inherit; text-decoration: none; }
 label.field { display: block; margin-bottom: 13px; }
 label.field > span { display: block; font-size: 12px; color: var(--muted); margin-bottom: 5px; }
 .hint { font-size: 11.5px; color: var(--muted); margin-top: 4px; }
+/* 快速接入区：三格输入 + 一键接入，主体是这个区块 */
+.quick { border: 1px solid var(--border); border-radius: 12px; background: var(--card-2); padding: 12px; margin: 0 0 14px; }
+.quick > b { display: block; margin-bottom: 10px; font-size: 13px; color: var(--text); }
+.quick .grid { margin-bottom: 10px; }
+.quick #autodetect-out:not(:empty) { margin-top: 10px; }
 /* 高级模板折叠：默认收起，让「填 3 项就能用」这件事一眼可见 */
 .adv { margin-top: 12px; border: 1px solid var(--border); border-radius: 10px; background: var(--card-2); }
 .adv > summary { cursor: pointer; padding: 9px 12px; font-size: 12.5px; color: var(--muted); user-select: none; list-style: none; }
@@ -611,22 +616,30 @@ function openProviderEditor(pid) {
       const isVideo = t === "video";
       const cap = ensureCap(t);
       const req = cap.request || {}, ex = cap.extract || {};
-      /* 三项缺一不可：Base URL（基本页）+ 密钥（鉴权页）+ 模型名（这里）。
-         所以这一页先把「还差什么」说清楚，再给一键自动装配。 */
-      const basic = '<div class="hint" style="margin:0 0 12px;padding:10px 12px;border:1px solid var(--border);border-radius:10px;background:var(--card-2)">'
-        + "<b>还差三样才能用</b>：① <b>基础地址</b>（基本页填）② <b>密钥</b>（鉴权页填）"
-        + "③ <b>模型名</b>（本页填）。<br>"
-        + "只填模型名<b>不能</b>用——服务得先知道往哪个地址、用什么路径发请求。"
-        + "下面点按钮，服务会自己把路径/请求体/响应格式探出来。"
+      /* 用户只要给三样：API 地址 + Key + 模型名。其余（路径/请求体/响应解析/
+         限速/轮询端点）全部由服务端探测填好——所以这三格 + 一个按钮就够了，
+         不该让人去别的标签页来回找。 */
+      const basic = '<div class="quick">'
+        + "<b>只需填这三样，其余服务自动匹配</b>"
+        + '<div class="grid two">'
+        + '<label class="field"><span>① API 地址</span><input class="input" id="q-base" value="'
+        + esc(it.base_url || "") + '" placeholder="https://api.你的服务商.com/v1"></label>'
+        + '<label class="field"><span>② Key</span><input class="input" id="q-token" type="password" value="'
+        + esc((it.auth || {}).token || "") + '" placeholder="sk-..."></label>'
         + "</div>"
-        + '<div style="display:flex;gap:8px;margin:0 0 10px;flex-wrap:wrap">'
-        + '<button class="btn primary" id="autodetect-btn">⚡ 自动装配（探测路径 / 请求体 / 模型列表）</button>'
+        + '<label class="field"><span>③ 模型名（可留空，服务会从上游自动拉）</span>'
+        + '<input class="input" id="q-model" value="' + esc(cap.model || "")
+        + '" placeholder="' + (isVideo ? "如 sora-2" : "如 gpt-image-1") + '"></label>'
+        + '<div style="display:flex;gap:8px;flex-wrap:wrap">'
+        + '<button class="btn primary" id="autodetect-btn">⚡ 一键接入（其余全自动）</button>'
+        + '<button class="btn" id="autosave-btn">⚡ 一键接入并保存</button>'
         + "</div>"
         + '<div id="autodetect-out"></div>'
+        + "</div>"
         + '<label class="field" style="display:flex;align-items:center;gap:8px"><span style="margin:0">启用该能力</span>'
         + '<label class="switch"><input type="checkbox" data-f="cap.enabled" ' + (cap.enabled ? "checked" : "") + '><span class="slider"></span></label></label>'
         + f("模型名 Model", "cap.model",
-            isVideo ? "上游的视频模型名，如 sora-2（可点上面按钮自动列出）" : "上游的生图模型名，如 gpt-image-1（可点上面按钮自动列出）", cap.model);
+            isVideo ? "上游的视频模型名" : "上游的生图模型名", cap.model);
       const adv = f("请求方法与路径", "cap.request.method", "", req.method) + ""
         + f("路径 Path", "cap.request.path", "支持占位符，如 <code>/v1/videos/{task_id}</code>", req.path)
         + '<label class="field"><span>请求体模板（JSON）</span><textarea class="textarea" data-area="cap.request.body" rows="10">'
@@ -663,18 +676,17 @@ function openProviderEditor(pid) {
     const AUTO_KIND = tabKind === "video" ? "video" : "image";
     const out = mask.querySelector("#autodetect-out");
     const btn = mask.querySelector("#autodetect-btn");
-    const mbtn = mask.querySelector("#models-btn");
+    const saveBtn = mask.querySelector("#autosave-btn");
     if (!btn) return;
-    /* 把当前表单里已填的值同步进 state.item，才能拿到 base_url / 密钥 / 模型名 */
-    function payload(kind) {
-      collect();
-      const it = state.item;
+    /* 三格输入 → 一个 payload。不用去别的标签页取值。 */
+    function read3(kind) {
+      const qb = mask.querySelector("#q-base");
+      const qt = mask.querySelector("#q-token");
+      const qm = mask.querySelector("#q-model");
       return {
-        id: it.id || "probe", base_url: it.base_url || "",
-        auth: it.auth || { kind: "bearer", token: "" },
-        capability: kind,
-        model: (it.capabilities && it.capabilities[kind] &&
-                (it.capabilities[kind].model || "")) || ""
+        base_url: (qb && qb.value.trim()) || "",
+        token: (qt && qt.value.trim()) || "",
+        model: (qm && qm.value.trim()) || ""
       };
     }
     function triedTable(tried) {
@@ -695,49 +707,77 @@ function openProviderEditor(pid) {
         + models.map(function (m) { return '<option value="' + esc(m) + '">' + esc(m) + "</option>"; }).join("")
         + "</select></label>";
     }
-    async function run() {
+    /* doSave=true 时探测完直接落库，用户一次点击就完成 */
+    async function run(doSave) {
       const kind = AUTO_KIND;
-      collect();
-      if (!state.item.base_url) { toast("请先到「基本」页填写基础地址 Base URL", "bad"); return; }
-      const token = (state.item.auth || {}).token || "";
-      if (!token) { toast("请先到「鉴权」页填写密钥", "bad"); return; }
-      const p = payload(kind);
-      if (!p.model) p.model = "";   // 允许空模型名：先探路径，之后再选
-      btn.disabled = true;
+      const three = read3(kind);
+      if (!three.base_url) { toast("请填 API 地址", "bad"); return; }
+      if (!three.token) { toast("请填 Key", "bad"); return; }
+      const btns = [btn, saveBtn].filter(Boolean);
+      btns.forEach(function (b) { b.disabled = true; });
       btn.innerHTML = '<span class="spinner" style="width:12px;height:12px"></span> 探测中…';
-      out.innerHTML = '<div class="hint">正在按候选路径试探（会用极小请求，可能产生一次极小额度消耗）…</div>';
+      out.innerHTML = '<div class="hint">正在自动匹配请求路径与响应格式（会用极小请求，可能产生一次极小额度消耗）…</div>';
+
+      /* 把三格写回state.item，其余字段沿用当前编辑中的值 */
+      collect();
+      state.item.base_url = three.base_url;
+      state.item.auth = state.item.auth || { kind: "bearer", token: "" };
+      state.item.auth.token = three.token;
+      state.item.name = state.item.name || String(three.base_url).split("://").pop().split("/")[0];
+
+      const p = {
+        id: state.item.id || "probe", base_url: three.base_url,
+        auth: state.item.auth, capability: kind, model: three.model
+      };
       const res = await api("/providers/autodetect", { method: "POST", body: JSON.stringify(p) });
-      btn.disabled = false;
-      btn.textContent = "⚡ 自动装配（探测路径与模型）";
-      if (res.ok && res.capability) {
-        /* 回填：把探测到的形状写进 image 能力；模型名用探测结果或用户已填的 */
-        const cap = res.capability || {};
-        cap.model = p.model || cap.model || "";
-        state.item.capabilities = state.item.capabilities || {};
-        state.item.capabilities[kind] = cap;
-        const models = res.models || [];
-        out.innerHTML = '<div class="hint" style="color:var(--ok);margin:0 0 8px">✓ '
-          + esc(res.detail || "自动装配成功") + (models.length ? "（并拉取到 " + models.length + " 个模型）" : "")
-          + "</div>" + modelSelect(models, kind) + triedTable(res.tried);
-        const pick = mask.querySelector("#model-pick-" + kind);
-        if (pick) pick.onchange = function () {
-          collect();
-          const c = ensureCap(kind); c.model = pick.value;
-        };
-        toast("自动装配完成，已填入请求路径与响应解析", "ok");
-        /* 若没填模型名且拉到了列表，默认选第一个 */
-        if (!p.model && models.length) {
-          const c = ensureCap(kind); c.model = models[0];
-        }
-      } else {
+      btns.forEach(function (b) { b.disabled = false; });
+      btn.textContent = "⚡ 一键接入（其余全自动）";
+
+      if (!(res.ok && res.capability)) {
         out.innerHTML = '<div class="hint" style="color:var(--bad)">✗ '
-          + esc(res.message || "自动装配失败") + "</div>" + triedTable(res.tried)
-          + '<div class="hint">可在「高级」里手工指定路径与请求体。</div>';
-        toast("自动装配未成功，可手工填写或查看明细", "bad");
+          + esc(res.message || "自动匹配失败") + "</div>" + triedTable(res.tried)
+          + '<div class="hint">可能是地址/密钥不对，或该上游不是常见的 OpenAI 兼容形状——'
+          + "可在「高级」里手工指定。下方明细列出了试过的路径。</div>";
+        toast("自动匹配未成功", "bad");
+        return;
       }
+      /* 回填探测结果 */
+      const cap = res.capability || {};
+      const models = res.models || [];
+      if (!cap.model) cap.model = three.model || (models.length ? models[0] : "");
+      state.item.capabilities = state.item.capabilities || {};
+      state.item.capabilities[kind] = cap;
+      /* 让下方「模型名」字段同步显示 */
+      const mf = mask.querySelector('[data-f="cap.model"]');
+      if (mf) mf.value = cap.model || "";
+
+      if (doSave) {
+        collect();
+        const savePath = state.pid
+          ? "/providers/" + encodeURIComponent(state.pid) : "/providers";
+        const saved = await api(savePath,
+          { method: state.pid ? "PUT" : "POST", body: JSON.stringify(state.item) });
+        if (saved.ok) {
+          out.innerHTML = '<div class="hint" style="color:var(--ok)">✓ 已接入并保存：'
+            + esc(cap.model || "(未指定模型)") + " · " + esc((cap.request || {}).path || "")
+            + (models.length ? " · 上游共 " + models.length + " 个模型" : "") + "</div>"
+            + modelSelect(models, kind);
+          toast("接入成功，已生效", "ok");
+          setTimeout(function () { closeModal(); location.hash = "#/providers"; route(); }, 900);
+          return;
+        }
+        out.innerHTML = '<div class="hint" style="color:var(--bad)">✗ 保存失败：'
+          + esc(saved.message || saved.error) + "</div>";
+        return;
+      }
+      out.innerHTML = '<div class="hint" style="color:var(--ok)">✓ '
+        + esc(res.detail || "匹配成功")
+        + (models.length ? "（上游共 " + models.length + " 个模型）" : "") + "</div>"
+        + modelSelect(models, kind) + triedTable(res.tried);
+      toast("匹配成功，可点「一键接入并保存」直接生效", "ok");
     }
-    btn.onclick = run;
-    if (mbtn) mbtn.onclick = run;
+    btn.onclick = function () { run(false); };
+    if (saveBtn) saveBtn.onclick = function () { run(true); };
   }
   function collect() {
     const it = state.item;
