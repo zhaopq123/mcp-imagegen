@@ -33,6 +33,7 @@ import logging
 from typing import Any, Optional
 
 from . import schema
+from .urlmerge import split_endpoint
 from .template import _B64_KEYS, _CONTAINER_KEYS, _URL_KEYS, guess_urls
 
 log = logging.getLogger(__name__)
@@ -73,34 +74,8 @@ def _join(base: str, path: str) -> str:
     return f"{(base or '').rstrip('/')}{path}"
 
 
-def split_endpoint(raw: str) -> tuple[str, str]:
-    """把用户粘的接口地址拆成 (base_url, path)。
-
-    **用户就是按「完整端点 URL」给地址的**（如
-    ``https://api.example.cn/v1/images/generations``），而不是只给域名。
-    所以必须支持直接用完整 URL：把路径部分摘出来当 path，域名当 base_url，
-    免得再去猜「这段路径是干吗的」。
-
-    无路径（如 ``https://api.example.cn``）时 path 返回空串，由探测决定。
-    """
-    text = (raw or "").strip().rstrip("/")
-    if not text:
-        return "", ""
-    # 去掉查询串/片段——不该进base_url
-    for sep in ("?", "#"):
-        if sep in text:
-            text = text.split(sep, 1)[0]
-    scheme = ""
-    rest = text
-    for candidate in ("https://", "http://"):
-        if text.lower().startswith(candidate):
-            scheme = candidate
-            rest = text[len(candidate):]
-            break
-    if "/" in rest:
-        host, path = rest.split("/", 1)
-        return f"{scheme}{host}", "/" + path.lstrip("/")
-    return f"{scheme}{rest}", ""
+# split_endpoint 挪到 urlmerge（schema 也要用它拆 base_url，而 schema 不能
+# 反向依赖本模块），本模块仍从那里导入，`autodetect.split_endpoint` 照旧可用。
 
 
 def _auth_headers(spec: schema.ProviderConfig, secret: str) -> dict[str, str]:

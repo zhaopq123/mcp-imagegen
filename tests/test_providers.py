@@ -235,3 +235,65 @@ def test_settings_roundtrip(tmp_path):
     again = store_mod.Store(st.path)
     again.load()
     assert again.get_setting("image_max_concurrency") == 9
+
+
+# ---------------------------------------------------------------------------
+# base_url 归一：完整端点 URL → origin（否则表达不了兄弟端点）
+# ---------------------------------------------------------------------------
+def _caps(path, poll=None):
+    return {"video": schema.CapabilitySpec(
+        model="m",
+        request=schema.RequestSpec(method="POST", path=path),
+        poll=(schema.RequestSpec(method="GET", path=poll) if poll else None))}
+
+
+def test_base_url_with_endpoint_path_is_split_to_origin():
+    """接口地址粘完整端点 URL → 归一到 origin。
+
+    生产实测（2026-10-15）：查询通道 ``/agnesapi`` 与提交端点 ``/v1/videos``
+    是**兄弟**，base_url 带路径时出站会把 /agnesapi 接成
+    /v1/videos/agnesapi，轮询永远查不到任务。
+    """
+    from providers import urlmerge
+
+    spec = schema.ProviderConfig(
+        id="p", base_url="https://api.example.cn/v1/videos",
+        capabilities=_caps("/v1/videos", poll="/agnesapi"))
+    assert spec.base_url == "https://api.example.cn"
+    cap = spec.capabilities["video"]
+    assert urlmerge.resolve_url(spec.base_url, cap.request.path) == \
+        "https://api.example.cn/v1/videos"
+    assert urlmerge.resolve_url(spec.base_url, cap.poll.path) == \
+        "https://api.example.cn/agnesapi"
+
+
+def test_base_url_gateway_prefix_is_kept():
+    """网关前缀不是端点重复，必须原样保留。"""
+    spec = schema.ProviderConfig(
+        id="p", base_url="https://gw.example.cn/openai/v1",
+        capabilities={"image": schema.CapabilitySpec(
+            model="m", request=schema.RequestSpec(
+                method="POST", path="/v1/images/generations"))})
+    assert spec.base_url == "https://gw.example.cn/openai/v1"
+
+
+def test_base_url_kept_when_no_endpoint_to_compare():
+    """能力路径全空时**不敢**拆：没有可比对的端点，无法区分「端点」与「网关前缀」。
+
+    宁可原样保留（面板上看得到，用户自己改），也不要猜错把前缀吃掉。
+    """
+    spec = schema.ProviderConfig(
+        id="p", base_url="https://gw.example.cn/openai/v1",
+        capabilities={"image": schema.CapabilitySpec(
+            model="m", request=schema.RequestSpec(method="POST", path=""))})
+    assert spec.base_url == "https://gw.example.cn/openai/v1"
+    assert spec.capabilities["image"].request.path == ""
+
+
+def test_base_url_normalization_is_idempotent():
+    """反复 load/save 不能越拆越短。"""
+    for _ in range(3):
+        spec = schema.ProviderConfig(
+            id="p", base_url="https://api.example.cn/v1/videos",
+            capabilities=_caps("/v1/videos"))
+        assert spec.base_url == "https://api.example.cn"

@@ -52,6 +52,63 @@ def merge_paths(base_path: str, req_path: str) -> str:
     return "/" + "/".join(merged)
 
 
+def split_endpoint(raw: str) -> tuple:
+    """把用户粘的接口地址拆成 (base_url, path)。
+
+    **用户就是按「完整端点 URL」给地址的**（如
+    ``https://api.example.cn/v1/images/generations``），而不是只给域名。
+    所以必须支持直接用完整 URL：把路径部分摘出来当 path，域名当 base_url，
+    免得再去猜「这段路径是干吗的」。
+
+    无路径（如 ``https://api.example.cn``）时 path 返回空串，由探测决定。
+    """
+    text = (raw or "").strip().rstrip("/")
+    if not text:
+        return "", ""
+    # 去掉查询串/片段——不该进 base_url
+    for sep in ("?", "#"):
+        if sep in text:
+            text = text.split(sep, 1)[0]
+    scheme = ""
+    rest = text
+    for candidate in ("https://", "http://"):
+        if text.lower().startswith(candidate):
+            scheme = candidate
+            rest = text[len(candidate):]
+            break
+    if "/" in rest:
+        host, path = rest.split("/", 1)
+        return f"{scheme}{host}", "/" + path.lstrip("/")
+    return f"{scheme}{rest}", ""
+
+
+def is_endpoint_suffix(base_path: str, candidates) -> bool:
+    """``base_path`` 是不是某个候选路径的**重复端点**（而不是网关前缀）。
+
+    判据：base 的尾部与候选中某一条的尾部完全重合。
+
+    - ``/v1/videos`` vs ``/v1/videos`` → True（用户把端点粘进了接口地址）
+    - ``/v1/images/generations`` vs ``/v1/images/generations`` → True
+    - ``/openai/v1`` vs ``/v1/chat`` → False（这是网关前缀，不能丢）
+    - ``/v1`` vs ``/v1/images/generations`` → False（同上）
+
+    为什么非要区分：base_url 一旦带着端点路径，就**没法表达兄弟端点**
+    （用户实测：查询通道 ``/agnesapi`` 与提交端点 ``/v1/videos`` 是兄弟，
+    会把 /agnesapi 接成 /v1/videos/agnesapi）。重复端点要拆掉，前缀要留着。
+    """
+    base_segs = _segments(base_path)
+    if not base_segs:
+        return False
+    for cand in candidates or ():
+        segs = _segments(cand)
+        if not segs:
+            continue
+        n = min(len(base_segs), len(segs))
+        if base_segs[len(base_segs) - n:] == segs[len(segs) - n:]:
+            return True
+    return False
+
+
 def resolve_url(base_url: str, path: str) -> str:
     """→ 最终请求 URL。``path`` 已是绝对 URL 时原样返回。"""
     raw = str(path or "").strip()
