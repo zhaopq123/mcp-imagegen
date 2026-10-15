@@ -428,3 +428,37 @@ def test_admin_page_script_is_syntactically_valid():
             "管理面板内联 JS 语法错误（浏览器会白屏）：\n"
             + (r.stderr or "").strip()[:500]
         )
+
+
+def test_admin_password_min_len_is_configurable(tmp_path, monkeypatch):
+    """管理员密码下限应由 ADMIN_MIN_PASSWORD_LEN 控制，默认仍是 8。
+
+    背景：用户要求能用 5 位短口令（内网自用）。直接改死常量不好——
+    默认安全值要保留，所以改成「可下调、默认不变」。
+    """
+    from providers.store import Store, StoreError
+
+    # 默认：8 位下限，5 位被拒
+    monkeypatch.delenv("ADMIN_MIN_PASSWORD_LEN", raising=False)
+    s = Store(tmp_path / "a.json")
+    with pytest.raises(StoreError):
+        s.set_admin_password("admin")
+    s.set_admin_password("adminadmin")  # 8 位 OK
+
+    # 下调到 4：5 位放行
+    monkeypatch.setenv("ADMIN_MIN_PASSWORD_LEN", "4")
+    s2 = Store(tmp_path / "b.json")
+    s2.set_admin_password("admin")
+    assert s2.check_admin_password("admin") is True
+
+    # 下限再低也兜到 4（防 0/1 造成空口令）
+    monkeypatch.setenv("ADMIN_MIN_PASSWORD_LEN", "0")
+    s3 = Store(tmp_path / "c.json")
+    with pytest.raises(StoreError):
+        s3.set_admin_password("abc")
+
+    # 非法值回落默认 8，不崩
+    monkeypatch.setenv("ADMIN_MIN_PASSWORD_LEN", "not-a-number")
+    s4 = Store(tmp_path / "d.json")
+    with pytest.raises(StoreError):
+        s4.set_admin_password("admin")

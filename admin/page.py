@@ -104,6 +104,14 @@ a { color: inherit; text-decoration: none; }
 label.field { display: block; margin-bottom: 13px; }
 label.field > span { display: block; font-size: 12px; color: var(--muted); margin-bottom: 5px; }
 .hint { font-size: 11.5px; color: var(--muted); margin-top: 4px; }
+/* 高级模板折叠：默认收起，让「填 3 项就能用」这件事一眼可见 */
+.adv { margin-top: 12px; border: 1px solid var(--border); border-radius: 10px; background: var(--card-2); }
+.adv > summary { cursor: pointer; padding: 9px 12px; font-size: 12.5px; color: var(--muted); user-select: none; list-style: none; }
+.adv > summary::-webkit-details-marker { display: none; }
+.adv > summary::before { content: "▸ "; color: var(--brand-2); }
+.adv[open] > summary::before { content: "▾ "; }
+.adv > summary:hover { color: var(--text); }
+.adv-body { padding: 4px 12px 12px; border-top: 1px solid var(--border-soft); }
 .card {
   background: var(--card); border: 1px solid var(--border-soft); border-radius: var(--radius);
   padding: 16px; box-shadow: var(--shadow);
@@ -548,11 +556,25 @@ function openProviderEditor(pid) {
   function ensureCap(kind) {
     state.item.capabilities = state.item.capabilities || {};
     if (!state.item.capabilities[kind]) {
+      /* 新建时给一份能直接用的形状：path / body / extract 全部预填，
+         用户只填「模型名」就能跑（抽取路径留空=自动猜测）。
+         这样「基础」页填 3 项即可用，高级项想改再展开。 */
+      var isVideo = kind === "video";
       state.item.capabilities[kind] = { enabled: true, model: "", async_poll: true,
-        request: { method: "POST", path: kind === "image" ? "/v1/images/generations" : "/v1/videos", headers: {}, query: {}, body: {}, body_encoding: "json" },
+        request: { method: "POST", path: isVideo ? "/v1/videos" : "/v1/images/generations",
+                   headers: {}, query: {},
+                   body: isVideo ? { model: "{model}", prompt: "{prompt}" }
+                                 : { model: "{model}", prompt: "{prompt}", size: "{size}" },
+                   body_encoding: "json" },
         extract: { urls: "", task_id: "", status: "", url: "", b64: false, status_map: {}, error_message: "message" } };
     }
     return state.item.capabilities[kind];
+  }
+  /* 高级（请求/响应模板）默认折叠：绝大多数OpenAI 兼容上游只需基础三项，
+     把 path/body/extract 全摊开只会让人以为必须逐项填。 */
+  function advWrap(inner, open) {
+    return '<details class="adv"' + (open ? " open" : "") + '><summary>高级：请求 / 响应模板（一般不用改）</summary>'
+      + '<div class="adv-body">' + inner + "</div></details>";
   }
   function drawBody() {
     const it = state.item, body = mask.querySelector("#modal-body"), t = state.tab;
@@ -561,14 +583,18 @@ function openProviderEditor(pid) {
       return;
     }
     if (t === "basic") {
-      body.innerHTML = f("显示名称", "name", "", it.name)
+      body.innerHTML = '<div class="hint" style="margin:0 0 12px;padding:10px 12px;border:1px solid var(--border);border-radius:10px;background:var(--card-2)">'
+        + "<b>三步就能用</b>：① 本页填「基础地址 + 名称」→ ② 「鉴权」页填密钥 → ③ 「生图」页填模型名。"
+        + "请求路径/请求体/响应抽取都已按 OpenAI 兼容形状预填，一般不用改（藏在「高级」里）。"
+        + "</div>"
+        + f("显示名称", "name", "", it.name)
         + f("唯一 ID", "id", "字母/数字/下划线/连字符，保存后不建议改", it.id)
         + f("基础地址 Base URL", "base_url", "以 http:// 或 https:// 开头，末尾斜杠会自动去掉", it.base_url)
         + '<label class="field"><span>预设 Preset</span><select class="select" data-f="preset">'
         + ["custom", "openai"].map(function (p) { return '<option value="' + p + '"' + (it.preset === p ? " selected" : "") + ">" + p + "</option>"; }).join("")
         + '</select><div class="hint">只影响表单默认值，实际行为由下面的请求模板决定</div></label>'
         + f("优先级 Priority", "priority", "数字越小越优先", it.priority)
-        + '<div class="hint">提示：把 <code>{prompt}</code> 这类占位符写进下面的请求模板即可注入变量（<code>{{images}}</code> 是原样注入数组）。</div>';
+        + '<div class="hint">提示：把 <code>{prompt}</code> 这类占位符写进高级区的请求模板即可注入变量（<code>{{images}}</code> 是原样注入数组）。</div>';
     }
     if (t === "auth") {
       const a = it.auth || {};
@@ -584,10 +610,15 @@ function openProviderEditor(pid) {
       const isVideo = t === "video";
       const cap = ensureCap(t);
       const req = cap.request || {}, ex = cap.extract || {};
-      body.innerHTML = '<label class="field" style="display:flex;align-items:center;gap:8px"><span style="margin:0">启用该能力</span>'
+      /* 基础只有两个：启用 + 模型名。抽取路径留空 = 自动猜测（兼容
+         data[].url / images[].url 双形态），绝大多数上游无需手填。 */
+      const basic = '<label class="field" style="display:flex;align-items:center;gap:8px"><span style="margin:0">启用该能力</span>'
         + '<label class="switch"><input type="checkbox" data-f="cap.enabled" ' + (cap.enabled ? "checked" : "") + '><span class="slider"></span></label></label>'
-        + f("模型名 Model", "cap.model", "会替换请求模板里的 <code>{model}</code>；留空则该键不注入", cap.model)
-        + f("请求方法与路径", "cap.request.method", "", req.method) + ""
+        + f("模型名 Model", "cap.model",
+            isVideo ? "上游的视频模型名，如 sora-2" : "上游的生图模型名，如 gpt-image-1", cap.model)
+        + '<div class="hint">已按 OpenAI 兼容形状预填请求路径与请求体，'
+        + (isVideo ? "并预填了轮询端点" : "") + '；模型名填上即可用。</div>';
+      const adv = f("请求方法与路径", "cap.request.method", "", req.method) + ""
         + f("路径 Path", "cap.request.path", "支持占位符，如 <code>/v1/videos/{task_id}</code>", req.path)
         + '<label class="field"><span>请求体模板（JSON）</span><textarea class="textarea" data-area="cap.request.body" rows="10">'
         + esc(typeof req.body === "string" ? req.body : JSON.stringify(req.body || {}, null, 2)) + "</textarea></label>"
@@ -601,6 +632,7 @@ function openProviderEditor(pid) {
           + '<label class="field"><span>状态映射（JSON）</span><textarea class="textarea" data-area="cap.extract.status_map" rows="3">' + esc(JSON.stringify(ex.status_map || {}, null, 2)) + '</textarea><div class="hint">把上游的状态字符串映射成 running / completed / failed</div></label>'
           : '<label class="field" style="display:flex;align-items:center;gap:8px"><span style="margin:0">返回值是 base64</span>'
           + '<label class="switch"><input type="checkbox" data-f="cap.extract.b64" ' + (ex.b64 ? "checked" : "") + '><span class="slider"></span></label></label>');
+      body.innerHTML = basic + advWrap(adv, false);
       return;
     }
     if (t === "limits") {

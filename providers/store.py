@@ -173,8 +173,19 @@ class Store:
         return bool(self.admin and self.admin.get("hash"))
 
     def set_admin_password(self, password: str) -> None:
-        if not isinstance(password, str) or len(password) < 8:
-            raise StoreError("管理员密码至少 8 位")
+        # 长度下限可由 ADMIN_MIN_PASSWORD_LEN 覆盖（默认 8）。
+        # 为什么可配：管理面板常部署在内网/局域网，运维可能只想用短口令
+        # 便于输入；但**默认仍是 8**，想要弱口令必须显式声明，不静默降级。
+        # 上限 128 是防御性上限，避免把超长字符串丢进哈希。
+        try:
+            floor = int(os.environ.get("ADMIN_MIN_PASSWORD_LEN", "8"))
+        except (TypeError, ValueError):
+            floor = 8
+        floor = max(4, min(floor, 128))
+        if not isinstance(password, str) or len(password) < floor:
+            raise StoreError(f"管理员密码至少 {floor} 位")
+        if len(password) > 128:
+            raise StoreError("管理员密码过长（上限 128 位）")
         self.admin = hash_password(password)
         self.save()
 
