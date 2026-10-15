@@ -93,6 +93,21 @@ def _build(category: str, reason: str, suggestion: str, detail: str = "") -> Err
     return ErrorInfo(category, retry, switchable, full_reason, suggestion)
 
 
+# 上游 400 不只有内容审核：同一家上游实测还用 400 表达业务错误
+# （`{"code":"task_not_exist","message":"任务不存在"}`，2026-10-15 真机）。
+# 不区分就会把「任务号 / 查询参数名不对」诊断成「内容审核未通过」，
+# 把排查方向整个带偏（生产实测：轮询一直报内容审核，实际是参数名不符）。
+_TASK_MISSING_MARKERS = (
+    "task_not_exist", "task not exist", "task not found", "task_not_found",
+    "任务不存在", "任务已过期", "任务已失效",
+)
+
+
+def _looks_like_task_missing(detail: str) -> bool:
+    text = (detail or "").lower()
+    return any(marker in text for marker in _TASK_MISSING_MARKERS)
+
+
 def classify_http_status(status_code: int, detail: str = "") -> ErrorInfo:
     """上游 HTTP 状态 → 分类（规格书 4.1 的 V2 版；402 已删）。
 
@@ -101,6 +116,13 @@ def classify_http_status(status_code: int, detail: str = "") -> ErrorInfo:
     MCP 层鉴权失败请用 mcp_auth_error()。
     """
     if status_code == 400:
+        if _looks_like_task_missing(detail):
+            return _build(
+                TASK_NOT_FOUND,
+                "上游查无此任务(400)",
+                "核对 task_id 与轮询参数名（video_id / model_name 等）是否与上游一致",
+                detail,
+            )
         return _build(CONTENT_POLICY, "内容审核未通过(400)", "修改 prompt 后重试", detail)
     if status_code in (401, 403):
         return _build(

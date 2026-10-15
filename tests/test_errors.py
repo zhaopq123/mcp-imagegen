@@ -190,3 +190,35 @@ def test_error_info_is_immutable():
     info = errors.busy_error(1.0)
     with pytest.raises(Exception):
         info.retry = "no"  # type: ignore[misc]
+
+
+def test_classify_400_task_not_exist_is_not_content_policy():
+    """上游 400 也可能是「任务不存在」——不能一律报内容审核。
+
+    生产实测（2026-10-15）：轮询参数名与上游不符，上游回 400
+    ``{"code":"task_not_exist","message":"任务不存在"}``，却被报成
+    「内容审核未通过(400)」——排查方向被整个带偏。
+    """
+    info = errors.classify_http_status(
+        400, "任务不存在 (request id: 202610150800499035830991XTGzzKt)")
+    assert info.category == errors.TASK_NOT_FOUND
+    assert info.retry == "fixthenretry"
+    assert "参数名" in info.suggestion
+
+
+@pytest.mark.parametrize("detail", [
+    '{"code":"task_not_exist","message":"x"}',
+    "TASK_NOT_EXIST",
+    "Task Not Found",
+])
+def test_classify_400_task_missing_markers(detail):
+    assert errors.classify_http_status(400, detail).category == errors.TASK_NOT_FOUND
+
+
+@pytest.mark.parametrize("detail", [
+    "内容审核未通过：prompt 含违规内容",
+    "bad size value",
+    "content policy violation",
+])
+def test_classify_400_other_business_errors_still_content_policy(detail):
+    assert errors.classify_http_status(400, detail).category == errors.CONTENT_POLICY
