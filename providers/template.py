@@ -243,6 +243,9 @@ def extract_list(obj: Any, path: str) -> list:
 # 自动探测（未配置抽取路径时的兜底）
 # ---------------------------------------------------------------------------
 _URL_KEYS = ("url", "image_url", "image", "src", "link", "download_url")
+# base64 图片的键名。单独提出为常量，供 autodetect 反推抽取路径时复用——
+# 两边必须认同一份清单，否则会推出 guess_urls 不认的路径。
+_B64_KEYS = ("b64_json", "b64", "base64")
 _ID_KEYS = ("video_id", "task_id", "id", "job_id", "request_id", "uuid")
 _STATUS_KEYS = ("status", "state", "task_status")
 _CONTAINER_KEYS = ("data", "images", "results", "items", "output", "videos")
@@ -276,7 +279,7 @@ def guess_urls(body: Any) -> list:
                         found.append(value.strip())
                         break
                 else:
-                    for key in ("b64_json", "b64", "base64"):
+                    for key in _B64_KEYS:
                         if isinstance(node.get(key), str) and node[key]:
                             found.append(node[key])
                             break

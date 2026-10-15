@@ -33,7 +33,7 @@ import logging
 from typing import Any, Optional
 
 from . import schema
-from .template import guess_urls
+from .template import _B64_KEYS, _CONTAINER_KEYS, _URL_KEYS, guess_urls
 
 log = logging.getLogger(__name__)
 
@@ -197,23 +197,28 @@ async def list_models(client: Any, spec: schema.ProviderConfig,
 # ────────────────────────── 形状反推 ──────────────────────────
 
 def _derive_extract(body: Any) -> schema.ExtractSpec:
-    """从成功响应反推抽取路径（拿不到就留空 = 自动猜测）。"""
+    """从成功响应反推抽取路径（拿不到就留空 = 自动猜测）。
+
+    键名清单**必须复用 template._URL_KEYS / _CONTAINER_KEYS**，不能自己另写一套
+    —— 否则会推出一个 guess_urls 根本不认的路径（如 `images[].uri`：
+    uri 不在 _URL_KEYS 里），探测能过、真正调用时却抽不到图。
+    2026-10-15 端到端测试正是踩了这个坑。
+    """
     if not guess_urls(body):
         return schema.ExtractSpec()
     if isinstance(body, dict):
-        for container in ("data", "images", "output", "result", "results"):
+        for container in _CONTAINER_KEYS:
             node = body.get(container)
             if isinstance(node, list) and node and isinstance(node[0], dict):
-                for key in ("url", "b64_json", "b64", "image", "uri"):
+                for key in _URL_KEYS + _B64_KEYS:
                     if node[0].get(key):
                         return schema.ExtractSpec(
-                            urls=f"{container}[].{key}",
-                            b64=key in ("b64_json", "b64"))
+                            urls=f"{container}[].{key}", b64=key in _B64_KEYS)
             if isinstance(node, dict):
-                for key in ("url", "image", "uri"):
+                for key in _URL_KEYS:
                     if isinstance(node.get(key), str):
                         return schema.ExtractSpec(urls=f"{container}.{key}")
-        for key in ("url", "image", "uri", "output_url"):
+        for key in _URL_KEYS:
             if isinstance(body.get(key), str):
                 return schema.ExtractSpec(urls=key)
     return schema.ExtractSpec()
