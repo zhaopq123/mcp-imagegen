@@ -38,6 +38,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import time
 from collections import deque
 from typing import Any, Callable, Optional
@@ -242,8 +243,14 @@ class AdminAPI:
             return self._fail(409, "already_initialized", "管理员已初始化")
         body = await self._json_body(request)
         password = str(body.get("password") or "")
-        if len(password) < 8:
-            return self._fail(400, "weak_password", "管理员密码至少 8 位")
+        # 长度下限与 store.set_admin_password 共用同一口径（ADMIN_MIN_PASSWORD_LEN，
+        # 默认 8）。别在这里写死另一个数——否则运维放宽了 store 这边仍被拦。
+        try:
+            floor = max(4, min(int(os.environ.get("ADMIN_MIN_PASSWORD_LEN", "8")), 128))
+        except (TypeError, ValueError):
+            floor = 8
+        if len(password) < floor:
+            return self._fail(400, "weak_password", f"管理员密码至少 {floor} 位")
         self.ctx.store.set_admin_password(password)
         logger.warning("[admin] 管理员密码已设置（首次初始化完成）")
         return self._ok({"initialized": True})
