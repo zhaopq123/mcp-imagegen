@@ -398,22 +398,34 @@ class AdminAPI:
 
     async def _autodetect_provider(self, body: dict,
                                    request: Request) -> JSONResponse:
-        """自动装配：给 base_url + 密钥 + 模型名，探出请求路径/请求体/抽取路径。
+        """自动装配：给地址 + 密钥 + 模型名，其余由服务探测。
 
-        为什么需要：让使用者只填「地址 + 密钥 + 模型名」，其余由服务探测。
-        探测是**最小代价**的（n=1/小 size/短超时），且失败时如实返回
-        已试清单，不做静默降级。
+        **地址支持两种写法**（用户按哪种给都能用）：
+          1) 完整端点 URL：`https://api.example.cn/v1/images/generations`
+             → 直接拆成 base_url + path，**只试这一个**，不通才回退候选清单。
+          2) 仅域名：`https://api.example.cn` → 走候选路径列表探测。
+
+        探测是最小代价的（n=1/小 size/短超时）；失败时如实返回已试清单。
         """
         from providers import autodetect
 
-        base_url = str(body.get("base_url") or "").strip()
+        raw_url = str(body.get("base_url") or "").strip()
+        if not raw_url:
+            return self._fail(400, "missing_base_url", "请先填写接口地址")
+        # 拆完整端点 URL → base_url + 显式 path
+        base_url, explicit_path = autodetect.split_endpoint(raw_url)
         if not base_url:
-            return self._fail(400, "missing_base_url", "请先填写基础地址 Base URL")
+            return self._fail(400, "bad_base_url",
+                              f"地址无法解析：{raw_url}")
+        body = {**body, "base_url": base_url}
         try:
             spec = schema.ProviderConfig.from_dict(
                 {**body, "id": str(body.get("id") or "probe")})
         except Exception as exc:  # noqa: BLE001
             return self._fail(400, "invalid", f"{type(exc).__name__}: {exc}")
+        # 用户粘完整端点 URL 时，把拆出来的 path 挂上去，探测优先用它
+        if explicit_path:
+            setattr(spec, "_explicit_path", explicit_path)
 
         secret = self._resolve_secret(spec)
         kind = str(body.get("capability") or schema.CAP_IMAGE)

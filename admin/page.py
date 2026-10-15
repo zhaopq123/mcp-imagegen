@@ -610,9 +610,9 @@ function openProviderEditor(pid) {
       const img = ensureCap("image"), vid = ensureCap("video");
       body.innerHTML = '<div class="steps">'
         + '<div class="step-n">1</div>'
-        + '<label class="field" style="flex:1"><span>API 地址</span>'
+        + '<label class="field" style="flex:1"><span>接口地址</span>'
         + '<input class="input" id="q-base" value="' + esc(it.base_url || "")
-        + '" placeholder="https://api.服务商.com/v1"></label>'
+        + '" placeholder="https://api.服务商.com/v1/images/generations"></label>'
         + '<div class="step-n">2</div>'
         + '<label class="field" style="flex:1"><span>Key</span>'
         + '<input class="input" id="q-token" type="password" value="'
@@ -628,8 +628,9 @@ function openProviderEditor(pid) {
         + '<span class="spacer" style="flex:1"></span>'
         + '<button class="btn primary" id="do-connect">⚡ 接入</button>'
         + "</div>"
-        + '<div class="hint" style="margin-top:8px">填完点「接入」：服务自动探测请求路径与响应格式、拉取模型列表并保存。'
-        + "非标准上游可去「高级」手工指定。</div>"
+        + '<div class="hint" style="margin-top:8px">把服务商给的<b>完整接口地址</b>粘进第 ① 格'
+        + "（含 <code>/v1/images/generations</code> 这样的完整路径），再点「接入」。"
+        + "服务照你给的地址调，自动处理请求体与响应解析。</div>"
         + '<div id="autodetect-out"></div>';
       bindConnect();
       return;
@@ -696,7 +697,7 @@ function openProviderEditor(pid) {
     async function connect() {
       collect();
       const base = val("q-base"), token = val("q-token"), model = val("q-model");
-      if (!base) { toast("请填 API 地址", "bad"); return; }
+      if (!base) { toast("请填接口地址（完整 URL）", "bad"); return; }
       if (!token) { toast("请填 Key", "bad"); return; }
       const wantImg = chk("cap-img"), wantVid = chk("cap-vid");
       if (!wantImg && !wantVid) { toast("至少勾选一个能力（生图 / 视频）", "bad"); return; }

@@ -73,6 +73,36 @@ def _join(base: str, path: str) -> str:
     return f"{(base or '').rstrip('/')}{path}"
 
 
+def split_endpoint(raw: str) -> tuple[str, str]:
+    """把用户粘的接口地址拆成 (base_url, path)。
+
+    **用户就是按「完整端点 URL」给地址的**（如
+    ``https://api.example.cn/v1/images/generations``），而不是只给域名。
+    所以必须支持直接用完整 URL：把路径部分摘出来当 path，域名当 base_url，
+    免得再去猜「这段路径是干吗的」。
+
+    无路径（如 ``https://api.example.cn``）时 path 返回空串，由探测决定。
+    """
+    text = (raw or "").strip().rstrip("/")
+    if not text:
+        return "", ""
+    # 去掉查询串/片段——不该进base_url
+    for sep in ("?", "#"):
+        if sep in text:
+            text = text.split(sep, 1)[0]
+    scheme = ""
+    rest = text
+    for candidate in ("https://", "http://"):
+        if text.lower().startswith(candidate):
+            scheme = candidate
+            rest = text[len(candidate):]
+            break
+    if "/" in rest:
+        host, path = rest.split("/", 1)
+        return f"{scheme}{host}", "/" + path.lstrip("/")
+    return f"{scheme}{rest}", ""
+
+
 def _auth_headers(spec: schema.ProviderConfig, secret: str) -> dict[str, str]:
     auth = spec.auth
     headers: dict[str, str] = {"Content-Type": "application/json",
@@ -255,11 +285,39 @@ async def autodetect(client: Any, spec: schema.ProviderConfig, secret: str,
     """
     kind = kind or schema.CAP_IMAGE
     model = (model or "").strip()
-    candidates = _IMAGE_PATHS if kind == schema.CAP_IMAGE else _VIDEO_SUBMIT_PATHS
     headers = _auth_headers(spec, secret)
     query = _auth_query(spec, secret)
     tried: list[dict] = []
     chosen: Optional[dict] = None
+
+    # 用户粘的是完整端点 URL 时，**先用它自己的路径**，不通再回退候选清单。
+    # 这条优先级最高：用户已经明确告诉我们要打哪了，不该替他猜。
+    explicit_path = str(getattr(spec, "_explicit_path", "") or "").strip()
+    if explicit_path:
+        entry: dict[str, Any] = {"path": explicit_path, "source": "用户填写"}
+        payload = {"model": model or "{model}", "prompt": _PROBE_PROMPT}
+        try:
+            resp = await client.post(_join(spec.base_url, explicit_path),
+                                     headers=headers, params=query or None,
+                                     json=payload, timeout=timeout)
+        except Exception as exc:  # noqa: BLE001
+            entry["error"] = type(exc).__name__
+            entry["detail"] = "按你填的完整地址请求失败"
+            tried.append(entry)
+        else:
+            status = resp.status_code
+            body = _parse_body(resp)
+            entry["status"] = status
+            entry["path_exists"] = _path_exists(status, body)
+            entry["detail"] = "可用" if 200 <= status < 300 else _summarize(body, 100)
+            tried.append(entry)
+            if 200 <= status < 300:
+                chosen = {"path": explicit_path, "status": status, "body": body}
+
+    candidates = (_IMAGE_PATHS if kind == schema.CAP_IMAGE
+                  else _VIDEO_SUBMIT_PATHS)
+    if chosen:
+        candidates = ()
 
     for path in candidates:
         entry: dict[str, Any] = {"path": path}
