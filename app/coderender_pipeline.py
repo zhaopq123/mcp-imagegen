@@ -28,7 +28,7 @@ import uuid
 from pathlib import Path
 from typing import Mapping, Optional
 
-from app import contract
+from app import contract, endpoints
 from engine import errors
 from infra.persist import build_base_url
 from providers import coderender
@@ -60,20 +60,37 @@ def parse_size(raw: object, default: tuple[int, int]) -> tuple[int, int]:
     return w, h
 
 
+# Python 代码信号（行首关键字 / print( / 对 svg/out/result 赋值）。
+# 判 lang 时先看这个再看 `含 <svg`：Python 代码里几乎必然出现 '<svg' 字面量
+# （就是要拼出 SVG 字符串），拿"含 <svg"当 SVG 判据会把最常见的写法判错
+# ——线上实测：`svg = '<svg ...>' % ...` 被当成 SVG 送去渲染 → 空文档报错。
+_PY_SIGNALS = re.compile(
+    r"(?m)^[ \t]*(?:import|from|def|class|for|while|if|elif|else|try|except|"
+    r"with|return|lambda|assert|del)\b"
+    r"|^[ \t]*(?:svg|out|result|image|output)\s*="
+    r"|\bprint\s*\("
+)
+
+
 def detect_lang(code: str, lang: Optional[str]) -> str:
     """lang=auto/None 时按内容判断。
 
-    判据刻意简单：**以 `<` 开头或含 `<svg`** 就是 SVG，否则当 Python。
-    为什么不用「含 `<svg` 才算 SVG」：`<rect/>` 这种形状片段也是合法
-    SVG（_normalize_svg 会帮忙补外层 <svg>），按那个判据会被误当 Python
-    送进沙箱，报一堆莫名其妙的错。
+    判据（顺序不能换）：
+    1. 以 `<` 开头 → SVG（`<svg>`、`<?xml`、`<rect/>` 形状片段全在这）
+    2. 有 Python 信号（行首关键字 / print( / 对 svg 赋值）→ Python
+    3. 其余含 `<svg` → SVG
+    4. 兜底 Python
     """
     if lang in ("svg", "python"):
         return lang
     text = (code or "").strip()
     if not text:
         return "svg"
-    return "svg" if (text.startswith("<") or "<svg" in text.lower()) else "python"
+    if text.startswith("<"):
+        return "svg"
+    if _PY_SIGNALS.search(text):
+        return "python"
+    return "svg" if "<svg" in text.lower() else "python"
 
 
 class CodeRenderPipeline:
@@ -91,9 +108,19 @@ class CodeRenderPipeline:
     # ------------------------------------------------------------------
     # 落盘
     # ------------------------------------------------------------------
-    def _save(self, data: bytes, ext: str, *, video: bool) -> str:
+    def _dir_for(self, ext: str) -> Path:
+        """**按扩展名决定目录**，与 /files 的分流规则保持一致。
+
+        踩过的坑：render_video 默认出 GIF，而 /files 只把 .mp4/.webm 当视频
+        （VIDEO_EXTS）——把 GIF 存进 VIDEO_DIR 就等于返回一个 404 的 URL。
+        /files 的"扩展名决定目录"是有测试钉住的纪律（放错目录就是 404），
+        所以这里跟着它走，而不是反过来放宽 /files。
+        """
+        return self._video_dir if ext in endpoints.VIDEO_EXTS else self._image_dir
+
+    def _save(self, data: bytes, ext: str) -> str:
         """落盘并返回 `/files/<name>`（相对；绝对化由 _url 负责）。"""
-        root = self._video_dir if video else self._image_dir
+        root = self._dir_for(ext)
         root.mkdir(parents=True, exist_ok=True)
         name = ""
         for _ in range(3):
@@ -148,7 +175,7 @@ class CodeRenderPipeline:
             return self._render_error(result.get("error") or "渲染失败")
 
         try:
-            path = self._save(result["png"], ".png", video=False)
+            path = self._save(result["png"], ".png")
         except OSError as exc:
             log.exception("[coderender] 落盘失败")
             return contract.format_error(errors.internal_error(exc))
@@ -205,7 +232,7 @@ class CodeRenderPipeline:
             with open(result["path"], "rb") as fh:
                 data = fh.read()
             path = self._save(
-                data, "." + str(result.get("format") or "gif"), video=True)
+                data, "." + str(result.get("format") or "gif"))
         except OSError as exc:
             log.exception("[coderender] 视频落盘失败")
             return contract.format_error(errors.internal_error(exc))

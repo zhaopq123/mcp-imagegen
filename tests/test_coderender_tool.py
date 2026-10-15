@@ -60,13 +60,84 @@ def test_parse_size_rejects(raw):
 
 def test_detect_lang():
     assert crp.detect_lang("<svg/>", None) == "svg"
-    assert crp.detect_lang("svg = '<svg/>'", "auto") == "svg"
+    assert crp.detect_lang("svg = '<svg/>'", "auto") == "python"
     assert crp.detect_lang("x = 1", "auto") == "python"
     assert crp.detect_lang("x = 1", "svg") == "svg"      # 显式优先
     # 形状片段（没有 <svg 外层）也是 SVG，不能误判成 Python
     assert crp.detect_lang('<rect width="10" height="10"/>', "auto") == "svg"
     assert crp.detect_lang("<?xml version='1.0'?><svg/>", "auto") == "svg"
     assert crp.detect_lang("", "auto") == "svg"
+
+
+def test_detect_lang_python_building_svg_is_python():
+    """最常见写法 `svg = '<svg ...>'` 里必然出现 `<svg`，不能被当成 SVG。"""
+    code = ("import math\n"
+            "svg = '<svg xmlns=\"http://www.w3.org/2000/svg\">%d</svg>' % width\n")
+    assert crp.detect_lang(code, "auto") == "python"
+    assert crp.detect_lang("print('<svg/>')", "auto") == "python"
+    assert crp.detect_lang("for i in range(3):\n    pass", "auto") == "python"
+
+
+# ── 产物目录必须与 /files 的分流规则一致（否则返回的是 404 URL）──
+
+@pytest.mark.parametrize("ext,is_video", [(".png", False), (".gif", False),
+                                          (".mp4", True)])
+def test_saved_dir_follows_files_endpoint_rules(pipe, ext, is_video):
+    from app import endpoints
+
+    root = pipe._dir_for(ext)
+    assert (root == pipe._video_dir) is is_video
+    assert (ext in endpoints.VIDEO_EXTS) is is_video
+
+
+def test_rendered_artifact_is_actually_servable(pipe, monkeypatch, tmp_path):
+    """端到端对账：render_* 返回的 URL 必须能被 /files 取到。
+
+    这条是补线上实测出来的坑——GIF 存进了 VIDEO_DIR，而 /files 只把
+    .mp4/.webm 当视频扩展名 → 返回的 URL 404。
+    """
+    import httpx
+    from starlette.applications import Starlette
+
+    from app import endpoints
+
+    frames_dir = tmp_path / "frames"
+    frames_dir.mkdir()
+    gif = frames_dir / "out.gif"
+    gif.write_bytes(b"GIF89a" + b"\x00" * 64)
+
+    async def fake_video(code, width=720, height=720, fps=12, frames=36,
+                         lang="svg", video_format="auto", timeout=20.0):
+        return {"ok": True, "path": str(gif), "format": "gif", "frames": frames,
+                "fps": fps, "size": [width, height], "workdir": str(frames_dir)}
+
+    async def fake_image(code, width=1024, height=1024, lang="svg",
+                         timeout=20.0):
+        return {"ok": True, "png": _PNG, "size": [width, height], "svg": code}
+
+    monkeypatch.setattr(coderender, "render_video_from_code", fake_video)
+    monkeypatch.setattr(coderender, "render_image_from_code", fake_image)
+
+    app = Starlette(routes=[endpoints.files_route(
+        pipe._cfg.image_dir, pipe._cfg.video_dir)])
+
+    async def _run():
+        out_img = await pipe.render_image('<rect width="4" height="4"/>')
+        out_vid = await pipe.render_video("<svg>__FRAME__</svg>", frames=2)
+        async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=app),
+                base_url="http://t") as c:
+            results = []
+            for text in (out_img, out_vid):
+                url = text.splitlines()[0]
+                path = url[url.index("/files/"):]
+                r = await c.get(path)
+                results.append((path, r.status_code, r.content))
+            return results
+
+    for path, status, content in asyncio.run(_run()):
+        assert status == 200, f"{path} 取不到（回给 Agent 的就是死链）"
+        assert content[:4] in (b"\x89PNG", b"GIF8")
 
 
 # ── 成功路径（假渲染器）：落盘 + 契约行 ──
@@ -116,7 +187,8 @@ def test_render_video_saves_and_formats(pipe, monkeypatch, tmp_path):
         headers={"host": "h:8000"}))
     lines = out.splitlines()
     assert lines[0].endswith(".gif")
-    saved = Path(pipe._video_dir) / lines[0].rsplit("/", 1)[-1]
+    # GIF 是图片扩展名 → 落 IMAGE_DIR（/files 只把 .mp4/.webm 当视频）
+    saved = Path(pipe._dir_for(".gif")) / lines[0].rsplit("/", 1)[-1]
     assert saved.read_bytes().startswith(b"GIF89a")
     assert "frames=10" in lines[1] and "fps=10" in lines[1]
     assert "format=gif" in lines[1]
