@@ -432,3 +432,49 @@ async def test_stats_expose_health(cfg, tmp_path):
         assert "base_url" in snapshot
     finally:
         await gw.aclose()
+
+
+# ---------------------------------------------------------------------------
+# 出站 URL：用户把「完整端点 URL」填进接口地址时不能拼出重复路径
+# ---------------------------------------------------------------------------
+async def test_full_endpoint_base_url_does_not_double_path(cfg, tmp_path):
+    """面板里 base_url 粘成 https://api.example.com/v1/images/generations。"""
+    spec = image_provider()
+    spec.base_url = "https://api.example.com/v1/images/generations"
+    transport = ScriptedTransport([httpx.Response(
+        200, json={"images": [{"url": "https://a/1.png"}]})])
+    gw = make_gateway(cfg, tmp_path, [spec], transport)
+    try:
+        res = await gw.generate_image(prompt="x", size="1K",
+                                      deadline=budget.Deadline(60.0))
+        assert res.ok is True
+        assert str(transport.requests[0].url) == (
+            "https://api.example.com/v1/images/generations")
+    finally:
+        await gw.aclose()
+
+
+async def test_full_endpoint_base_url_video_poll_not_doubled(cfg, tmp_path):
+    """视频最刺眼的形态：base_url 与 poll.path 同时带 /v1/videos。"""
+    spec = video_provider()
+    spec.base_url = "https://api.example.com/v1/videos"
+    transport = ScriptedTransport([
+        httpx.Response(200, json={"video_id": "up-123"}),
+        httpx.Response(200, json={"status": "succeeded", "url": "https://v/1.mp4"}),
+    ])
+    gw = make_gateway(cfg, tmp_path, [spec], transport)
+    try:
+        submitted = await gw.submit_video(
+            prompt="x", seconds=5, aspect_ratio="16:9",
+            deadline=budget.Deadline(60.0))
+        assert submitted.ok is True and submitted.video_id == "up-123"
+        assert str(transport.requests[0].url) == (
+            "https://api.example.com/v1/videos")
+        polled = await gw.query_video(video_id="up-123",
+                                      deadline=budget.Deadline(60.0))
+        assert polled.ok is True
+        assert str(transport.requests[1].url).startswith(
+            "https://api.example.com/v1/videos/query?")
+        assert "/v1/videos/v1/videos" not in str(transport.requests[1].url)
+    finally:
+        await gw.aclose()
