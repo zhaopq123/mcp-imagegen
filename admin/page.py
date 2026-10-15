@@ -584,21 +584,16 @@ function openProviderEditor(pid) {
     }
     if (t === "basic") {
       body.innerHTML = '<div class="hint" style="margin:0 0 12px;padding:10px 12px;border:1px solid var(--border);border-radius:10px;background:var(--card-2)">'
-        + "<b>推荐：自动装配</b> —— 填好「基础地址」和「密钥」后点下方按钮，"
-        + "服务会自己探测请求路径、请求体和响应格式（并顺手拉取可用模型列表），"
-        + "通常<b>不需要手工填任何模板</b>。"
+        + "<b>第 1 步</b>：这里填「基础地址」（你买的上游 API 网址）。"
+        + "填完去<b>鉴权</b>页填密钥，再到<b>生图</b>页点「⚡ 自动装配」，"
+        + "服务就会自己把路径/请求体/响应格式和模型列表都探出来。"
         + "</div>"
-        + '<div style="display:flex;gap:8px;margin:0 0 12px;flex-wrap:wrap">'
-        + '<button class="btn primary" id="autodetect-btn">⚡ 自动装配（探测路径与模型）</button>'
-        + '<button class="btn" id="models-btn">拉取模型列表</button>'
-        + "</div>"
-        + '<div id="autodetect-out"></div>'
         + f("显示名称", "name", "", it.name)
         + f("唯一 ID", "id", "字母/数字/下划线/连字符，保存后不建议改", it.id)
-        + f("基础地址 Base URL", "base_url", "以 http:// 或 https:// 开头，末尾斜杠会自动去掉", it.base_url)
+        + f("基础地址 Base URL", "base_url", "你买的上游 API 地址，以 http:// 或 https:// 开头", it.base_url)
         + '<label class="field"><span>预设 Preset</span><select class="select" data-f="preset">'
         + ["custom", "openai"].map(function (p) { return '<option value="' + p + '"' + (it.preset === p ? " selected" : "") + ">" + p + "</option>"; }).join("")
-        + '</select><div class="hint">只影响表单默认值，实际行为由下面的请求模板决定</div></label>'
+        + '</select><div class="hint">只影响表单默认值，实际行为由「生图」页的自动装配决定</div></label>'
         + f("优先级 Priority", "priority", "数字越小越优先", it.priority)
         + '<div class="hint">高级区里的 <code>{prompt}</code> 这类占位符用于注入变量（<code>{{images}}</code> 原样注入数组）。</div>';
     }
@@ -616,14 +611,22 @@ function openProviderEditor(pid) {
       const isVideo = t === "video";
       const cap = ensureCap(t);
       const req = cap.request || {}, ex = cap.extract || {};
-      /* 基础只有两个：启用 + 模型名。抽取路径留空 = 自动猜测（兼容
-         data[].url / images[].url 双形态），绝大多数上游无需手填。 */
-      const basic = '<label class="field" style="display:flex;align-items:center;gap:8px"><span style="margin:0">启用该能力</span>'
+      /* 三项缺一不可：Base URL（基本页）+ 密钥（鉴权页）+ 模型名（这里）。
+         所以这一页先把「还差什么」说清楚，再给一键自动装配。 */
+      const basic = '<div class="hint" style="margin:0 0 12px;padding:10px 12px;border:1px solid var(--border);border-radius:10px;background:var(--card-2)">'
+        + "<b>还差三样才能用</b>：① <b>基础地址</b>（基本页填）② <b>密钥</b>（鉴权页填）"
+        + "③ <b>模型名</b>（本页填）。<br>"
+        + "只填模型名<b>不能</b>用——服务得先知道往哪个地址、用什么路径发请求。"
+        + "下面点按钮，服务会自己把路径/请求体/响应格式探出来。"
+        + "</div>"
+        + '<div style="display:flex;gap:8px;margin:0 0 10px;flex-wrap:wrap">'
+        + '<button class="btn primary" id="autodetect-btn">⚡ 自动装配（探测路径 / 请求体 / 模型列表）</button>'
+        + "</div>"
+        + '<div id="autodetect-out"></div>'
+        + '<label class="field" style="display:flex;align-items:center;gap:8px"><span style="margin:0">启用该能力</span>'
         + '<label class="switch"><input type="checkbox" data-f="cap.enabled" ' + (cap.enabled ? "checked" : "") + '><span class="slider"></span></label></label>'
         + f("模型名 Model", "cap.model",
-            isVideo ? "上游的视频模型名，如 sora-2" : "上游的生图模型名，如 gpt-image-1", cap.model)
-        + '<div class="hint">已按 OpenAI 兼容形状预填请求路径与请求体，'
-        + (isVideo ? "并预填了轮询端点" : "") + '；模型名填上即可用。</div>';
+            isVideo ? "上游的视频模型名，如 sora-2（可点上面按钮自动列出）" : "上游的生图模型名，如 gpt-image-1（可点上面按钮自动列出）", cap.model);
       const adv = f("请求方法与路径", "cap.request.method", "", req.method) + ""
         + f("路径 Path", "cap.request.path", "支持占位符，如 <code>/v1/videos/{task_id}</code>", req.path)
         + '<label class="field"><span>请求体模板（JSON）</span><textarea class="textarea" data-area="cap.request.body" rows="10">'
@@ -652,11 +655,12 @@ function openProviderEditor(pid) {
         + f("读超时（秒）", "pool.read_sec", "0 = 用全局分档", p.read_sec || 0) + "</div></div>";
       return;
     }
-    if (t === "basic") bindAutodetect();
+    if (t === "image" || t === "video") bindAutodetect(t);
   }
 
   /* ── 自动装配：只给 base_url + 密钥（+ 可选模型名），其余探测填好 ── */
-  function bindAutodetect() {
+  function bindAutodetect(tabKind) {
+    const AUTO_KIND = tabKind === "video" ? "video" : "image";
     const out = mask.querySelector("#autodetect-out");
     const btn = mask.querySelector("#autodetect-btn");
     const mbtn = mask.querySelector("#models-btn");
@@ -692,11 +696,11 @@ function openProviderEditor(pid) {
         + "</select></label>";
     }
     async function run() {
-      const kind = "image";
+      const kind = AUTO_KIND;
       collect();
-      if (!state.item.base_url) { toast("请先填基础地址 Base URL", "bad"); return; }
+      if (!state.item.base_url) { toast("请先到「基本」页填写基础地址 Base URL", "bad"); return; }
       const token = (state.item.auth || {}).token || "";
-      if (!token) { toast("请先到「鉴权」页填密钥", "bad"); return; }
+      if (!token) { toast("请先到「鉴权」页填写密钥", "bad"); return; }
       const p = payload(kind);
       if (!p.model) p.model = "";   // 允许空模型名：先探路径，之后再选
       btn.disabled = true;
