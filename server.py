@@ -51,6 +51,31 @@ VERSION = "5.0.0"
 # ---------------------------------------------------------------------------
 # 组件集合
 # ---------------------------------------------------------------------------
+def _apply_stored_settings(cfg: Config, store: Store) -> Config:
+    """启动时重放「面板保存过的运行参数」（热字段）。
+
+    面板的 PUT /admin/settings 会把 patch 落进 store.settings 并即时生效，
+    但**启动路径原本不读它** → 服务一重启（手机内存压力下看门狗频繁重启），
+    用户调过的参数就悄悄回到默认值，而面板上仍显示「已保存」。
+    这正是典型的一条「改了没生效」，故启动时重放一次。
+
+    boot 路径以「起得来」为先：字段因版本变更失效时告警继续，绝不拦启动。
+    """
+    stored = dict(store.settings or {})
+    if not stored:
+        return cfg
+    try:
+        new_cfg = cfg.with_overrides(stored)
+        new_cfg.self_check_report()
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "[settings] 面板保存的运行参数无法应用，按默认值启动：%s", exc)
+        return cfg
+    logger.info("[settings] 已重放面板保存的 %d 项运行参数：%s",
+                len(stored), ", ".join(sorted(stored)))
+    return new_cfg
+
+
 class Components:
     """全部组件（构造顺序 = 依赖顺序；单一事件循环内使用）。"""
 
@@ -94,6 +119,7 @@ class Components:
         store = store or Store(cfg.store_path)
         if not store.loaded:
             store.load()
+        cfg = _apply_stored_settings(cfg, store)
         notifier = notifier if notifier is not None else liveness.SdNotifier()
         circuit_ = circuit.CircuitBreaker(
             hard_sec=cfg.circuit_hard_sec, soft_sec=cfg.circuit_soft_sec)
