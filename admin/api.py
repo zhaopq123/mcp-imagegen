@@ -59,6 +59,14 @@ PROBE_SIZE = "512x512"
 PROBE_DEADLINE_SEC = 30.0
 PROBE_VIDEO_ID = "__connectivity_probe__"
 
+# 管理台一律不缓存：面板配置随时会改，缓存旧页面/旧数据会让用户以为
+# 「改了没生效」「没有那个输入框」（2026-10-15 实际踩坑）。
+_NO_CACHE = {
+    "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
+    "Pragma": "no-cache",
+    "Expires": "0",
+}
+
 # 列表里的密钥预览：只留"能认出是哪一把钥匙"的信息量
 _PREVIEW_MIN_LEN = 8      # 短于此一律全遮（短串遮一半等于没遮）
 _PREVIEW_HEAD = 3         # 只露前缀（sk- / gsk_ 这类类型标识）
@@ -165,7 +173,12 @@ class AdminAPI:
         if rest in ("", "index.html"):
             root = request.scope.get("root_path", "")
             html = PAGE_HTML.replace("{{PREFIX}}", f"{root}{self.prefix}")
-            return Response(html, media_type="text/html; charset=utf-8")
+            # 管理台是单页应用且**不外链任何资源**，浏览器很容易把旧版
+            # 页面缓存住——用户会看到「改了却没有输入框」的错觉
+            #（2026-10-15 实际踩到：用户说「没有填的地方」，其实页面是旧的）。
+            # 面板配置随时可能改，显式禁缓存最省事；这里流量很小，不值当优化。
+            return Response(html, media_type="text/html; charset=utf-8",
+                            headers=_NO_CACHE)
         if not rest.startswith("api/"):
             return JSONResponse(
                 {"ok": False, "error": "not_found"}, status_code=404)
@@ -217,13 +230,14 @@ class AdminAPI:
     # ------------------------------------------------------------------
     @staticmethod
     def _ok(payload: dict = None, status: int = 200) -> JSONResponse:
-        return JSONResponse({"ok": True, **(payload or {})}, status_code=status)
+        return JSONResponse({"ok": True, **(payload or {})}, status_code=status,
+                            headers=_NO_CACHE)
 
     @staticmethod
     def _fail(status: int, code: str, message: str = "") -> JSONResponse:
         return JSONResponse(
             {"ok": False, "error": code, "message": message or code},
-            status_code=status)
+            status_code=status, headers=_NO_CACHE)
 
     # ------------------------------------------------------------------
     # 鉴权

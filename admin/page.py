@@ -396,6 +396,108 @@ async function loadPage(silent) {
   try { await view(content, silent); } catch (e) { content.innerHTML = '<div class="card"><div class="empty">加载失败：' + esc(e.message || e) + "</div></div>"; }
 }
 
+/* ---------------- 快速接入（首屏） ---------------- */
+/* 诉求原文「只需要配模型名 + api key，配好之后自动匹配其他」——
+   所以做成登录后第一屏最显眼的东西，不用先点菜单/切标签页。 */
+function renderQuickConnect() {
+  return '<div class="card" style="margin-bottom:14px">'
+    + "<header><h3>⚡ 快速接入上游</h3></header>"
+    + '<div class="quick">'
+    + "只填下面三样，其余（请求路径 / 请求体 / 响应解析 / 限速）全部由服务自动匹配。"
+    + '<div class="grid two">'
+    + '<label class="field"><span>① API 地址</span><input class="input" id="qc-base" placeholder="https://api.你的服务商.com/v1"></label>'
+    + '<label class="field"><span>② Key</span><input class="input" id="qc-token" type="password" placeholder="sk-..."></label>'
+    + "</div>"
+    + '<label class="field"><span>③ 模型名（可留空，自动从上游拉）</span><input class="input" id="qc-model" placeholder="如 gpt-image-1"></label>'
+    + '<div style="display:flex;gap:8px;flex-wrap:wrap">'
+    + '<button class="btn primary" id="qc-go">⚡ 一键接入并保存</button>'
+    + '<button class="btn" id="qc-test">只探测不保存</button>'
+    + "</div>"
+    + '<div id="qc-out"></div>'
+    + "</div></div>";
+}
+
+function bindQuickConnect() {
+  const btn = document.getElementById("qc-go");
+  if (!btn) return;
+  const out = document.getElementById("qc-out");
+  const tbtn = document.getElementById("qc-test");
+  const v = function (id) { const n = document.getElementById(id); return n ? n.value.trim() : ""; };
+
+  function slug(base, model) {
+    const host = String(base).split("://").pop().split("/")[0]
+      .replace(/[^a-zA-Z0-9]+/g, "").slice(0, 20).toLowerCase() || "up";
+    const m = String(model || "").replace(/[^a-zA-Z0-9]+/g, "").slice(0, 12).toLowerCase();
+    return "up-" + host + (m ? "-" + m : "");
+  }
+
+  async function run(save) {
+    const base = v("qc-base"), token = v("qc-token"), model = v("qc-model");
+    if (!base) { toast("请填 API 地址", "bad"); return; }
+    if (!token) { toast("请填 Key", "bad"); return; }
+    const btns = [btn, tbtn].filter(Boolean);
+    btns.forEach(function (b) { b.disabled = true; });
+    btn.innerHTML = '<span class="spinner" style="width:12px;height:12px"></span> 探测中…';
+    out.innerHTML = '<div class="hint">正在自动匹配请求路径与响应格式（极小请求，可能产生一次极小额度消耗）…</div>';
+
+    const auth = { kind: "bearer", token: token, name: "Authorization", prefix: "Bearer " };
+    const pid = slug(base, model);
+    const probe = await api("/providers/autodetect", { method: "POST",
+      body: JSON.stringify({ id: pid, base_url: base, auth: auth,
+                             capability: "image", model: model }) });
+    btns.forEach(function (b) { b.disabled = false; });
+    btn.textContent = "⚡ 一键接入并保存";
+
+    if (!(probe.ok && probe.capability)) {
+      let tried = "";
+      if (probe.tried && probe.tried.length) {
+        tried = '<details class="adv"><summary>试过的路径（' + probe.tried.length
+          + " 个）</summary><div class='adv-body'>"
+          + probe.tried.map(function (r) {
+              return "<div class='mono' style='font-size:11px'>" + esc(r.path) + " → "
+                + esc(r.status === undefined ? (r.error || "-") : r.status) + " "
+                + esc(r.detail || "") + "</div>";
+            }).join("")
+          + "</div></details>";
+      }
+      out.innerHTML = '<div class="hint" style="color:var(--bad)">✗ '
+        + esc(probe.message || "自动匹配失败") + "</div>" + tried
+        + '<div class="hint">若是地址/密钥不对请改正；若该上游不是常见的 OpenAI 兼容形状，'
+        + "可在「服务提供方 → 新建 → 生图 → 高级」手工指定。</div>";
+      toast("自动匹配未成功", "bad");
+      return;
+    }
+
+    const cap = probe.capability || {};
+    const models = probe.models || [];
+    if (!cap.model) cap.model = model || (models.length ? models[0] : "");
+    const spec = {
+      id: pid, name: String(base).split("://").pop().split("/")[0],
+      base_url: base, auth: auth, preset: "openai",
+      capabilities: { image: cap },
+    };
+    if (!save) {
+      out.innerHTML = '<div class="hint" style="color:var(--ok)">✓ 匹配成功：'
+        + esc((cap.request || {}).path || "") + " · 模型 " + esc(cap.model || "(未填)")
+        + (models.length ? " · 上游共 " + models.length + " 个模型" : "") + "</div>"
+        + '<div class="hint">确认无误后点「一键接入并保存」。</div>';
+      return;
+    }
+    const saved = await api("/providers", { method: "POST", body: JSON.stringify(spec) });
+    if (saved.ok) {
+      out.innerHTML = '<div class="hint" style="color:var(--ok)">✓ 已接入并保存：'
+        + esc(cap.model || "") + " · " + esc((cap.request || {}).path || "") + "</div>";
+      toast("接入成功，已生效", "ok");
+      setTimeout(function () { route(); }, 900);
+    } else {
+      out.innerHTML = '<div class="hint" style="color:var(--bad)">✗ 保存失败：'
+        + esc(saved.message || saved.error) + "</div>";
+    }
+  }
+  btn.onclick = function () { run(true); };
+  if (tbtn) tbtn.onclick = function () { run(false); };
+}
+
 /* ---------------- dashboard ---------------- */
 async function viewDashboard(node, silent) {
   const res = await api("/dashboard");
@@ -442,7 +544,8 @@ async function viewDashboard(node, silent) {
       + "<td class='muted' style='max-width:220px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap'>" + esc(r.detail || "") + "</td></tr>";
   }).join("");
 
-  node.innerHTML = '<div class="grid stats">' + statCards + "</div>"
+  node.innerHTML = renderQuickConnect()
+    + '<div class="grid stats">' + statCards + "</div>"
     + '<div class="grid two" style="margin-top:16px">'
     + '<div class="card"><header><h3>并发泳道</h3><span class="spacer"></span><span class="muted" style="font-size:12px">占用 / 配额</span></header>'
     + '<table><thead><tr><th>泳道</th><th>占用</th><th>排队</th><th>水位</th></tr></thead><tbody>' + (laneRows || '<tr><td colspan="4"><div class="empty">无</div></td></tr>') + "</tbody></table></div>"
@@ -459,6 +562,7 @@ async function viewDashboard(node, silent) {
     + '<table><thead><tr><th>名称 / 地址</th><th>能力</th><th>优先级</th><th>状态</th><th>调用</th><th>最近耗时</th></tr></thead><tbody>' + providerRows + "</tbody></table></div>"
     + '<div class="card" style="margin-top:16px"><header><h3>最近请求</h3><span class="spacer"></span><span class="muted" style="font-size:12px">最近 5 分钟</span></header>'
     + '<table><thead><tr><th>时间</th><th>类型</th><th>提供方</th><th>结果</th><th>耗时</th><th>摘要</th></tr></thead><tbody>' + (recent || '<tr><td colspan="6"><div class="empty">暂无请求</div></td></tr>') + "</tbody></table></div>";
+  bindQuickConnect();
 }
 
 /* ---------------- providers ---------------- */
