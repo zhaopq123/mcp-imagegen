@@ -59,6 +59,7 @@ from fastmcp import FastMCP
 from pydantic import Field
 
 if TYPE_CHECKING:  # 仅类型标注；运行时避免 tool ↔ pipeline 循环导入
+    from app import coderender_pipeline as coderender_pipeline_mod
     from app import pipeline as pipeline_mod
     from app import video_pipeline as video_pipeline_mod
 
@@ -68,6 +69,9 @@ TOOL_NAME_VIDEO = "generate_video"
 TOOL_NAME_QUERY = "query_video"
 # V3：异步作业总览（不触碰上面三个冻结工具的 schema/description）
 TOOL_NAME_LIST = "list_video_tasks"
+# V5：代码生图 / 代码生视频（本地渲染，不走上游）
+TOOL_NAME_RENDER_IMAGE = "render_image"
+TOOL_NAME_RENDER_VIDEO = "render_video"
 
 # A1‴（V4 重冻结）：在 A1″ 原文基础上追加参考图（图生图/多图合成）语义句。
 # 冻结纪律不变——tests/test_tool.py 全等断言拦截一切未授权改动；
@@ -125,6 +129,10 @@ TOOL_PARAMS_VIDEO: tuple[str, ...] = (
 )
 TOOL_PARAMS_QUERY: tuple[str, ...] = ("task_id",)
 TOOL_PARAMS_LIST: tuple[str, ...] = ("limit",)
+TOOL_PARAMS_RENDER_IMAGE: tuple[str, ...] = ("code", "size", "lang")
+TOOL_PARAMS_RENDER_VIDEO: tuple[str, ...] = (
+    "code", "size", "frames", "fps", "format", "lang",
+)
 
 # V3：list_video_tasks 描述（自建，非规格书冻结文本）
 TOOL_DESCRIPTION_LIST = (
@@ -134,13 +142,52 @@ TOOL_DESCRIPTION_LIST = (
     "once, instead of polling query_video one by one."
 )
 
+# V5：代码渲染两条工具的描述（自建，非规格书冻结文本；与 generate_* 的
+# 区别必须在描述第一句就说清，否则模型会拿 AI 生图去画图表 → 必然画不准）
+TOOL_DESCRIPTION_RENDER_IMAGE = (
+    "Render an image from code and return a URL to the PNG. Use this "
+    "instead of generate_image whenever the result must be exact and "
+    "repeatable: charts, plots, diagrams, flowcharts, tables, icons, "
+    "badges, posters or covers with precise text layout, and batches of "
+    "templated images. Nothing is sent upstream and no generation quota "
+    "is consumed - the code is rendered locally on the server. code is "
+    "either SVG markup, or a short Python script that produces SVG "
+    "markup; lang defaults to auto (code that starts with < or contains "
+    "<svg> is treated as SVG, otherwise as Python). Python runs in a "
+    "restricted sandbox: no "
+    "file, network or import access other than math, json, random, "
+    "statistics and colorsys; the variables width and height are "
+    "predefined; it must print the SVG or assign it to svg/out/result. "
+    "size accepts WxH like 1024x768 (default 1024x1024)."
+)
+
+TOOL_DESCRIPTION_RENDER_VIDEO = (
+    "Render an animation from code and return a URL to the result (GIF "
+    "by default, or MP4 when ffmpeg is installed on the server). Use it "
+    "for animated diagrams, loading spinners, progress bars, kinetic "
+    "text and simple motion graphics - exact, repeatable and local, "
+    "with no upstream quota consumed. code is either SVG markup or a "
+    "short Python script; animate SVG by putting the __FRAME__ "
+    "placeholder where the frame index belongs, or in Python by using "
+    "the predefined variables frame, total, width and height. Same "
+    "restricted sandbox as render_image. frames (default 36, max 120) "
+    "and fps (default 12, max 30) control the animation; the whole "
+    "request is capped at 90 seconds, so keep frames and drawing cost "
+    "modest. format: auto, mp4 or gif."
+)
+
 
 def register_tool(
     mcp: FastMCP,
     pipeline: pipeline_mod.GeneratePipeline,
     video_pipeline: video_pipeline_mod.VideoPipeline,
+    code_render: "coderender_pipeline_mod.CodeRenderPipeline | None" = None,
 ) -> None:
-    """向 FastMCP 注册三工具（描述/schema 见模块 docstring）。"""
+    """向 FastMCP 注册工具（描述/schema 见模块 docstring）。
+
+    code_render 为 None 时不注册 render_image/render_video（老测试与
+    只跑生图链路的场景仍可调用本函数，签名向后兼容）。
+    """
 
     @mcp.tool(name=TOOL_NAME, description=TOOL_DESCRIPTION, output_schema=None)
     async def generate_image(
@@ -262,6 +309,58 @@ def register_tool(
         jobs = video_pipeline.list_jobs(limit=limit)
         return json.dumps(
             {"count": len(jobs), "tasks": jobs}, ensure_ascii=False)
+
+    # ---- V5：代码生图 / 代码生视频（本地渲染，无上游依赖）----
+    if code_render is not None:
+        @mcp.tool(name=TOOL_NAME_RENDER_IMAGE,
+                  description=TOOL_DESCRIPTION_RENDER_IMAGE,
+                  output_schema=None)
+        async def render_image(
+            code: Annotated[
+                str, Field(description="SVG 代码，或产出 SVG 的短 Python 脚本")
+            ],
+            size: Annotated[
+                str, Field(description="WxH，如 1024x768；默认 1024x1024")
+            ] = "1024x1024",
+            lang: Annotated[
+                Optional[str], Field(
+                    description="svg / python；不传=自动判断（含 <svg> 即 SVG）")
+            ] = None,
+        ) -> str:
+            """见模块级 TOOL_DESCRIPTION_RENDER_IMAGE。"""
+            return await code_render.render_image(
+                code, size=size, lang=lang,
+                headers=_current_http_headers())
+
+        @mcp.tool(name=TOOL_NAME_RENDER_VIDEO,
+                  description=TOOL_DESCRIPTION_RENDER_VIDEO,
+                  output_schema=None)
+        async def render_video(
+            code: Annotated[
+                str, Field(
+                    description="SVG（用 __FRAME__ 占位帧号）或短 Python 脚本")
+            ],
+            size: Annotated[
+                str, Field(description="WxH，如 720x480；默认 720x720")
+            ] = "720x720",
+            frames: Annotated[
+                int, Field(description="帧数 1–120，默认 36")
+            ] = 36,
+            fps: Annotated[
+                int, Field(description="帧率 1–30，默认 12")
+            ] = 12,
+            format: Annotated[
+                str, Field(description="auto / mp4 / gif；默认 auto")
+            ] = "auto",
+            lang: Annotated[
+                Optional[str], Field(
+                    description="svg / python；不传=自动判断（含 <svg> 即 SVG）")
+            ] = None,
+        ) -> str:
+            """见模块级 TOOL_DESCRIPTION_RENDER_VIDEO。"""
+            return await code_render.render_video(
+                code, size=size, fps=fps, frames=frames, lang=lang,
+                video_format=format, headers=_current_http_headers())
 
     # 注册后的函数对象已替换为 Tool，无需保留引用
     # 收尾：压平 anyOf（严格模型拒载第二道毒，见 _flatten_null_union 注释）
