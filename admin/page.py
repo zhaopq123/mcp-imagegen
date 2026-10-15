@@ -584,9 +584,15 @@ function openProviderEditor(pid) {
     }
     if (t === "basic") {
       body.innerHTML = '<div class="hint" style="margin:0 0 12px;padding:10px 12px;border:1px solid var(--border);border-radius:10px;background:var(--card-2)">'
-        + "<b>三步就能用</b>：① 本页填「基础地址 + 名称」→ ② 「鉴权」页填密钥 → ③ 「生图」页填模型名。"
-        + "请求路径/请求体/响应抽取都已按 OpenAI 兼容形状预填，一般不用改（藏在「高级」里）。"
+        + "<b>推荐：自动装配</b> —— 填好「基础地址」和「密钥」后点下方按钮，"
+        + "服务会自己探测请求路径、请求体和响应格式（并顺手拉取可用模型列表），"
+        + "通常<b>不需要手工填任何模板</b>。"
         + "</div>"
+        + '<div style="display:flex;gap:8px;margin:0 0 12px;flex-wrap:wrap">'
+        + '<button class="btn primary" id="autodetect-btn">⚡ 自动装配（探测路径与模型）</button>'
+        + '<button class="btn" id="models-btn">拉取模型列表</button>'
+        + "</div>"
+        + '<div id="autodetect-out"></div>'
         + f("显示名称", "name", "", it.name)
         + f("唯一 ID", "id", "字母/数字/下划线/连字符，保存后不建议改", it.id)
         + f("基础地址 Base URL", "base_url", "以 http:// 或 https:// 开头，末尾斜杠会自动去掉", it.base_url)
@@ -594,7 +600,7 @@ function openProviderEditor(pid) {
         + ["custom", "openai"].map(function (p) { return '<option value="' + p + '"' + (it.preset === p ? " selected" : "") + ">" + p + "</option>"; }).join("")
         + '</select><div class="hint">只影响表单默认值，实际行为由下面的请求模板决定</div></label>'
         + f("优先级 Priority", "priority", "数字越小越优先", it.priority)
-        + '<div class="hint">提示：把 <code>{prompt}</code> 这类占位符写进高级区的请求模板即可注入变量（<code>{{images}}</code> 是原样注入数组）。</div>';
+        + '<div class="hint">高级区里的 <code>{prompt}</code> 这类占位符用于注入变量（<code>{{images}}</code> 原样注入数组）。</div>';
     }
     if (t === "auth") {
       const a = it.auth || {};
@@ -646,6 +652,88 @@ function openProviderEditor(pid) {
         + f("读超时（秒）", "pool.read_sec", "0 = 用全局分档", p.read_sec || 0) + "</div></div>";
       return;
     }
+    if (t === "basic") bindAutodetect();
+  }
+
+  /* ── 自动装配：只给 base_url + 密钥（+ 可选模型名），其余探测填好 ── */
+  function bindAutodetect() {
+    const out = mask.querySelector("#autodetect-out");
+    const btn = mask.querySelector("#autodetect-btn");
+    const mbtn = mask.querySelector("#models-btn");
+    if (!btn) return;
+    /* 把当前表单里已填的值同步进 state.item，才能拿到 base_url / 密钥 / 模型名 */
+    function payload(kind) {
+      collect();
+      const it = state.item;
+      return {
+        id: it.id || "probe", base_url: it.base_url || "",
+        auth: it.auth || { kind: "bearer", token: "" },
+        capability: kind,
+        model: (it.capabilities && it.capabilities[kind] &&
+                (it.capabilities[kind].model || "")) || ""
+      };
+    }
+    function triedTable(tried) {
+      if (!tried || !tried.length) return "";
+      return '<details class="adv"><summary>探测明细（' + tried.length + " 个候选路径）</summary><div class='adv-body'>"
+        + "<table><thead><tr><th>路径</th><th>状态</th><th>说明</th></tr></thead><tbody>"
+        + tried.map(function (r) {
+            return "<tr><td class='mono'>" + esc(r.path) + "</td><td>"
+              + esc(r.status === undefined ? (r.error || "-") : r.status)
+              + "</td><td class='muted'>" + esc(r.detail || "") + "</td></tr>";
+          }).join("")
+        + "</tbody></table></div></details>";
+    }
+    function modelSelect(models, kind) {
+      if (!models || !models.length) return "";
+      return '<label class="field"><span>选模型（' + models.length + " 个可用）</span>"
+        + '<select class="select" id="model-pick-' + kind + '">'
+        + models.map(function (m) { return '<option value="' + esc(m) + '">' + esc(m) + "</option>"; }).join("")
+        + "</select></label>";
+    }
+    async function run() {
+      const kind = "image";
+      collect();
+      if (!state.item.base_url) { toast("请先填基础地址 Base URL", "bad"); return; }
+      const token = (state.item.auth || {}).token || "";
+      if (!token) { toast("请先到「鉴权」页填密钥", "bad"); return; }
+      const p = payload(kind);
+      if (!p.model) p.model = "";   // 允许空模型名：先探路径，之后再选
+      btn.disabled = true;
+      btn.innerHTML = '<span class="spinner" style="width:12px;height:12px"></span> 探测中…';
+      out.innerHTML = '<div class="hint">正在按候选路径试探（会用极小请求，可能产生一次极小额度消耗）…</div>';
+      const res = await api("/providers/autodetect", { method: "POST", body: JSON.stringify(p) });
+      btn.disabled = false;
+      btn.textContent = "⚡ 自动装配（探测路径与模型）";
+      if (res.ok && res.capability) {
+        /* 回填：把探测到的形状写进 image 能力；模型名用探测结果或用户已填的 */
+        const cap = res.capability || {};
+        cap.model = p.model || cap.model || "";
+        state.item.capabilities = state.item.capabilities || {};
+        state.item.capabilities[kind] = cap;
+        const models = res.models || [];
+        out.innerHTML = '<div class="hint" style="color:var(--ok);margin:0 0 8px">✓ '
+          + esc(res.detail || "自动装配成功") + (models.length ? "（并拉取到 " + models.length + " 个模型）" : "")
+          + "</div>" + modelSelect(models, kind) + triedTable(res.tried);
+        const pick = mask.querySelector("#model-pick-" + kind);
+        if (pick) pick.onchange = function () {
+          collect();
+          const c = ensureCap(kind); c.model = pick.value;
+        };
+        toast("自动装配完成，已填入请求路径与响应解析", "ok");
+        /* 若没填模型名且拉到了列表，默认选第一个 */
+        if (!p.model && models.length) {
+          const c = ensureCap(kind); c.model = models[0];
+        }
+      } else {
+        out.innerHTML = '<div class="hint" style="color:var(--bad)">✗ '
+          + esc(res.message || "自动装配失败") + "</div>" + triedTable(res.tried)
+          + '<div class="hint">可在「高级」里手工指定路径与请求体。</div>';
+        toast("自动装配未成功，可手工填写或查看明细", "bad");
+      }
+    }
+    btn.onclick = run;
+    if (mbtn) mbtn.onclick = run;
   }
   function collect() {
     const it = state.item;

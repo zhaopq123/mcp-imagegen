@@ -378,7 +378,65 @@ class AdminAPI:
                     return self._ok({"enabled": spec.enabled})
                 if action == "test":
                     return await self._test_provider(spec, request)
+                if action == "autodetect":
+                    return await self._autodetect_provider(body, request)
         return self._fail(404, "not_found", "/".join(parts))
+
+    async def _autodetect_provider(self, body: dict,
+                                   request: Request) -> JSONResponse:
+        """自动装配：给 base_url + 密钥 + 模型名，探出请求路径/请求体/抽取路径。
+
+        为什么需要：让使用者只填「地址 + 密钥 + 模型名」，其余由服务探测。
+        探测是**最小代价**的（n=1/小 size/短超时），且失败时如实返回
+        已试清单，不做静默降级。
+        """
+        from providers import autodetect
+
+        base_url = str(body.get("base_url") or "").strip()
+        if not base_url:
+            return self._fail(400, "missing_base_url", "请先填写基础地址 Base URL")
+        try:
+            spec = schema.ProviderConfig.from_dict(
+                {**body, "id": str(body.get("id") or "probe")})
+        except Exception as exc:  # noqa: BLE001
+            return self._fail(400, "invalid", f"{type(exc).__name__}: {exc}")
+
+        secret = self._resolve_secret(spec)
+        kind = str(body.get("capability") or schema.CAP_IMAGE)
+        model = str(body.get("model") or "").strip()
+        # 探测用该 provider 自己的临时 runtime（不碰长期连接池），
+        # 探测结束立即关闭，避免留下空闲连接。
+        runtime = None
+        try:
+            runtime = self.ctx.gateway._build_runtime(spec)
+            result = await autodetect.detect_all(
+                runtime.client, spec, secret, kind, model)
+        except Exception as exc:  # noqa: BLE001
+            return self._fail(502, "autodetect_failed",
+                               f"{type(exc).__name__}: {exc}")
+        finally:
+            if runtime is not None:
+                try:
+                    await runtime.aclose()
+                except Exception:  # noqa: BLE001
+                    pass
+        if not result.get("ok"):
+            return JSONResponse({"ok": False, "error": "autodetect_failed",
+                                 "message": result.get("detail") or "自动装配失败",
+                                 "tried": result.get("tried", []),
+                                 "models": result.get("models", [])},
+                                status_code=422)
+        return self._ok({"capability": result["capability"],
+                         "tried": result.get("tried", []),
+                         "models": result.get("models", []),
+                         "detail": result.get("detail", "")})
+
+    def _resolve_secret(self, spec: schema.ProviderConfig) -> str:
+        """取明文密钥：支持 env:变量名 间接引用（密钥不落配置文件）。"""
+        raw = (spec.auth.token or "").strip()
+        if raw.startswith("env:"):
+            return os.environ.get(raw[4:].strip(), "")
+        return raw
 
     async def _write_provider(self, request: Request,
                               pid: Optional[str]) -> JSONResponse:
