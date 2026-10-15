@@ -391,15 +391,33 @@ async def test_run_failed_status_classified_error(caplog):
     assert "result=error:upstream_error" in access_records(caplog)[0].getMessage()
 
 
-async def test_run_poll_http_error_classified():
-    # 轮询查询 HTTP 429 → rate_limit 分类（E19：无切换，分类即返回）
+async def test_run_poll_retryable_error_defers_instead_of_failing():
+    """轮询撞 429（可重试类）→ **不判失败**，作业继续退避轮询 + 交收条。
+
+    2026-10-15 真机修正：上游查询接口有独立速率限制，把 429 当终态会把
+    已出片的任务永久漏收（上游 status=completed、本端报 FAILED）。现在
+    作业在总等待预算内一直重试，请求预算用尽就交 deferred 收条，让 Agent
+    稍后 query_video 续查。
+    """
     ns = make_pipeline(
         submit_result=submit_ok("vid-429"),
         query_script=[query_result("running"), api_error(429, "rate limited")])
     out = await run_ok(ns)
+    assert not out.startswith(ERROR_PREFIX)
+    assert "task_id=vid-429" in out            # 收条要能续查
+    assert "status=running" in out
+    assert ns.pool.in_use() == 0               # 等待期不占槽（E20）
+
+
+async def test_run_poll_non_retryable_error_classified():
+    """轮询撞不可重试类（403 鉴权/额度）→ 立即失败，且**分类不被压平**。"""
+    ns = make_pipeline(
+        submit_result=submit_ok("vid-403"),
+        query_script=[api_error(403, "Invalid token")])
+    out = await run_ok(ns)
     assert out.startswith(ERROR_PREFIX)
-    assert "category=rate_limit" in out
-    assert "task_id=vid-429" in out            # detail 附 task_id 便于续查
+    assert "category=upstream_auth" in out
+    assert "task_id=vid-403" in out            # detail 附 task_id 便于续查
     assert ns.pool.in_use() == 0
 
 

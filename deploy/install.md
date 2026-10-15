@@ -317,6 +317,7 @@ sudo systemctl reload caddy
 | 日志出现磁盘水位 WARN | `df -h /var/lib/mcp-imagegen/images /var/lib/mcp-imagegen/videos`（V2 水位覆盖双目录）；**人工**清理旧文件（服务永不自动删图/视频，C10） |
 | 工具调用慢但成功 | 正常：视频轮询受 200s 总预算约束（超预算返 `task_id` 收条非错误，稍后 `query_video` 续查）；客户端超时须 ≥210s（详见 agent-config.md §4） |
 | `query_video` 返回 `task_not_found` | 预期行为：任务超 TTL（默认 2h）/容量逐出/服务重启（任务表内存态清零）——按 retry=fixthenretry 重新提交生成即可，勿原样重查 |
+| 日志出现 `[video] 轮询遇上游繁忙(429)，Xs 后继续` | **正常**：上游查询接口有自己的速率限制，本端按 Retry-After/指数退避（上限 30s）继续轮询到终态。**别改成"遇 429 判失败"**——实测会把已出片的任务永久漏收（上游 status=completed 而本端报 FAILED）。退避到总等待超限时只是 abort（保持 running），之后 `query_video` 会走实况查询补回成片 |
 
 ---
 
