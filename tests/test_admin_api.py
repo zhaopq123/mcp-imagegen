@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import json
+import os
 
 import pytest
 from starlette.requests import Request
@@ -382,3 +383,48 @@ async def test_admin_is_real_asgi_app_when_mounted(env):
     assert "text/html" in page.headers["content-type"]
     assert state.status_code == 200 and state.json()["ok"] is True
     assert listed.status_code == 200 and "items" in listed.json()
+
+
+def test_admin_page_script_is_syntactically_valid():
+    """管理面板内联 JS 必须语法合法（白屏回归）。
+
+    背景：2026-10-15 用户报 /admin 打开空白。根因是 openImport() 里
+    textarea 的 placeholder 属性用单引号，而整段 HTML 又被包在 JS 的
+    单引号字符串里 → JS 字符串提前闭合 → 整个 <script> 语法错误 →
+    浏览器拒绝执行 → 白屏。**Python 侧完全正常**（返回 200 + 58KB HTML），
+    只有真实浏览器才暴露，pytest 无法覆盖。
+
+    做法：把内联 JS 落到临时文件交给 node --check（真实 JS 语法器）。
+    环境无 node 时跳过——不能因为缺工具就放行。
+    """
+    import re
+    import shutil
+    import subprocess
+    import tempfile
+
+    from admin.page import PAGE_HTML
+
+    m = re.search(r"<script>([\s\S]*?)</script>", PAGE_HTML)
+    assert m, "页面里应内联 <script>"
+    code = m.group(1)
+    assert len(code) > 1000, "内联脚本不应为空"
+
+    # 关键入口必须存在，否则页面无交互
+    for fn in ("function bootstrap", "function render(", "function openImport"):
+        assert fn in code, f"缺少关键函数 {fn}"
+
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("无 node，跳过 JS 语法校验")
+
+    # 包一层 async IIFE：页面脚本用了顶层 await
+    with tempfile.TemporaryDirectory() as td:
+        js = os.path.join(td, "page.js")
+        with open(js, "w", encoding="utf-8") as f:
+            f.write("(async () => {\n" + code + "\n})();\n")
+        r = subprocess.run([node, "--check", js], capture_output=True,
+                           text=True)
+        assert r.returncode == 0, (
+            "管理面板内联 JS 语法错误（浏览器会白屏）：\n"
+            + (r.stderr or "").strip()[:500]
+        )

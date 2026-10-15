@@ -679,7 +679,7 @@ function openResult(title, res) {
 }
 function openImport() {
   const mask = el('<div class="mask"><div class="modal small"><header><h3>导入服务提供方</h3></header><div class="body">'
-    + '<label class="field"><span>粘贴导出内容（JSON）</span><textarea class="textarea" id="imp" rows="14" placeholder=\'{"providers": [...]}\'></textarea></label></div>'
+    + '<label class="field"><span>粘贴导出内容（JSON）</span><textarea class="textarea" id="imp" rows="14" placeholder="{&quot;providers&quot;: [...]}"></textarea></label></div>'
     + '<footer><button class="btn ghost" data-no>取消</button><button class="btn primary" data-yes>导入</button></footer></div></div>');
   document.body.appendChild(mask);
   mask.querySelector("[data-no]").onclick = closeModal;
