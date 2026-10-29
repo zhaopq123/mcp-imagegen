@@ -1,6 +1,6 @@
 # MCP 图片生成 Server · 验收报告
 
-> **历史存档**：本文是 V2 阶段的设计/验收记录。V5 起上游已改为「服务提供方」可由用户自行配置，代码与文档不再绑定任何厂商；以 [README](README.md) 为准。
+> **历史存档**：本文是 V2 阶段的设计/验收记录。V5 起上游已改为「服务提供方」可由用户自行配置，代码与文档不再绑定任何厂商；以 [README](../README.md) 为准。
 - **验收对象**：mcp-imagegen（FastMCP + uvicorn，规格书十一节实施顺序 S5 验收阶段）
 - **验收日期**：2026-10-10
 - **执行环境**：本机沙箱（真实 uvicorn 临时端口 + 真实 MCP streamable-http 协议：initialize → tools/list → tools/call，唯一替换项为"另一家上游上游"与"persist 图片下载"两处注入式 mock transport）
